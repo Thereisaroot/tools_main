@@ -26,6 +26,7 @@ class AppCommand(Enum):
     RUN_FULL = "run_full"
     RUN_PARTIAL = "run_partial"
     STOP_ANALYSIS = "stop_analysis"
+    CLEAR_DETECTED_EVENTS = "clear_detected_events"
     SET_MODE_A = "set_mode_a"
     SET_MODE_B = "set_mode_b"
 
@@ -40,6 +41,7 @@ class AppCommand(Enum):
     VIEW_LOGS = "view_logs"
     ABOUT = "about"
     SEEK_EVENT = "seek_event"
+    DEBUG_OCR_CURRENT_FRAME = "debug_ocr_current_frame"
 
 
 @dataclass(slots=True)
@@ -89,6 +91,7 @@ def build_menu_action_map() -> MenuActionMap:
             MenuActionSpec(AppCommand.RUN_FULL, "Full Analysis", "F5"),
             MenuActionSpec(AppCommand.RUN_PARTIAL, "Partial Analysis", "F6"),
             MenuActionSpec(AppCommand.STOP_ANALYSIS, "Stop", "Shift+F5"),
+            MenuActionSpec(AppCommand.CLEAR_DETECTED_EVENTS, "Clear Detected Events", "Ctrl+Shift+X"),
             MenuActionSpec(AppCommand.SET_MODE_A, "Mode A (Entry)", "Ctrl+1"),
             MenuActionSpec(AppCommand.SET_MODE_B, "Mode B (Entry+Exit)", "Ctrl+2"),
         ],
@@ -109,5 +112,8 @@ def build_menu_action_map() -> MenuActionMap:
             MenuActionSpec(AppCommand.OPEN_OUTPUT_FOLDER, "Open Output Folder", "Ctrl+Shift+E"),
             MenuActionSpec(AppCommand.VIEW_LOGS, "View Logs"),
             MenuActionSpec(AppCommand.ABOUT, "About"),
+        ],
+        "Debug": [
+            MenuActionSpec(AppCommand.DEBUG_OCR_CURRENT_FRAME, "OCR Current Frame", "Ctrl+Shift+R"),
         ],
     }

@@ -38,6 +38,7 @@ class VideoCanvas(QWidget):
 
         self._timestamp_roi: ROI | None = None
         self._tracks: list[Track] = []
+        self._active_roi_ids: set[str] = set()
 
         self._add_roi_mode = False
         self._manual_timestamp_mode = False
@@ -54,6 +55,7 @@ class VideoCanvas(QWidget):
 
     def set_rois(self, rois: dict[str, ROI]) -> None:
         self._rois = dict(rois)
+        self._active_roi_ids.intersection_update(self._rois.keys())
         self.update()
 
     def set_direction_vectors(self, vectors: dict[str, Vector2]) -> None:
@@ -70,6 +72,10 @@ class VideoCanvas(QWidget):
 
     def set_tracks(self, tracks: list[Track]) -> None:
         self._tracks = tracks
+        self.update()
+
+    def set_active_roi_ids(self, roi_ids: set[str]) -> None:
+        self._active_roi_ids = {str(roi_id) for roi_id in roi_ids}
         self.update()
 
     def set_show_overlays(self, show: bool) -> None:
@@ -159,8 +165,20 @@ class VideoCanvas(QWidget):
             rect = QRectF(p1, p2)
 
             selected = roi_id == self._selected_roi_id
-            color = QColor(70, 220, 90) if not selected else QColor(255, 165, 0)
-            pen = QPen(color, 2)
+            active = roi_id in self._active_roi_ids
+            if active:
+                painter.fillRect(rect, QColor(255, 80, 80, 48))
+
+            if selected and active:
+                color = QColor(255, 220, 90)
+            elif selected:
+                color = QColor(255, 165, 0)
+            elif active:
+                color = QColor(255, 80, 80)
+            else:
+                color = QColor(70, 220, 90)
+
+            pen = QPen(color, 3 if active else 2)
             painter.setPen(pen)
             painter.drawRect(rect)
             painter.drawText(rect.topLeft() + QPointF(4, 14), roi_id)

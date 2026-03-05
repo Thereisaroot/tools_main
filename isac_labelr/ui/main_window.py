@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from isac_labelr.analysis.engine import AnalysisEngine, PresenceState
 from isac_labelr.analysis.worker import AnalysisWorker
 from isac_labelr.commands import AppCommand, MenuActionSpec, build_menu_action_map
 from isac_labelr.io.metadata_writer import MetadataWriter
@@ -56,7 +57,13 @@ from isac_labelr.settings import (
     save_preferences,
 )
 from isac_labelr.ui.video_canvas import VideoCanvas
+from isac_labelr.vision.detector import (
+    DetectorConfig,
+    DetectorInitializationError,
+    OnnxYoloPersonDetector,
+)
 from isac_labelr.vision.ocr import TimestampOCR
+from isac_labelr.vision.tracker import ByteTrackLite
 
 
 class PreferencesDialog(QDialog):
@@ -152,6 +159,7 @@ class MainWindow(QMainWindow):
         self.fps = 30.0
         self.total_frames = 0
         self.current_frame_index = 0
+        self.current_video_time_ms = 0
         self.current_frame_raw = None
         self.current_frame_rotated = None
 
@@ -168,6 +176,11 @@ class MainWindow(QMainWindow):
         self.analysis_worker: AnalysisWorker | None = None
         self.ocr_debug_thread: QThread | None = None
         self.ocr_debug_worker: OCRDebugWorker | None = None
+        self.preview_detector: OnnxYoloPersonDetector | None = None
+        self.preview_tracker: ByteTrackLite | None = None
+        self.preview_event_engine = AnalysisEngine()
+        self.preview_presence: dict[tuple[str, int], PresenceState] = {}
+        self.preview_last_overlay_ts: int | None = None
 
         self.timestamp_ocr = TimestampOCR()
 
@@ -182,6 +195,7 @@ class MainWindow(QMainWindow):
         self._bind_signals()
         self._refresh_recent_menu()
         self.status_label.setText(f"Idle | OCR backend: {self.timestamp_ocr.backend}")
+        self._set_notice(self._default_notice_text())
         self._refresh_action_states()
 
     def _build_ui(self) -> None:
@@ -197,14 +211,9 @@ class MainWindow(QMainWindow):
 
         self.open_file_button = QPushButton("Open File")
         self.add_roi_button = QPushButton("Add ROI")
+        self.add_ts_roi_button = QPushButton("Add TS ROI")
         self.rotate_left_button = QPushButton("Rotate -90")
         self.rotate_right_button = QPushButton("Rotate +90")
-        self.ocr_current_frame_button = QPushButton("OCR Current Frame")
-        self.ocr_current_frame_button.setToolTip("Debug OCR on the currently displayed frame.")
-        self.start_analysis_button = QPushButton("Start Analysis")
-        self.start_analysis_button.setToolTip(
-            "Starts Full/Partial analysis based on 'Analyze full video' setting."
-        )
         self.start_full_button = QPushButton("Start Full Analysis")
         self.start_full_button.setToolTip("Always analyze full video, ignoring start/duration.")
         self.start_partial_button = QPushButton("Start Partial Analysis")
@@ -214,6 +223,7 @@ class MainWindow(QMainWindow):
         self.command_buttons = {
             AppCommand.OPEN_VIDEO: self.open_file_button,
             AppCommand.ADD_ROI: self.add_roi_button,
+            AppCommand.MANUAL_OCR_ROI: self.add_ts_roi_button,
             AppCommand.ROTATE_PREV: self.rotate_left_button,
             AppCommand.ROTATE_NEXT: self.rotate_right_button,
             AppCommand.RUN_FULL: self.start_full_button,
@@ -224,10 +234,9 @@ class MainWindow(QMainWindow):
         for button in [
             self.open_file_button,
             self.add_roi_button,
+            self.add_ts_roi_button,
             self.rotate_left_button,
             self.rotate_right_button,
-            self.ocr_current_frame_button,
-            self.start_analysis_button,
             self.start_full_button,
             self.start_partial_button,
             self.stop_analysis_button,
@@ -245,9 +254,13 @@ class MainWindow(QMainWindow):
         controls_layout.setContentsMargins(0, 0, 0, 0)
 
         self.play_button = QPushButton("Play Preview")
-        self.play_button.setToolTip("Preview playback only. Analysis starts with Start Analysis buttons.")
+        self.play_button.setToolTip("Preview playback only. Analysis starts with Start Full/Partial Analysis buttons.")
         self.prev_button = QPushButton("Prev")
         self.next_button = QPushButton("Next")
+        self.preview_detection_checkbox = QCheckBox("Detection On")
+        self.preview_detection_checkbox.setToolTip(
+            "When enabled, Play Preview runs person detection/tracking and draws person IDs."
+        )
         self.frame_slider = QSpinBox()
         self.frame_slider.setRange(0, 0)
         self.frame_label = QLabel("frame: 0 / 0")
@@ -257,6 +270,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.prev_button)
         controls_layout.addWidget(self.play_button)
         controls_layout.addWidget(self.next_button)
+        controls_layout.addWidget(self.preview_detection_checkbox)
         controls_layout.addWidget(QLabel("Frame"))
         controls_layout.addWidget(self.frame_slider)
         controls_layout.addWidget(self.frame_label)
@@ -293,6 +307,14 @@ class MainWindow(QMainWindow):
         settings_form.addRow("TS correction ms", self.correction_edit)
 
         right_layout.addWidget(settings_box)
+
+        notice_box = QGroupBox("TEXT NOTICE")
+        notice_layout = QVBoxLayout(notice_box)
+        self.notice_text = QTextEdit()
+        self.notice_text.setReadOnly(True)
+        self.notice_text.setMinimumHeight(120)
+        notice_layout.addWidget(self.notice_text)
+        right_layout.addWidget(notice_box)
 
         roi_box = QGroupBox("ROIs")
         roi_layout = QVBoxLayout(roi_box)
@@ -379,12 +401,9 @@ class MainWindow(QMainWindow):
     def _bind_signals(self) -> None:
         self.open_file_button.clicked.connect(lambda: self._dispatch_command(AppCommand.OPEN_VIDEO))
         self.add_roi_button.clicked.connect(lambda: self._dispatch_command(AppCommand.ADD_ROI))
+        self.add_ts_roi_button.clicked.connect(lambda: self._dispatch_command(AppCommand.MANUAL_OCR_ROI))
         self.rotate_left_button.clicked.connect(lambda: self._dispatch_command(AppCommand.ROTATE_PREV))
         self.rotate_right_button.clicked.connect(lambda: self._dispatch_command(AppCommand.ROTATE_NEXT))
-        self.ocr_current_frame_button.clicked.connect(self._debug_ocr_current_frame)
-        self.start_analysis_button.clicked.connect(
-            lambda: self._start_analysis(force_full=self.full_checkbox.isChecked())
-        )
         self.start_full_button.clicked.connect(lambda: self._dispatch_command(AppCommand.RUN_FULL))
         self.start_partial_button.clicked.connect(lambda: self._dispatch_command(AppCommand.RUN_PARTIAL))
         self.stop_analysis_button.clicked.connect(lambda: self._dispatch_command(AppCommand.STOP_ANALYSIS))
@@ -392,10 +411,11 @@ class MainWindow(QMainWindow):
         self.play_button.clicked.connect(self._toggle_play)
         self.prev_button.clicked.connect(lambda: self._seek_frame(self.current_frame_index - 1))
         self.next_button.clicked.connect(lambda: self._seek_frame(self.current_frame_index + 1))
+        self.preview_detection_checkbox.toggled.connect(self._on_preview_detection_toggled)
         self.frame_slider.valueChanged.connect(self._seek_frame)
 
         self.full_checkbox.stateChanged.connect(self._toggle_partial_fields)
-        self.mode_combo.currentIndexChanged.connect(self._sync_mode_actions)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self.roi_list.currentItemChanged.connect(self._on_roi_list_selection_changed)
         self.dx_spin.valueChanged.connect(self._on_direction_changed)
         self.dy_spin.valueChanged.connect(self._on_direction_changed)
@@ -419,6 +439,7 @@ class MainWindow(QMainWindow):
         elif command == AppCommand.ADD_ROI:
             self.canvas.begin_add_roi()
             self.status_label.setText("Drag on preview to create ROI")
+            self._set_notice("Add ROI mode is on. Drag a rectangle in preview.")
         elif command == AppCommand.DELETE_SELECTED_ROI:
             self._delete_selected_roi()
         elif command == AppCommand.CLEAR_ALL_ROIS:
@@ -444,6 +465,8 @@ class MainWindow(QMainWindow):
             self._start_analysis(force_full=False)
         elif command == AppCommand.STOP_ANALYSIS:
             self._stop_analysis()
+        elif command == AppCommand.CLEAR_DETECTED_EVENTS:
+            self._clear_detected_events(confirm=True)
         elif command == AppCommand.SET_MODE_A:
             self.mode_combo.setCurrentIndex(0)
         elif command == AppCommand.SET_MODE_B:
@@ -453,6 +476,7 @@ class MainWindow(QMainWindow):
         elif command == AppCommand.MANUAL_OCR_ROI:
             self.canvas.begin_manual_timestamp_roi()
             self.status_label.setText("Drag on preview to set timestamp ROI")
+            self._set_notice("Add TS ROI mode is on. Drag a rectangle over the timestamp text area.")
         elif command == AppCommand.SET_CORRECTION_MS:
             self._set_correction_dialog()
         elif command == AppCommand.RERUN_OCR_SELECTED_EVENT:
@@ -465,6 +489,8 @@ class MainWindow(QMainWindow):
             self._view_logs_dialog()
         elif command == AppCommand.ABOUT:
             self._about_dialog()
+        elif command == AppCommand.DEBUG_OCR_CURRENT_FRAME:
+            self._debug_ocr_current_frame()
 
         self._refresh_action_states()
 
@@ -510,12 +536,13 @@ class MainWindow(QMainWindow):
         self.timestamp_ocr.clear_auto_roi()
         self.canvas.set_timestamp_roi(None)
 
-        self.events.clear()
-        self.event_list.clear()
+        self._clear_detected_events(confirm=False)
+        self._reset_preview_inference(clear_detector=False, clear_overlay=True)
 
         self.output_dir = MetadataWriter.default_output_dir(path)
         self.setWindowTitle(f"ISAC Labelr - {Path(path).name}")
         self.status_label.setText(f"Loaded {Path(path).name}")
+        self._set_notice(self._default_notice_text())
         self._refresh_action_states()
 
     def _release_capture(self) -> None:
@@ -534,9 +561,12 @@ class MainWindow(QMainWindow):
             return
 
         self.current_frame_index = frame_index
+        self.current_video_time_ms = int(round((frame_index / max(self.fps, 1.0)) * 1000.0))
         self.current_frame_raw = frame
         self.current_frame_rotated = rotate_bgr(frame, self.rotation_deg)
         self.canvas.set_frame(self.current_frame_rotated)
+        if not (self.play_timer.isActive() and self.preview_detection_checkbox.isChecked()):
+            self._clear_preview_overlays()
 
         self.frame_slider.blockSignals(True)
         self.frame_slider.setValue(frame_index)
@@ -551,6 +581,17 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Preview paused (analysis is separate)")
             return
 
+        if self.preview_detection_checkbox.isChecked():
+            if not self._ensure_preview_detector():
+                self.preview_detection_checkbox.blockSignals(True)
+                self.preview_detection_checkbox.setChecked(False)
+                self.preview_detection_checkbox.blockSignals(False)
+                self._clear_preview_overlays()
+                self._refresh_action_states()
+                return
+            self._reset_preview_tracker()
+            self._reset_preview_event_state()
+
         interval = int(1000 / max(1.0, self.fps))
         self.play_timer.start(max(1, interval))
         self.play_button.setText("Pause Preview")
@@ -563,6 +604,186 @@ class MainWindow(QMainWindow):
             self.play_button.setText("Play Preview")
             return
         self._seek_frame(next_frame)
+        if self.preview_detection_checkbox.isChecked():
+            self._run_preview_detection_on_current_frame()
+
+    def _on_preview_detection_toggled(self, checked: bool) -> None:
+        if not checked:
+            self._reset_preview_inference(clear_detector=False, clear_overlay=True)
+            self.status_label.setText("Preview detection off")
+            self._refresh_action_states()
+            return
+
+        if self.video_path is None:
+            self.preview_detection_checkbox.blockSignals(True)
+            self.preview_detection_checkbox.setChecked(False)
+            self.preview_detection_checkbox.blockSignals(False)
+            self.status_label.setText("Open a video first")
+            self._refresh_action_states()
+            return
+
+        if not self._ensure_preview_detector():
+            self.preview_detection_checkbox.blockSignals(True)
+            self.preview_detection_checkbox.setChecked(False)
+            self.preview_detection_checkbox.blockSignals(False)
+            self._clear_preview_overlays()
+            self._refresh_action_states()
+            return
+
+        self._reset_preview_tracker()
+        self._reset_preview_event_state()
+        self.status_label.setText("Preview detection on")
+        self._refresh_action_states()
+
+    def _ensure_preview_detector(self) -> bool:
+        if self.preview_detector is not None and self.preview_tracker is not None:
+            return True
+        try:
+            self.preview_detector = OnnxYoloPersonDetector(
+                DetectorConfig(
+                    model_path=self.preferences.detector_model_path,
+                    confidence=self.preferences.detector_confidence,
+                    iou=self.preferences.detector_iou,
+                )
+            )
+            self.preview_tracker = ByteTrackLite(iou_threshold=self.preferences.detector_iou)
+            return True
+        except DetectorInitializationError as exc:
+            QMessageBox.warning(self, "Preview Detection", f"Cannot start preview detection:\n{exc}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Preview Detection", f"Failed to initialize detector:\n{exc}")
+
+        self.preview_detector = None
+        self.preview_tracker = None
+        return False
+
+    def _reset_preview_tracker(self) -> None:
+        if self.preview_tracker is None:
+            self.preview_tracker = ByteTrackLite(iou_threshold=self.preferences.detector_iou)
+        else:
+            self.preview_tracker.reset()
+
+    def _clear_preview_overlays(self) -> None:
+        self.canvas.set_tracks([])
+        self.canvas.set_active_roi_ids(set())
+
+    def _reset_preview_event_state(self) -> None:
+        self.preview_presence.clear()
+        self.preview_last_overlay_ts = None
+
+    def _reset_preview_inference(self, *, clear_detector: bool, clear_overlay: bool) -> None:
+        if self.preview_tracker is not None:
+            self.preview_tracker.reset()
+        self._reset_preview_event_state()
+        if clear_detector:
+            self.preview_detector = None
+            self.preview_tracker = None
+        if clear_overlay:
+            self._clear_preview_overlays()
+
+    def _run_preview_detection_on_current_frame(self) -> None:
+        if self.current_frame_rotated is None:
+            return
+        if not self._ensure_preview_detector():
+            self.preview_detection_checkbox.blockSignals(True)
+            self.preview_detection_checkbox.setChecked(False)
+            self.preview_detection_checkbox.blockSignals(False)
+            self._clear_preview_overlays()
+            self._refresh_action_states()
+            return
+
+        assert self.preview_detector is not None
+        assert self.preview_tracker is not None
+
+        try:
+            detections = self.preview_detector.detect(self.current_frame_rotated)
+            tracks = self.preview_tracker.update(detections)
+        except Exception as exc:
+            self.preview_detection_checkbox.blockSignals(True)
+            self.preview_detection_checkbox.setChecked(False)
+            self.preview_detection_checkbox.blockSignals(False)
+            self._clear_preview_overlays()
+            self.status_label.setText(f"Preview detection failed: {exc}")
+            self._refresh_action_states()
+            return
+
+        active_roi_ids: set[str] = set()
+        for roi_id, roi in self.rois.items():
+            n = roi.normalized()
+            for track in tracks:
+                cx, cy = track.center
+                if n.contains(cx, cy):
+                    active_roi_ids.add(roi_id)
+                    break
+
+        self.canvas.set_tracks(tracks)
+        self.canvas.set_active_roi_ids(active_roi_ids)
+
+        if self.video_path is None:
+            return
+
+        preview_events = self.preview_event_engine._update_presence(
+            rois=[roi.normalized() for roi in self.rois.values()],
+            direction_vectors=dict(self.direction_vectors),
+            mode=self._current_mode(),
+            frame_index=self.current_frame_index,
+            video_time_ms=self.current_video_time_ms,
+            video_name=Path(self.video_path).name,
+            tracks=tracks,
+            presence=self.preview_presence,
+        )
+        if not preview_events:
+            return
+
+        overlay_ts_ms, overlay_status, ocr_conf = self._resolve_overlay_timestamp_for_frame(
+            frame_bgr=self.current_frame_rotated,
+            frame_index=self.current_frame_index,
+            last_valid_ts=self.preview_last_overlay_ts,
+        )
+        if overlay_status in {OverlayTSStatus.OK, OverlayTSStatus.INTERPOLATED_NEIGHBOR}:
+            self.preview_last_overlay_ts = overlay_ts_ms
+
+        correction = int(self.correction_edit.text() or 0)
+        corrected_ts = overlay_ts_ms + correction if overlay_ts_ms is not None else None
+
+        for event in preview_events:
+            event.overlay_ts_ms = overlay_ts_ms
+            event.overlay_ts_status = overlay_status
+            event.correction_ms = correction
+            event.corrected_ts_ms = corrected_ts
+            event.ocr_conf = ocr_conf
+            self._on_analysis_event(event)
+
+    def _resolve_overlay_timestamp_for_frame(
+        self,
+        *,
+        frame_bgr,
+        frame_index: int,
+        last_valid_ts: int | None,
+    ) -> tuple[int | None, OverlayTSStatus, float | None]:
+        ocr_result = self.timestamp_ocr.extract_timestamp(frame_bgr)
+        candidate_ts = (
+            ocr_result.timestamp_ms
+            if self.timestamp_ocr.is_valid_timestamp(ocr_result.timestamp_ms)
+            else None
+        )
+        if candidate_ts is not None:
+            return candidate_ts, OverlayTSStatus.OK, ocr_result.confidence
+
+        if self.video_path is not None:
+            neighbor_ts, neighbor_conf = self.timestamp_ocr.interpolate_timestamp_from_neighbors(
+                video_path=self.video_path,
+                frame_index=frame_index,
+                rotation_deg=self.rotation_deg,
+                fast=True,
+            )
+            if neighbor_ts is not None:
+                conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
+                return neighbor_ts, OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf
+
+        if last_valid_ts is not None and self.timestamp_ocr.is_valid_timestamp(last_valid_ts):
+            return last_valid_ts, OverlayTSStatus.INTERPOLATED_PREV, ocr_result.confidence
+        return None, OverlayTSStatus.FAILED, ocr_result.confidence
 
     def _rotate(self, delta: int) -> None:
         if self.rois:
@@ -589,7 +810,13 @@ class MainWindow(QMainWindow):
         if self.current_frame_raw is not None:
             self.current_frame_rotated = rotate_bgr(self.current_frame_raw, self.rotation_deg)
             self.canvas.set_frame(self.current_frame_rotated)
+        self.ocr_manual_roi = None
+        self.timestamp_ocr.set_manual_roi(None)
+        self.timestamp_ocr.clear_auto_roi()
+        self.canvas.set_timestamp_roi(None)
+        self._reset_preview_inference(clear_detector=False, clear_overlay=True)
         self.status_label.setText(f"Rotation: {self.rotation_deg} deg")
+        self._set_notice("Rotation changed. Set TS ROI again before analysis.")
         self._refresh_action_states()
 
     def _toggle_partial_fields(self) -> None:
@@ -608,6 +835,7 @@ class MainWindow(QMainWindow):
         self._refresh_roi_list(selected_roi_id=roi_id)
         self.canvas.set_rois(self.rois)
         self.canvas.set_direction_vectors(self.direction_vectors)
+        self._reset_preview_event_state()
         self.status_label.setText(f"Added {roi_id}")
         self._refresh_action_states()
 
@@ -696,6 +924,7 @@ class MainWindow(QMainWindow):
         self._refresh_roi_list()
         self.canvas.set_rois(self.rois)
         self.canvas.set_direction_vectors(self.direction_vectors)
+        self._reset_preview_event_state()
         self._refresh_action_states()
 
     def _clear_all_rois(self) -> None:
@@ -709,6 +938,7 @@ class MainWindow(QMainWindow):
         self._refresh_roi_list()
         self.canvas.set_rois(self.rois)
         self.canvas.set_direction_vectors(self.direction_vectors)
+        self._reset_preview_event_state()
         self._refresh_action_states()
 
     def _on_manual_timestamp_roi_created(self, roi: ROI) -> None:
@@ -716,6 +946,7 @@ class MainWindow(QMainWindow):
         self.timestamp_ocr.set_manual_roi(self.ocr_manual_roi)
         self.canvas.set_timestamp_roi(self.ocr_manual_roi)
         self.status_label.setText("Manual timestamp ROI set")
+        self._set_notice("Timestamp ROI is set. You can start analysis.")
 
     def _auto_detect_timestamp_roi(self) -> None:
         if self.current_frame_rotated is None:
@@ -723,9 +954,11 @@ class MainWindow(QMainWindow):
         roi = self.timestamp_ocr.detect_auto_roi(self.current_frame_rotated)
         if roi is None:
             QMessageBox.information(self, "OCR ROI", "Failed to auto-detect timestamp ROI")
+            self._set_notice("Auto TS ROI detect failed. Use Add TS ROI and draw it manually.")
             return
         self.canvas.set_timestamp_roi(roi)
         self.status_label.setText("Auto timestamp ROI detected")
+        self._set_notice("Auto TS ROI detected. You can start analysis.")
 
     def _set_correction_dialog(self) -> None:
         current = int(self.correction_edit.text() or 0)
@@ -770,6 +1003,7 @@ class MainWindow(QMainWindow):
     def _on_ocr_debug_finished(self, result, backend: str) -> None:
         ts_display = str(result.timestamp_ms) if result.timestamp_ms is not None else "-"
         conf_display = f"{result.confidence:.3f}" if result.confidence is not None else "-"
+        valid_display = str(self.timestamp_ocr.is_valid_timestamp(result.timestamp_ms))
         roi_display = (
             f"{result.roi.roi_id} ({result.roi.x},{result.roi.y},{result.roi.w},{result.roi.h})"
             if result.roi is not None
@@ -787,6 +1021,7 @@ class MainWindow(QMainWindow):
                     f"backend: {backend}",
                     f"success: {result.success}",
                     f"timestamp_ms: {ts_display}",
+                    f"valid_177_13digits: {valid_display}",
                     f"confidence: {conf_display}",
                     f"roi: {roi_display}",
                     f"raw_text: {result.raw_text!r}",
@@ -819,23 +1054,45 @@ class MainWindow(QMainWindow):
                 return AnalysisMode.ENTRY_ONLY
         return AnalysisMode.ENTRY_ONLY
 
+    def _default_notice_text(self) -> str:
+        return (
+            "Instructions:\n"
+            "1) Open video.\n"
+            "2) Add ROI (required).\n"
+            "3) Add TS ROI or Auto Detect Timestamp ROI (required).\n"
+            "4) Choose Full/Partial and start analysis."
+        )
+
+    def _set_notice(self, message: str) -> None:
+        self.notice_text.setPlainText(message.strip())
+
+    def _has_timestamp_roi(self) -> bool:
+        return (self.ocr_manual_roi is not None) or (self.timestamp_ocr.auto_roi is not None)
+
+    def _validate_analysis_request(self, force_full: bool) -> str | None:
+        if self.video_path is None:
+            return "Open a video first."
+        if not self.rois:
+            return "Add at least one ROI before starting analysis."
+        if not self._has_timestamp_roi():
+            return "Set timestamp ROI first. Use Add TS ROI or Tools > Auto Detect Timestamp ROI."
+        if (not force_full) and self.duration_ms_spin.value() <= 0:
+            return "Duration must be greater than 0 for partial analysis."
+        return None
+
     def _start_analysis(self, force_full: bool) -> None:
         if self.analysis_worker is not None:
             QMessageBox.warning(self, "Busy", "Analysis is already running")
+            self._set_notice("Analysis is already running.")
             return
 
-        if self.video_path is None:
-            QMessageBox.warning(self, "Missing video", "Open a video first")
-            return
-
-        if not self.rois:
-            QMessageBox.warning(self, "Missing ROI", "Add at least one ROI")
+        validation_error = self._validate_analysis_request(force_full=force_full)
+        if validation_error is not None:
+            self._set_notice(validation_error)
+            self.status_label.setText("Analysis blocked. Check TEXT NOTICE.")
             return
 
         analyze_full = force_full
-        if not analyze_full and self.duration_ms_spin.value() <= 0:
-            QMessageBox.warning(self, "Invalid range", "Duration must be > 0")
-            return
 
         mode = self._current_mode()
         correction = int(self.correction_edit.text() or 0)
@@ -861,8 +1118,7 @@ class MainWindow(QMainWindow):
             chunk_seconds=self.preferences.chunk_seconds,
         )
 
-        self.events.clear()
-        self.event_list.clear()
+        self._clear_detected_events(confirm=False)
         self.progress_bar.setValue(0)
 
         self.analysis_thread = QThread(self)
@@ -881,6 +1137,7 @@ class MainWindow(QMainWindow):
         self.analysis_thread.start()
         scope = "full" if analyze_full else "partial"
         self.status_label.setText(f"Analysis started ({scope})")
+        self._set_notice(f"Analysis started ({scope}).")
         self._refresh_action_states()
 
     def _stop_analysis(self) -> None:
@@ -937,7 +1194,8 @@ class MainWindow(QMainWindow):
         direction = event.direction_label if event.direction_label is not None else "-"
         return (
             f"[{event.roi_id}] {event.event_type} id={event.person_id} "
-            f"dir={direction} ts={corrected} frame={event.frame_index}"
+            f"dir={direction} ts={corrected} frame={event.frame_index} "
+            f"all={event.visible_person_count} roi={event.roi_person_count}"
         )
 
     def _on_event_item_clicked(self, item: QListWidgetItem) -> None:
@@ -946,6 +1204,19 @@ class MainWindow(QMainWindow):
             return
         event = self.events[int(idx)]
         self._seek_frame(event.frame_index)
+        self._refresh_action_states()
+
+    def _clear_detected_events(self, *, confirm: bool) -> None:
+        if not self.events:
+            return
+        if confirm:
+            answer = QMessageBox.question(self, "Clear Events", "Delete all detected events?")
+            if answer != QMessageBox.Yes:
+                return
+
+        self.events.clear()
+        self.event_list.clear()
+        self._reset_preview_event_state()
         self._refresh_action_states()
 
     def _rerun_ocr_on_selected_event(self) -> None:
@@ -968,18 +1239,11 @@ class MainWindow(QMainWindow):
             return
 
         rotated = rotate_bgr(frame, self.rotation_deg)
-        result = self.timestamp_ocr.extract_timestamp(rotated)
-
-        if result.success:
-            overlay = result.timestamp_ms
-            status = OverlayTSStatus.OK
-        else:
-            overlay = event.overlay_ts_ms
-            status = (
-                OverlayTSStatus.INTERPOLATED_PREV
-                if overlay is not None
-                else OverlayTSStatus.FAILED
-            )
+        overlay, status, ocr_conf = self._resolve_overlay_timestamp_for_frame(
+            frame_bgr=rotated,
+            frame_index=event.frame_index,
+            last_valid_ts=event.overlay_ts_ms,
+        )
 
         correction = int(self.correction_edit.text() or 0)
         corrected = overlay + correction if overlay is not None else None
@@ -988,7 +1252,7 @@ class MainWindow(QMainWindow):
         event.overlay_ts_status = status
         event.correction_ms = correction
         event.corrected_ts_ms = corrected
-        event.ocr_conf = result.confidence
+        event.ocr_conf = ocr_conf
         item.setText(self._event_text(event))
 
         if self.output_dir is not None:
@@ -1076,6 +1340,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             self.preferences = dialog.value()
             save_preferences(self.preferences)
+            self._reset_preview_inference(clear_detector=True, clear_overlay=True)
 
     def _session_config(self) -> SessionConfig:
         mode = self._current_mode()
@@ -1175,6 +1440,7 @@ class MainWindow(QMainWindow):
             AppCommand.RUN_FULL: has_video and has_roi and not running,
             AppCommand.RUN_PARTIAL: has_video and has_roi and not running,
             AppCommand.STOP_ANALYSIS: running,
+            AppCommand.CLEAR_DETECTED_EVENTS: has_events,
             AppCommand.SET_MODE_A: has_video and not running,
             AppCommand.SET_MODE_B: has_video and not running,
             AppCommand.AUTO_OCR_ROI: has_video,
@@ -1185,6 +1451,7 @@ class MainWindow(QMainWindow):
             AppCommand.VIEW_LOGS: self.output_dir is not None,
             AppCommand.RESET_LAYOUT: True,
             AppCommand.PREFERENCES: not running,
+            AppCommand.DEBUG_OCR_CURRENT_FRAME: has_video and not ocr_debug_running,
         }
 
         for command, enabled in enable_map.items():
@@ -1195,13 +1462,11 @@ class MainWindow(QMainWindow):
         for command, button in self.command_buttons.items():
             button.setEnabled(enable_map.get(command, True))
 
-        self.start_analysis_button.setEnabled(has_video and has_roi and not running)
-        self.ocr_current_frame_button.setEnabled(has_video and not ocr_debug_running)
-
         preview_enabled = has_video and not running
         self.play_button.setEnabled(preview_enabled)
         self.prev_button.setEnabled(preview_enabled)
         self.next_button.setEnabled(preview_enabled)
+        self.preview_detection_checkbox.setEnabled(preview_enabled)
         self.frame_slider.setEnabled(has_video)
 
         self._sync_mode_actions()
@@ -1212,6 +1477,10 @@ class MainWindow(QMainWindow):
         self.menu_actions[AppCommand.SET_MODE_B].setChecked(
             mode == AnalysisMode.ENTRY_EXIT_DIRECTION
         )
+
+    def _on_mode_changed(self, _index: int) -> None:
+        self._reset_preview_event_state()
+        self._sync_mode_actions()
 
     def closeEvent(self, event) -> None:
         self.play_timer.stop()

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from isac_labelr.io.video_stream import rotate_bgr
 from isac_labelr.models import ROI
 
 try:
@@ -23,6 +24,8 @@ except Exception:  # pragma: no cover - optional runtime import
 TS_REGEX = re.compile(r"(\d{13})")
 EPOCH_MIN_MS = 946684800000      # 2000-01-01
 EPOCH_MAX_MS = 4102444800000     # 2100-01-01
+EXPECTED_TS_PREFIX = "177"
+EXPECTED_TS_DIGITS = 13
 
 
 @dataclass(slots=True)
@@ -55,6 +58,10 @@ class TimestampOCR:
     @property
     def backend(self) -> str:
         return self._backend
+
+    @property
+    def auto_roi(self) -> ROI | None:
+        return self._auto_roi
 
     def set_manual_roi(self, roi: ROI | None) -> None:
         self._manual_roi = roi
@@ -296,6 +303,61 @@ class TimestampOCR:
             return best_txt, best_conf
 
         return "", 0.0
+
+    @staticmethod
+    def is_valid_timestamp(timestamp_ms: int | None) -> bool:
+        if timestamp_ms is None:
+            return False
+        txt = str(int(timestamp_ms))
+        return len(txt) == EXPECTED_TS_DIGITS and txt.startswith(EXPECTED_TS_PREFIX)
+
+    @staticmethod
+    def _read_rotated_frame(video_path: str, frame_index: int, rotation_deg: int) -> np.ndarray | None:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        try:
+            if frame_index < 0:
+                return None
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                return None
+            return rotate_bgr(frame, rotation_deg)
+        finally:
+            cap.release()
+
+    def interpolate_timestamp_from_neighbors(
+        self,
+        *,
+        video_path: str,
+        frame_index: int,
+        rotation_deg: int,
+        fast: bool = True,
+    ) -> tuple[int | None, float | None]:
+        if frame_index <= 0:
+            return None, None
+
+        prev_frame = self._read_rotated_frame(video_path, frame_index - 1, rotation_deg)
+        next_frame = self._read_rotated_frame(video_path, frame_index + 1, rotation_deg)
+        if prev_frame is None or next_frame is None:
+            return None, None
+
+        prev_result = self.extract_timestamp(prev_frame, fast=fast)
+        next_result = self.extract_timestamp(next_frame, fast=fast)
+        prev_ts = prev_result.timestamp_ms if self.is_valid_timestamp(prev_result.timestamp_ms) else None
+        next_ts = next_result.timestamp_ms if self.is_valid_timestamp(next_result.timestamp_ms) else None
+        if prev_ts is None or next_ts is None:
+            return None, None
+
+        interpolated = int(round((prev_ts + next_ts) / 2.0))
+        conf_values = [
+            c
+            for c in [prev_result.confidence, next_result.confidence]
+            if c is not None
+        ]
+        conf = float(np.mean(conf_values)) if conf_values else None
+        return interpolated, conf
 
     def extract_timestamp(self, frame_bgr: np.ndarray, *, fast: bool = False) -> OCRResult:
         candidates = self._build_candidate_rois(frame_bgr, fast=fast)

@@ -23,6 +23,8 @@ CSV_FIELDS = [
     "corrected_ts_ms",
     "det_conf",
     "ocr_conf",
+    "visible_person_count",
+    "roi_person_count",
 ]
 
 

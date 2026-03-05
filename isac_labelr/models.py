@@ -18,6 +18,7 @@ class OCRRoiMode(StrEnum):
 class OverlayTSStatus(StrEnum):
     OK = "ok"
     INTERPOLATED_PREV = "interpolated_prev"
+    INTERPOLATED_NEIGHBOR = "interpolated_neighbor"
     FAILED = "failed"
 
 
@@ -94,6 +95,8 @@ class EventRecord:
     corrected_ts_ms: int | None
     det_conf: float
     ocr_conf: float | None
+    visible_person_count: int
+    roi_person_count: int
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

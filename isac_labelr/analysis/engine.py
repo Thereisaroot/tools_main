@@ -110,32 +110,28 @@ class AnalysisEngine:
                 presence=presence,
             )
 
-            for event in events:
-                ocr_result = ocr.extract_timestamp(packet.image_bgr)
-                if ocr_result.success:
-                    overlay_ts_ms = ocr_result.timestamp_ms
-                    overlay_status = OverlayTSStatus.OK
-                    self._last_overlay_ts = overlay_ts_ms
-                elif self._last_overlay_ts is not None:
-                    overlay_ts_ms = self._last_overlay_ts
-                    overlay_status = OverlayTSStatus.INTERPOLATED_PREV
-                else:
-                    overlay_ts_ms = None
-                    overlay_status = OverlayTSStatus.FAILED
-
+            if events:
+                overlay_ts_ms, overlay_status, ocr_conf = self._resolve_overlay_timestamp(
+                    ocr=ocr,
+                    frame_bgr=packet.image_bgr,
+                    video_path=request.video_path,
+                    frame_index=packet.frame_index,
+                    rotation_deg=request.rotation_deg,
+                )
                 corrected_ts = (
                     overlay_ts_ms + request.timestamp_correction_ms
                     if overlay_ts_ms is not None
                     else None
                 )
-                event.overlay_ts_ms = overlay_ts_ms
-                event.overlay_ts_status = overlay_status
-                event.corrected_ts_ms = corrected_ts
-                event.correction_ms = request.timestamp_correction_ms
-                event.ocr_conf = ocr_result.confidence
+                for event in events:
+                    event.overlay_ts_ms = overlay_ts_ms
+                    event.overlay_ts_status = overlay_status
+                    event.corrected_ts_ms = corrected_ts
+                    event.correction_ms = request.timestamp_correction_ms
+                    event.ocr_conf = ocr_conf
 
-                on_event(event)
-                processed_events += 1
+                    on_event(event)
+                    processed_events += 1
 
             on_progress(
                 AnalysisProgress(
@@ -164,9 +160,21 @@ class AnalysisEngine:
         active_ids = {t.track_id for t in tracks}
         tracks_by_id = {t.track_id: t for t in tracks}
         events: list[EventRecord] = []
+        visible_person_count = len(tracks)
+        roi_person_counts: dict[str, int] = {}
 
         for roi in rois:
             roi_n = roi.normalized()
+            count = 0
+            for track in tracks:
+                cx, cy = track.center
+                if roi_n.contains(cx, cy):
+                    count += 1
+            roi_person_counts[roi_n.roi_id] = count
+
+        for roi in rois:
+            roi_n = roi.normalized()
+            roi_person_count = roi_person_counts.get(roi_n.roi_id, 0)
 
             # Step 1: active tracks
             for track in tracks:
@@ -185,6 +193,8 @@ class AnalysisEngine:
                     frame_index=frame_index,
                     video_time_ms=video_time_ms,
                     video_name=video_name,
+                    visible_person_count=visible_person_count,
+                    roi_person_count=roi_person_count,
                 )
                 if event is not None:
                     events.append(event)
@@ -207,6 +217,8 @@ class AnalysisEngine:
                     video_time_ms=video_time_ms,
                     video_name=video_name,
                     person_id_override=person_id,
+                    visible_person_count=visible_person_count,
+                    roi_person_count=roi_person_count,
                 )
                 if event is not None:
                     events.append(event)
@@ -225,6 +237,8 @@ class AnalysisEngine:
         frame_index: int,
         video_time_ms: int,
         video_name: str,
+        visible_person_count: int,
+        roi_person_count: int,
         person_id_override: int | None = None,
     ) -> EventRecord | None:
         debounce = 3
@@ -252,6 +266,8 @@ class AnalysisEngine:
                     corrected_ts_ms=None,
                     det_conf=conf,
                     ocr_conf=None,
+                    visible_person_count=visible_person_count,
+                    roi_person_count=roi_person_count,
                 )
             return None
 
@@ -275,9 +291,41 @@ class AnalysisEngine:
                 corrected_ts_ms=None,
                 det_conf=conf,
                 ocr_conf=None,
+                visible_person_count=visible_person_count,
+                roi_person_count=roi_person_count,
             )
 
         return None
+
+    def _resolve_overlay_timestamp(
+        self,
+        *,
+        ocr: TimestampOCR,
+        frame_bgr,
+        video_path: str,
+        frame_index: int,
+        rotation_deg: int,
+    ) -> tuple[int | None, OverlayTSStatus, float | None]:
+        ocr_result = ocr.extract_timestamp(frame_bgr)
+        candidate_ts = ocr_result.timestamp_ms if ocr.is_valid_timestamp(ocr_result.timestamp_ms) else None
+        if candidate_ts is not None:
+            self._last_overlay_ts = candidate_ts
+            return candidate_ts, OverlayTSStatus.OK, ocr_result.confidence
+
+        neighbor_ts, neighbor_conf = ocr.interpolate_timestamp_from_neighbors(
+            video_path=video_path,
+            frame_index=frame_index,
+            rotation_deg=rotation_deg,
+            fast=True,
+        )
+        if neighbor_ts is not None:
+            self._last_overlay_ts = neighbor_ts
+            conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
+            return neighbor_ts, OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf
+
+        if self._last_overlay_ts is not None:
+            return self._last_overlay_ts, OverlayTSStatus.INTERPOLATED_PREV, ocr_result.confidence
+        return None, OverlayTSStatus.FAILED, ocr_result.confidence
 
     @staticmethod
     def _direction_label(track: Track | None, direction: Vector2 | None) -> str | None:
