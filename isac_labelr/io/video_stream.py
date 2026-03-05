@@ -200,9 +200,13 @@ class VideoStream:
         chunk_seconds: int,
         on_chunk: Callable[[int, int], None] | None,
     ) -> Iterator[FramePacket]:
-        cap = cv2.VideoCapture(str(self.video_path))
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {self.video_path}")
+        def open_cap() -> cv2.VideoCapture:
+            c = cv2.VideoCapture(str(self.video_path))
+            if not c.isOpened():
+                raise RuntimeError(f"Cannot open video: {self.video_path}")
+            return c
+
+        cap = open_cap()
 
         end_ms = (start_ms + duration_ms) if duration_ms is not None else None
         chunk_ms = max(1, chunk_seconds) * 1000
@@ -234,8 +238,13 @@ class VideoStream:
                 yield FramePacket(frame_index=frame_index, time_ms=time_ms, image_bgr=rotated)
 
                 if on_chunk and (time_ms - last_chunk_tick) >= chunk_ms:
+                    # Periodically refresh VideoCapture to avoid long-run decoder memory growth.
+                    next_frame_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (frame_no + 1))
                     chunk_idx += 1
                     last_chunk_tick = time_ms
                     on_chunk(chunk_idx, time_ms)
+                    cap.release()
+                    cap = open_cap()
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, float(max(0, next_frame_pos)))
         finally:
             cap.release()

@@ -29,7 +29,11 @@ if ([version]$PyVersion -lt [version]"3.13") {
     Write-Host "[setup] rapidocr install failed. OCR fallback will use pytesseract."
   }
 } else {
-  Write-Host "[setup] python>=3.13 detected. rapidocr skipped, pytesseract fallback mode."
+  Write-Host "[setup] python>=3.13 detected. installing rapidocr (new package)."
+  python -m pip install "rapidocr>=3.7.0"
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "[setup] rapidocr install failed. OCR fallback will use pytesseract."
+  }
 }
 
 python -m pip install av

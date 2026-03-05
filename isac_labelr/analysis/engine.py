@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,7 @@ from threading import Event as ThreadEvent
 from typing import Callable
 
 from isac_labelr.io.video_stream import VideoStream
+from isac_labelr.monitor.memory import get_memory_snapshot
 from isac_labelr.models import (
     AnalysisMode,
     AnalysisProgress,
@@ -36,6 +38,14 @@ class PresenceState:
 class AnalysisEngine:
     def __init__(self) -> None:
         self._last_overlay_ts: int | None = None
+        self._last_overlay_video_time_ms: int | None = None
+        self._last_ocr_frame_index: int | None = None
+        self._mem_diag_enabled = str(os.getenv("ISAC_MEM_DIAG", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     @staticmethod
     def _coerce_mode(mode: AnalysisMode | str) -> AnalysisMode:
@@ -59,21 +69,39 @@ class AnalysisEngine:
     ) -> AnalysisResult:
         video_stream = VideoStream(request.video_path)
         info = video_stream.info
-
-        detector = OnnxYoloPersonDetector(
-            DetectorConfig(
-                model_path=request.detector_model_path,
-                confidence=request.detector_confidence,
-                iou=request.detector_iou,
-            )
+        detector_cfg = DetectorConfig(
+            model_path=request.detector_model_path,
+            confidence=request.detector_confidence,
+            iou=request.detector_iou,
         )
+        detector_reset_interval = max(
+            0,
+            int(os.getenv("ISAC_DETECTOR_RESET_INTERVAL", "100")),
+        )
+        ocr_reset_interval = max(
+            0,
+            int(os.getenv("ISAC_OCR_RESET_INTERVAL", "50")),
+        )
+        ocr_sample_frames = max(
+            1,
+            int(os.getenv("ISAC_OCR_SAMPLE_FRAMES", "5")),
+        )
+
+        detector = OnnxYoloPersonDetector(detector_cfg)
+        if detector.backend == "onnxruntime" and detector.providers:
+            logger.info("detector_provider providers=%s", ",".join(detector.providers))
         tracker = ByteTrackLite(iou_threshold=request.detector_iou)
         ocr = TimestampOCR()
         ocr.set_manual_roi(request.ocr_manual_roi)
 
         processed_events = 0
+        ocr_uses = 0
+        ocr_resets = 0
         presence: dict[tuple[str, int], PresenceState] = {}
         mode = self._coerce_mode(request.mode)
+        self._last_overlay_ts = None
+        self._last_overlay_video_time_ms = None
+        self._last_ocr_frame_index = None
 
         start_ms = 0 if request.analyze_full else request.start_ms
         duration_ms = None if request.analyze_full else request.duration_ms
@@ -81,74 +109,153 @@ class AnalysisEngine:
         logger.info("analysis_start video=%s", request.video_path)
 
         def on_chunk(chunk_idx: int, time_ms: int) -> None:
-            logger.info("chunk_flush chunk=%s time_ms=%s events=%s", chunk_idx, time_ms, processed_events)
+            logger.info(
+                "chunk_flush chunk=%s time_ms=%s events=%s ocr_calls=%s ocr_resets=%s",
+                chunk_idx,
+                time_ms,
+                processed_events,
+                ocr_uses,
+                ocr_resets,
+            )
 
         processed_frames = 0
-        for packet in video_stream.iter_frames(
-            rotation_deg=request.rotation_deg,
-            start_ms=start_ms,
-            duration_ms=duration_ms,
-            chunk_seconds=request.chunk_seconds,
-            on_chunk=on_chunk,
-        ):
-            if stop_event.is_set():
-                logger.info("analysis_aborted frame_index=%s", packet.frame_index)
-                return AnalysisResult(
-                    total_events=processed_events,
-                    output_dir=Path("."),
-                    aborted=True,
-                )
+        try:
+            for packet in video_stream.iter_frames(
+                rotation_deg=request.rotation_deg,
+                start_ms=start_ms,
+                duration_ms=duration_ms,
+                chunk_seconds=request.chunk_seconds,
+                on_chunk=on_chunk,
+            ):
+                if stop_event.is_set():
+                    logger.info("analysis_aborted frame_index=%s", packet.frame_index)
+                    return AnalysisResult(
+                        total_events=processed_events,
+                        output_dir=Path("."),
+                        aborted=True,
+                    )
 
-            processed_frames += 1
-            detections = detector.detect(packet.image_bgr)
-            tracks = tracker.update(detections)
-            events = self._update_presence(
-                rois=request.rois,
-                direction_vectors=request.direction_vectors,
-                mode=mode,
-                frame_index=packet.frame_index,
-                video_time_ms=packet.time_ms,
-                video_name=Path(request.video_path).name,
-                tracks=tracks,
-                presence=presence,
-            )
-
-            if events:
-                overlay_ts_ms, overlay_status, ocr_conf = self._resolve_overlay_timestamp(
-                    ocr=ocr,
-                    frame_bgr=packet.image_bgr,
-                    video_path=request.video_path,
-                    frame_index=packet.frame_index,
+                processed_frames += 1
+                if detector_reset_interval > 0 and processed_frames > 1:
+                    if processed_frames % detector_reset_interval == 0:
+                        old = detector
+                        detector = OnnxYoloPersonDetector(detector_cfg)
+                        del old
+                        gc.collect()
+                        logger.info(
+                            "detector_reset frame=%s interval=%s",
+                            packet.frame_index,
+                            detector_reset_interval,
+                        )
+                detections = detector.detect(packet.image_bgr)
+                tracks = tracker.update(detections)
+                events = self._update_presence(
+                    rois=request.rois,
+                    direction_vectors=request.direction_vectors,
                     rotation_deg=request.rotation_deg,
-                )
-                corrected_ts = (
-                    overlay_ts_ms + request.timestamp_correction_ms
-                    if overlay_ts_ms is not None
-                    else None
-                )
-                for event in events:
-                    event.overlay_ts_ms = overlay_ts_ms
-                    event.overlay_ts_status = overlay_status
-                    event.corrected_ts_ms = corrected_ts
-                    event.correction_ms = request.timestamp_correction_ms
-                    event.ocr_conf = ocr_conf
-
-                    on_event(event)
-                    processed_events += 1
-
-            if processed_frames % 600 == 0:
-                gc.collect()
-
-            on_progress(
-                AnalysisProgress(
+                    mode=mode,
                     frame_index=packet.frame_index,
-                    total_frames=info.total_frames,
                     video_time_ms=packet.time_ms,
-                    processed_events=processed_events,
+                    video_name=Path(request.video_path).name,
+                    tracks=tracks,
+                    presence=presence,
                 )
-            )
 
-        logger.info("analysis_complete events=%s", processed_events)
+                if events:
+                    can_sample = (
+                        ocr_sample_frames > 1
+                        and self._last_overlay_ts is not None
+                        and self._last_overlay_video_time_ms is not None
+                        and self._last_ocr_frame_index is not None
+                        and (packet.frame_index - self._last_ocr_frame_index) < ocr_sample_frames
+                    )
+                    if can_sample:
+                        delta = max(0, int(packet.time_ms) - int(self._last_overlay_video_time_ms))
+                        overlay_ts_ms = int(self._last_overlay_ts) + delta
+                        overlay_status = OverlayTSStatus.INTERPOLATED_PREV
+                        ocr_conf = None
+                        self._last_overlay_ts = overlay_ts_ms
+                        self._last_overlay_video_time_ms = packet.time_ms
+                    else:
+                        overlay_ts_ms, overlay_status, ocr_conf = self._resolve_overlay_timestamp(
+                            ocr=ocr,
+                            frame_bgr=packet.image_bgr,
+                            video_path=request.video_path,
+                            frame_index=packet.frame_index,
+                            video_time_ms=packet.time_ms,
+                            rotation_deg=request.rotation_deg,
+                            logger=logger,
+                        )
+                        ocr_uses += 1
+                        self._last_ocr_frame_index = packet.frame_index
+                    corrected_ts = (
+                        overlay_ts_ms + request.timestamp_correction_ms
+                        if overlay_ts_ms is not None
+                        else None
+                    )
+                    for event in events:
+                        event.overlay_ts_ms = overlay_ts_ms
+                        event.overlay_ts_status = overlay_status
+                        event.corrected_ts_ms = corrected_ts
+                        event.correction_ms = request.timestamp_correction_ms
+                        event.ocr_conf = ocr_conf
+
+                        on_event(event)
+                        processed_events += 1
+                    if ocr_reset_interval > 0 and ocr_uses > 0 and ocr_uses % ocr_reset_interval == 0:
+                        ocr.reset()
+                        ocr_resets += 1
+                        gc.collect()
+                        logger.info(
+                            "ocr_reset frame=%s interval=%s ocr_calls=%s ocr_resets=%s",
+                            packet.frame_index,
+                            ocr_reset_interval,
+                            ocr_uses,
+                            ocr_resets,
+                        )
+
+                if processed_frames % 600 == 0:
+                    gc.collect()
+                if self._mem_diag_enabled and processed_frames % 300 == 0:
+                    snap = get_memory_snapshot()
+                    logger.info(
+                        (
+                            "mem_diag frame=%s rss_self_mb=%.1f rss_tree_mb=%.1f footprint_mb=%s child=%s src=%s "
+                            "presence=%s events=%s ocr_calls=%s ocr_resets=%s"
+                        ),
+                        packet.frame_index,
+                        snap.rss_mb,
+                        snap.tree_rss_mb,
+                        (
+                            f"{snap.phys_footprint_mb:.1f}"
+                            if snap.phys_footprint_mb is not None
+                            else "-"
+                        ),
+                        snap.child_count,
+                        snap.backend,
+                        len(presence),
+                        processed_events,
+                        ocr_uses,
+                        ocr_resets,
+                    )
+
+                on_progress(
+                    AnalysisProgress(
+                        frame_index=packet.frame_index,
+                        total_frames=info.total_frames,
+                        video_time_ms=packet.time_ms,
+                        processed_events=processed_events,
+                    )
+                )
+        finally:
+            ocr.close()
+
+        logger.info(
+            "analysis_complete events=%s ocr_calls=%s ocr_resets=%s",
+            processed_events,
+            ocr_uses,
+            ocr_resets,
+        )
         return AnalysisResult(total_events=processed_events, output_dir=Path("."), aborted=False)
 
     def _update_presence(
@@ -156,6 +263,7 @@ class AnalysisEngine:
         *,
         rois: list[ROI],
         direction_vectors: dict[str, Vector2],
+        rotation_deg: int,
         mode: AnalysisMode,
         frame_index: int,
         video_time_ms: int,
@@ -168,7 +276,7 @@ class AnalysisEngine:
         events: list[EventRecord] = []
         visible_person_count = len(tracks)
         roi_person_counts: dict[str, int] = {}
-        prune_exit_streak = 120
+        prune_exit_streak = 30
 
         for roi in rois:
             roi_n = roi.normalized()
@@ -194,6 +302,7 @@ class AnalysisEngine:
                     state=state,
                     inside=inside,
                     mode=mode,
+                    rotation_deg=rotation_deg,
                     track=track,
                     roi=roi_n,
                     direction=direction_vectors.get(roi_n.roi_id),
@@ -217,6 +326,7 @@ class AnalysisEngine:
                     state=state,
                     inside=False,
                     mode=mode,
+                    rotation_deg=rotation_deg,
                     track=tracks_by_id.get(person_id),
                     roi=roi_n,
                     direction=direction_vectors.get(roi_n.roi_id),
@@ -232,6 +342,16 @@ class AnalysisEngine:
                 if not state.inside and state.exit_streak >= prune_exit_streak:
                     presence.pop(key, None)
 
+        if len(presence) > 100_000:
+            target = 80_000
+            removable = [
+                key
+                for key, state in presence.items()
+                if (not state.inside) and state.exit_streak >= 5
+            ]
+            for key in removable[: max(0, len(presence) - target)]:
+                presence.pop(key, None)
+
         return events
 
     def _step_presence(
@@ -240,6 +360,7 @@ class AnalysisEngine:
         state: PresenceState,
         inside: bool,
         mode: AnalysisMode,
+        rotation_deg: int,
         track: Track | None,
         roi: ROI,
         direction: Vector2 | None,
@@ -277,6 +398,11 @@ class AnalysisEngine:
                     ocr_conf=None,
                     visible_person_count=visible_person_count,
                     roi_person_count=roi_person_count,
+                    rotation_deg=int(rotation_deg) % 360,
+                    roi_x=roi.x,
+                    roi_y=roi.y,
+                    roi_w=roi.w,
+                    roi_h=roi.h,
                 )
             return None
 
@@ -302,6 +428,11 @@ class AnalysisEngine:
                 ocr_conf=None,
                 visible_person_count=visible_person_count,
                 roi_person_count=roi_person_count,
+                rotation_deg=int(rotation_deg) % 360,
+                roi_x=roi.x,
+                roi_y=roi.y,
+                roi_w=roi.w,
+                roi_h=roi.h,
             )
 
         return None
@@ -313,13 +444,41 @@ class AnalysisEngine:
         frame_bgr,
         video_path: str,
         frame_index: int,
+        video_time_ms: int,
         rotation_deg: int,
+        logger: logging.Logger,
     ) -> tuple[int | None, OverlayTSStatus, float | None]:
-        ocr_result = ocr.extract_timestamp(frame_bgr)
-        candidate_ts = ocr_result.timestamp_ms if ocr.is_valid_timestamp(ocr_result.timestamp_ms) else None
-        if candidate_ts is not None:
-            self._last_overlay_ts = candidate_ts
-            return candidate_ts, OverlayTSStatus.OK, ocr_result.confidence
+        ocr_result = ocr.extract_timestamp(frame_bgr, fast=True)
+        ocr.cache_video_frame_result(
+            video_path=video_path,
+            frame_index=frame_index,
+            rotation_deg=rotation_deg,
+            result=ocr_result,
+        )
+        expected_ts, tolerance = self._expected_overlay_ts(video_time_ms)
+        candidates = [
+            ts
+            for ts in ocr.extract_timestamp_candidates(ocr_result.raw_text)
+            if ocr.is_valid_timestamp(ts)
+        ]
+        if expected_ts is not None and candidates:
+            best = min(candidates, key=lambda ts: abs(int(ts) - int(expected_ts)))
+            if abs(int(best) - int(expected_ts)) <= tolerance:
+                self._last_overlay_ts = int(best)
+                self._last_overlay_video_time_ms = video_time_ms
+                return int(best), OverlayTSStatus.OK, ocr_result.confidence
+            logger.info(
+                (
+                    "ocr_suspicious frame=%s video_time_ms=%s expected=%s tolerance=%s "
+                    "best=%s raw=%r"
+                ),
+                frame_index,
+                video_time_ms,
+                expected_ts,
+                tolerance,
+                best,
+                ocr_result.raw_text,
+            )
 
         neighbor_ts, neighbor_conf = ocr.interpolate_timestamp_from_neighbors(
             video_path=video_path,
@@ -328,13 +487,51 @@ class AnalysisEngine:
             fast=True,
         )
         if neighbor_ts is not None:
-            self._last_overlay_ts = neighbor_ts
-            conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
-            return neighbor_ts, OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf
+            if expected_ts is None:
+                picked = int(neighbor_ts)
+                self._last_overlay_ts = picked
+                self._last_overlay_video_time_ms = video_time_ms
+                conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
+                return picked, OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf
+            if self._is_plausible_timestamp(neighbor_ts, video_time_ms):
+                self._last_overlay_ts = int(neighbor_ts)
+                self._last_overlay_video_time_ms = video_time_ms
+                conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
+                return int(neighbor_ts), OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf
 
         if self._last_overlay_ts is not None:
-            return self._last_overlay_ts, OverlayTSStatus.INTERPOLATED_PREV, ocr_result.confidence
+            prev_video_time_ms = self._last_overlay_video_time_ms
+            if prev_video_time_ms is not None:
+                delta = max(0, int(video_time_ms) - int(prev_video_time_ms))
+                estimated = int(self._last_overlay_ts) + delta
+            else:
+                estimated = int(self._last_overlay_ts)
+            self._last_overlay_ts = estimated
+            self._last_overlay_video_time_ms = video_time_ms
+            return estimated, OverlayTSStatus.INTERPOLATED_PREV, ocr_result.confidence
         return None, OverlayTSStatus.FAILED, ocr_result.confidence
+
+    def _expected_overlay_ts(self, video_time_ms: int) -> tuple[int | None, int]:
+        if self._last_overlay_ts is None or self._last_overlay_video_time_ms is None:
+            return None, 0
+        delta_video = int(video_time_ms) - int(self._last_overlay_video_time_ms)
+        if delta_video < 0:
+            return int(self._last_overlay_ts), 1500
+        expected = int(self._last_overlay_ts) + delta_video
+        tolerance = max(1500, int(delta_video * 4 + 500))
+        return expected, tolerance
+
+    def _is_plausible_timestamp(self, candidate_ts: int, video_time_ms: int) -> bool:
+        if self._last_overlay_ts is None or self._last_overlay_video_time_ms is None:
+            return True
+        delta_video = int(video_time_ms) - int(self._last_overlay_video_time_ms)
+        # Out-of-order frame timestamp in stream; don't over-filter.
+        if delta_video < 0:
+            return True
+        expected = int(self._last_overlay_ts) + delta_video
+        # Allow generous drift (clock jitter/OCR noise), but reject gross digit-shift errors.
+        tolerance = max(1500, int(delta_video * 4 + 500))
+        return abs(int(candidate_ts) - expected) <= tolerance
 
     @staticmethod
     def _direction_label(track: Track | None, direction: Vector2 | None) -> str | None:

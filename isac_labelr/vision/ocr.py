@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+from collections import OrderedDict
+import logging
 from shutil import which
 from dataclasses import dataclass
 
@@ -11,9 +14,14 @@ from isac_labelr.io.video_stream import rotate_bgr
 from isac_labelr.models import ROI
 
 try:
-    from rapidocr_onnxruntime import RapidOCR
+    from rapidocr_onnxruntime import RapidOCR as RapidOCROnnxRuntime
 except Exception:  # pragma: no cover - optional runtime import
-    RapidOCR = None
+    RapidOCROnnxRuntime = None
+
+try:
+    from rapidocr import RapidOCR as RapidOCRUnified
+except Exception:  # pragma: no cover - optional runtime import
+    RapidOCRUnified = None
 
 try:
     import pytesseract
@@ -41,15 +49,44 @@ class TimestampOCR:
     def __init__(self) -> None:
         self._backend = "none"
         self._engine = None
+        logging.getLogger("RapidOCR").setLevel(logging.ERROR)
+        logging.getLogger("rapidocr").setLevel(logging.ERROR)
 
-        if RapidOCR is not None:
-            self._engine = RapidOCR()
+        self._manual_roi: ROI | None = None
+        self._auto_roi: ROI | None = None
+        self._neighbor_cap_path: str | None = None
+        self._neighbor_cap: cv2.VideoCapture | None = None
+        self._neighbor_next_index: int | None = None
+        self._frame_ocr_cache: OrderedDict[tuple[str, int, int], OCRResult] = OrderedDict()
+        self._frame_ocr_cache_max = 2048
+        self._single_rotation_ocr = str(
+            os.getenv("ISAC_OCR_SINGLE_ROTATION", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._fast_full_rotation = str(
+            os.getenv("ISAC_OCR_FAST_FULL_ROTATION", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._init_backend()
+
+    def _init_backend(self) -> None:
+        self._backend = "none"
+        self._engine = None
+        if RapidOCROnnxRuntime is not None:
+            self._engine = RapidOCROnnxRuntime()
+            self._backend = "rapidocr-onnxruntime"
+        elif RapidOCRUnified is not None:
+            self._engine = RapidOCRUnified()
             self._backend = "rapidocr"
         elif pytesseract is not None and which("tesseract"):
             self._backend = "pytesseract"
 
-        self._manual_roi: ROI | None = None
-        self._auto_roi: ROI | None = None
+    def reset(self, *, preserve_rois: bool = True) -> None:
+        manual = self._manual_roi if preserve_rois else None
+        auto = self._auto_roi if preserve_rois else None
+        self.close()
+        self._frame_ocr_cache.clear()
+        self._init_backend()
+        self._manual_roi = manual
+        self._auto_roi = auto
 
     @property
     def manual_roi(self) -> ROI | None:
@@ -68,6 +105,30 @@ class TimestampOCR:
 
     def clear_auto_roi(self) -> None:
         self._auto_roi = None
+
+    def _cache_get(self, key: tuple[str, int, int]) -> OCRResult | None:
+        value = self._frame_ocr_cache.get(key)
+        if value is None:
+            return None
+        self._frame_ocr_cache.move_to_end(key)
+        return value
+
+    def _cache_put(self, key: tuple[str, int, int], value: OCRResult) -> None:
+        self._frame_ocr_cache[key] = value
+        self._frame_ocr_cache.move_to_end(key)
+        while len(self._frame_ocr_cache) > self._frame_ocr_cache_max:
+            self._frame_ocr_cache.popitem(last=False)
+
+    def cache_video_frame_result(
+        self,
+        *,
+        video_path: str,
+        frame_index: int,
+        rotation_deg: int,
+        result: OCRResult,
+    ) -> None:
+        key = (str(video_path), int(frame_index), int(rotation_deg) % 360)
+        self._cache_put(key, result)
 
     def detect_auto_roi(self, frame_bgr: np.ndarray) -> ROI | None:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -128,6 +189,79 @@ class TimestampOCR:
         x2 = min(w, n.x + n.w + pad_x)
         y2 = min(h, n.y + n.h + pad_y)
         return ROI(n.roi_id + "_expanded", x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+
+    @staticmethod
+    def _rotate_roi(roi: ROI, frame_w: int, frame_h: int, rotation_deg: int) -> tuple[ROI, tuple[int, int]]:
+        n = roi.normalized()
+        rot = rotation_deg % 360
+        if rot == 0:
+            return n, (frame_w, frame_h)
+        if rot == 90:
+            # clockwise
+            new_x = frame_h - (n.y + n.h)
+            new_y = n.x
+            return ROI(n.roi_id, int(new_x), int(new_y), int(n.h), int(n.w)).normalized(), (
+                frame_h,
+                frame_w,
+            )
+        if rot == 180:
+            new_x = frame_w - (n.x + n.w)
+            new_y = frame_h - (n.y + n.h)
+            return ROI(n.roi_id, int(new_x), int(new_y), int(n.w), int(n.h)).normalized(), (
+                frame_w,
+                frame_h,
+            )
+        if rot == 270:
+            # counter-clockwise 90
+            new_x = n.y
+            new_y = frame_w - (n.x + n.w)
+            return ROI(n.roi_id, int(new_x), int(new_y), int(n.h), int(n.w)).normalized(), (
+                frame_h,
+                frame_w,
+            )
+        return n, (frame_w, frame_h)
+
+    @staticmethod
+    def _orientation_score(roi: ROI, frame_w: int, frame_h: int) -> float:
+        n = roi.normalized()
+        cx = n.x + n.w / 2.0
+        # Expect timestamp ROI: wide + near top + near horizontal center.
+        aspect = n.w / max(1.0, float(n.h))
+        width_ratio = n.w / max(1.0, float(frame_w))
+        top_score = 1.0 - min(1.0, n.y / max(1.0, frame_h * 0.5))
+        center_score = 1.0 - min(1.0, abs(cx - frame_w / 2.0) / max(1.0, frame_w / 2.0))
+        return (aspect * 2.5) + (width_ratio * 1.5) + (top_score * 1.5) + (center_score * 1.0)
+
+    def _canonicalize_roi_orientation(
+        self, frame_bgr: np.ndarray, roi: ROI | None
+    ) -> tuple[np.ndarray, ROI | None]:
+        if roi is None:
+            return frame_bgr, None
+
+        h, w = frame_bgr.shape[:2]
+        n = roi.normalized()
+
+        # User rule: if ROI is tall and located on the left, rotate +90 first.
+        cx = n.x + n.w / 2.0
+        if n.h > n.w and cx < (w * 0.4):
+            rotated_frame = rotate_bgr(frame_bgr, 90)
+            rotated_roi, _ = self._rotate_roi(n, w, h, 90)
+            return rotated_frame, rotated_roi
+
+        best_rot = 0
+        best_score = float("-inf")
+        for rot in (0, 90, 180, 270):
+            r_roi, (rw, rh) = self._rotate_roi(n, w, h, rot)
+            score = self._orientation_score(r_roi, rw, rh)
+            if score > best_score:
+                best_score = score
+                best_rot = rot
+
+        if best_rot == 0:
+            return frame_bgr, n
+        rotated_frame = rotate_bgr(frame_bgr, best_rot)
+        rotated_roi, _ = self._rotate_roi(n, w, h, best_rot)
+        return rotated_frame, rotated_roi
 
     def _build_candidate_rois(self, frame_bgr: np.ndarray, *, fast: bool = False) -> list[ROI]:
         h, w = frame_bgr.shape[:2]
@@ -190,11 +324,21 @@ class TimestampOCR:
         best_text = ""
         best_conf = 0.0
         best_score = -1.0
+        if self._single_rotation_ocr:
+            rotations = [0]
+        elif fast and not self._fast_full_rotation:
+            rotations = [0, 2]
+        else:
+            rotations = [0, 2, 1, 3] if fast else [0, 1, 2, 3]
 
         for candidate in preprocess_candidates:
-            for rot in [0, 1, 2, 3]:
+            for rot in rotations:
                 c = np.rot90(candidate, k=rot)
                 text, conf = self._ocr_once(c, fast=fast)
+                if fast:
+                    quick_ts = self._extract_unix_ms(text)
+                    if self.is_valid_timestamp(quick_ts):
+                        return OCRResult(quick_ts, conf, True, None, text)
                 score = sum(ch.isdigit() for ch in text) + conf
                 if score > best_score:
                     best_score = score
@@ -208,49 +352,88 @@ class TimestampOCR:
 
     @staticmethod
     def _extract_unix_ms(text: str) -> int | None:
-        # 1) direct 13-digit match
-        match = TS_REGEX.search(text)
-        if match:
+        candidates = TimestampOCR.extract_timestamp_candidates(text)
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def extract_timestamp_candidates(text: str) -> list[int]:
+        ordered: list[int] = []
+        seen: set[int] = set()
+
+        # 1) direct contiguous 13-digit chunks from OCR text
+        for match in TS_REGEX.finditer(text):
+            token = match.group(1)
             try:
-                return int(match.group(1))
+                val = int(token)
             except ValueError:
-                pass
+                continue
+            if val in seen:
+                continue
+            seen.add(val)
+            ordered.append(val)
 
         # 2) OCR가 숫자를 띄워서 반환하는 경우를 복원
         digits = "".join(ch for ch in text if ch.isdigit())
-        if len(digits) < 13:
-            return None
+        if len(digits) >= 13:
+            for i in range(0, len(digits) - 12):
+                token = digits[i : i + 13]
+                try:
+                    val = int(token)
+                except ValueError:
+                    continue
+                if val in seen:
+                    continue
+                seen.add(val)
+                ordered.append(val)
 
-        candidates: list[int] = []
-        for i in range(0, len(digits) - 12):
-            chunk = digits[i : i + 13]
-            try:
-                val = int(chunk)
-            except ValueError:
-                continue
-            candidates.append(val)
+        if not ordered:
+            return []
 
-        if not candidates:
-            return None
+        # Prefer realistic unix-ms range and expected prefix.
+        def score(v: int) -> tuple[int, int]:
+            txt = str(v)
+            in_range = EPOCH_MIN_MS <= v <= EPOCH_MAX_MS
+            has_prefix = len(txt) == EXPECTED_TS_DIGITS and txt.startswith(EXPECTED_TS_PREFIX)
+            return (int(in_range), int(has_prefix))
 
-        plausible = [v for v in candidates if EPOCH_MIN_MS <= v <= EPOCH_MAX_MS]
-        if plausible:
-            return plausible[0]
-        return candidates[0]
+        ordered.sort(key=score, reverse=True)
+        return ordered
 
     def _ocr_once(self, image_gray: np.ndarray, *, fast: bool = False) -> tuple[str, float]:
-        if self._backend == "rapidocr" and self._engine is not None:
-            result, _ = self._engine(image_gray)
-            if not result:
+        if self._backend in {"rapidocr-onnxruntime", "rapidocr"} and self._engine is not None:
+            output = self._engine(image_gray)
+            if self._backend == "rapidocr-onnxruntime":
+                result = output[0] if isinstance(output, tuple) else output
+                if not result:
+                    return "", 0.0
+                text = " ".join([str(r[1]) for r in result])
+                conf = float(np.mean([float(r[2]) for r in result])) if result else 0.0
+                return text, conf
+
+            txts = list(getattr(output, "txts", ()) or ())
+            if not txts:
                 return "", 0.0
-            text = " ".join([str(r[1]) for r in result])
-            conf = float(np.mean([float(r[2]) for r in result])) if result else 0.0
+            text = " ".join([str(t) for t in txts if str(t).strip()])
+            scores = [float(s) for s in (getattr(output, "scores", ()) or ())]
+            conf = float(np.mean(scores)) if scores else 0.0
             return text, conf
 
         if self._backend == "pytesseract" and pytesseract is not None:
             if fast:
-                configs = ["--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789"]
-                timeout_sec = 0.6
+                config = "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789"
+                timeout_sec = 0.5
+                try:
+                    text = pytesseract.image_to_string(
+                        image_gray,
+                        config=config,
+                        timeout=timeout_sec,
+                    )
+                except Exception:
+                    return "", 0.0
+                text = str(text).strip()
+                # pytesseract fast path does not expose stable confidence cheaply.
+                conf_score = min(1.0, sum(ch.isdigit() for ch in text) / 13.0) if text else 0.0
+                return text, conf_score
             else:
                 configs = [
                     "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789",
@@ -311,21 +494,61 @@ class TimestampOCR:
         txt = str(int(timestamp_ms))
         return len(txt) == EXPECTED_TS_DIGITS and txt.startswith(EXPECTED_TS_PREFIX)
 
-    @staticmethod
-    def _read_rotated_frame(video_path: str, frame_index: int, rotation_deg: int) -> np.ndarray | None:
-        cap = cv2.VideoCapture(video_path)
+    def _get_neighbor_cap(self, video_path: str) -> cv2.VideoCapture | None:
+        norm_path = str(video_path)
+        if self._neighbor_cap is not None and self._neighbor_cap_path == norm_path:
+            return self._neighbor_cap
+        if self._neighbor_cap is not None:
+            self._neighbor_cap.release()
+            self._neighbor_cap = None
+            self._neighbor_cap_path = None
+            self._neighbor_next_index = None
+
+        cap = cv2.VideoCapture(norm_path)
         if not cap.isOpened():
             return None
-        try:
-            if frame_index < 0:
-                return None
+        self._neighbor_cap = cap
+        self._neighbor_cap_path = norm_path
+        self._neighbor_next_index = None
+        return cap
+
+    def _read_rotated_frame_cached(self, video_path: str, frame_index: int, rotation_deg: int) -> np.ndarray | None:
+        cap = self._get_neighbor_cap(video_path)
+        if cap is None:
+            return None
+        if frame_index < 0:
+            return None
+        if self._neighbor_next_index != frame_index:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                return None
-            return rotate_bgr(frame, rotation_deg)
-        finally:
-            cap.release()
+            self._neighbor_next_index = frame_index
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return None
+        self._neighbor_next_index = frame_index + 1
+        return rotate_bgr(frame, rotation_deg)
+
+    def _extract_timestamp_for_video_frame(
+        self,
+        *,
+        video_path: str,
+        frame_index: int,
+        rotation_deg: int,
+        fast: bool,
+    ) -> OCRResult:
+        key = (str(video_path), int(frame_index), int(rotation_deg) % 360)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+
+        frame = self._read_rotated_frame_cached(video_path, frame_index, rotation_deg)
+        if frame is None:
+            result = OCRResult(None, None, False, None, "")
+            self._cache_put(key, result)
+            return result
+
+        result = self.extract_timestamp(frame, fast=fast)
+        self._cache_put(key, result)
+        return result
 
     def interpolate_timestamp_from_neighbors(
         self,
@@ -338,13 +561,18 @@ class TimestampOCR:
         if frame_index <= 0:
             return None, None
 
-        prev_frame = self._read_rotated_frame(video_path, frame_index - 1, rotation_deg)
-        next_frame = self._read_rotated_frame(video_path, frame_index + 1, rotation_deg)
-        if prev_frame is None or next_frame is None:
-            return None, None
-
-        prev_result = self.extract_timestamp(prev_frame, fast=fast)
-        next_result = self.extract_timestamp(next_frame, fast=fast)
+        prev_result = self._extract_timestamp_for_video_frame(
+            video_path=video_path,
+            frame_index=frame_index - 1,
+            rotation_deg=rotation_deg,
+            fast=fast,
+        )
+        next_result = self._extract_timestamp_for_video_frame(
+            video_path=video_path,
+            frame_index=frame_index + 1,
+            rotation_deg=rotation_deg,
+            fast=fast,
+        )
         prev_ts = prev_result.timestamp_ms if self.is_valid_timestamp(prev_result.timestamp_ms) else None
         next_ts = next_result.timestamp_ms if self.is_valid_timestamp(next_result.timestamp_ms) else None
         if prev_ts is None or next_ts is None:
@@ -359,6 +587,13 @@ class TimestampOCR:
         conf = float(np.mean(conf_values)) if conf_values else None
         return interpolated, conf
 
+    def close(self) -> None:
+        if self._neighbor_cap is not None:
+            self._neighbor_cap.release()
+            self._neighbor_cap = None
+            self._neighbor_cap_path = None
+            self._neighbor_next_index = None
+
     def extract_timestamp(self, frame_bgr: np.ndarray, *, fast: bool = False) -> OCRResult:
         candidates = self._build_candidate_rois(frame_bgr, fast=fast)
 
@@ -366,9 +601,11 @@ class TimestampOCR:
         best_fail: OCRResult | None = None
 
         for roi in candidates:
-            crop, used_roi = self._crop_roi(frame_bgr, roi)
+            canonical_frame, canonical_roi = self._canonicalize_roi_orientation(frame_bgr, roi)
+            crop, used_roi = self._crop_roi(canonical_frame, canonical_roi)
             result = self._try_extract(crop, fast=fast)
-            result.roi = used_roi
+            # Keep ROI in current UI coordinate system for display.
+            result.roi = roi.normalized() if roi is not None else used_roi
 
             if result.success:
                 success_results.append(result)

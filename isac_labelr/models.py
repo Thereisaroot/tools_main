@@ -97,6 +97,11 @@ class EventRecord:
     ocr_conf: float | None
     visible_person_count: int
     roi_person_count: int
+    rotation_deg: int = 0
+    roi_x: int | None = None
+    roi_y: int | None = None
+    roi_w: int | None = None
+    roi_h: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

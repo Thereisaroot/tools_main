@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 import cv2
@@ -19,6 +20,7 @@ class DetectorConfig:
     model_path: str
     confidence: float = 0.4
     iou: float = 0.5
+    max_detections: int = 150
 
 
 class DetectorInitializationError(RuntimeError):
@@ -60,26 +62,96 @@ class OnnxYoloPersonDetector:
 
     def __init__(self, config: DetectorConfig) -> None:
         self.config = config
-        if ort is None:
-            raise DetectorInitializationError(
-                "onnxruntime is not installed. Install requirements first."
-            )
-
         model_path = Path(config.model_path)
         if not model_path.exists():
             raise DetectorInitializationError(f"Model not found: {model_path}")
+        forced = os.getenv("ISAC_DETECTOR_BACKEND", "auto").strip().lower()
+        self.backend = self._select_backend(forced)
 
-        providers = ["CPUExecutionProvider"]
-        available = ort.get_available_providers()
-        if "CUDAExecutionProvider" in available:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        self.session = None
+        self.providers: list[str] = []
+        self.net = None
+        self.input_name = ""
+        self.output_name = ""
+        self._input_buffer: np.ndarray | None = None
 
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        cv2_forced = forced in {"cv2", "opencv", "opencv-dnn"}
+        ort_forced = forced in {"ort", "onnxruntime"}
+
+        if self.backend == "opencv-dnn":
+            try:
+                self._init_opencv_dnn(model_path)
+            except Exception as exc:
+                if cv2_forced:
+                    raise DetectorInitializationError(
+                        f"Failed to init OpenCV DNN backend with model: {exc}"
+                    ) from exc
+                self.backend = "onnxruntime"
+                self._init_onnxruntime(model_path)
+        else:
+            try:
+                self._init_onnxruntime(model_path)
+            except Exception as exc:
+                if ort_forced:
+                    raise DetectorInitializationError(str(exc)) from exc
+                self.backend = "opencv-dnn"
+                self._init_opencv_dnn(model_path)
+
+    def _init_onnxruntime(self, model_path: Path) -> None:
+        if ort is None:
+            raise DetectorInitializationError(
+                "onnxruntime backend selected, but onnxruntime is not installed."
+            )
+        available = set(ort.get_available_providers())
+        forced_provider = os.getenv("ISAC_ORT_PROVIDER", "").strip()
+        if forced_provider:
+            providers = [forced_provider, "CPUExecutionProvider"]
+        else:
+            providers = ["CPUExecutionProvider"]
+            # macOS: CoreML provider is significantly more memory-stable than pure CPU provider.
+            if "CoreMLExecutionProvider" in available:
+                providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+            elif "CUDAExecutionProvider" in available:
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        sess_opt = ort.SessionOptions()
+        # Keep memory bounded for long-running analyses.
+        if os.getenv("ISAC_ORT_MEM_ARENA", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+            sess_opt.enable_cpu_mem_arena = False
+            sess_opt.enable_mem_pattern = False
+        # Reduce ONNXRuntime warning noise in user logs.
+        sess_opt.log_severity_level = 3
+        sess_opt.intra_op_num_threads = int(os.getenv("ISAC_ORT_INTRA_THREADS", "1"))
+        sess_opt.inter_op_num_threads = int(os.getenv("ISAC_ORT_INTER_THREADS", "1"))
+        self.session = ort.InferenceSession(
+            str(model_path), sess_options=sess_opt, providers=providers
+        )
+        self.providers = list(self.session.get_providers())
         self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
         shape = self.session.get_inputs()[0].shape
         # Typical: [1, 3, 640, 640]
         self.input_h = int(shape[2]) if isinstance(shape[2], int) else 640
         self.input_w = int(shape[3]) if isinstance(shape[3], int) else 640
+        self._input_buffer = np.zeros((1, 3, self.input_h, self.input_w), dtype=np.float32)
+
+    def _init_opencv_dnn(self, model_path: Path) -> None:
+        # OpenCV DNN backend: more stable on some macOS + Python 3.13 environments.
+        self.net = cv2.dnn.readNetFromONNX(str(model_path))
+        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        self.input_h = int(os.getenv("ISAC_DNN_INPUT_H", "640"))
+        self.input_w = int(os.getenv("ISAC_DNN_INPUT_W", "640"))
+
+    @staticmethod
+    def _select_backend(forced: str) -> str:
+        if forced in {"ort", "onnxruntime"}:
+            return "onnxruntime"
+        if forced in {"cv2", "opencv", "opencv-dnn"}:
+            return "opencv-dnn"
+        if ort is not None:
+            return "onnxruntime"
+        return "opencv-dnn"
 
     def _preprocess(self, image_bgr: np.ndarray):
         h, w = image_bgr.shape[:2]
@@ -100,8 +172,16 @@ class OnnxYoloPersonDetector:
 
     def detect(self, image_bgr: np.ndarray) -> list[Detection]:
         tensor, scale, pad_x, pad_y, src_w, src_h = self._preprocess(image_bgr)
-        outputs = self.session.run(None, {self.input_name: tensor})
-        raw = outputs[0]
+        if self.backend == "onnxruntime":
+            if self.session is None or self._input_buffer is None:
+                return []
+            np.copyto(self._input_buffer, tensor)
+            raw = self.session.run([self.output_name], {self.input_name: self._input_buffer})[0]
+        else:
+            if self.net is None:
+                return []
+            self.net.setInput(tensor)
+            raw = self.net.forward()
 
         boxes, scores = self._decode(raw)
         if boxes.size == 0:
@@ -116,6 +196,10 @@ class OnnxYoloPersonDetector:
         boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, src_h - 1)
 
         keep = _nms(boxes, scores, self.config.iou)
+        if self.config.max_detections > 0 and len(keep) > self.config.max_detections:
+            keep = sorted(keep, key=lambda idx: float(scores[idx]), reverse=True)[
+                : self.config.max_detections
+            ]
         detections: list[Detection] = []
         for idx in keep:
             detections.append(
@@ -138,7 +222,7 @@ class OnnxYoloPersonDetector:
         - [1, N, 85] or [1, 85, N] = x,y,w,h,obj,cls...
         - [1, N, 84] or [1, 84, N] = x,y,w,h,cls... (YOLOv8/11 no objectness)
         """
-        out = np.array(output)
+        out = np.asarray(output)
         if out.ndim == 3:
             out = out[0]
             if out.shape[0] < out.shape[1] and out.shape[0] <= 128:

@@ -25,6 +25,11 @@ CSV_FIELDS = [
     "ocr_conf",
     "visible_person_count",
     "roi_person_count",
+    "rotation_deg",
+    "roi_x",
+    "roi_y",
+    "roi_w",
+    "roi_h",
 ]
 
 

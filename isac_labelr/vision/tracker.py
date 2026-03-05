@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
-
 from isac_labelr.models import Detection, Track
 
 
@@ -43,9 +41,15 @@ def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, flo
 class ByteTrackLite:
     """간단한 IoU 기반 ByteTrack-like 추적기."""
 
-    def __init__(self, iou_threshold: float = 0.3, max_missed: int = 30) -> None:
+    def __init__(
+        self,
+        iou_threshold: float = 0.3,
+        max_missed: int = 30,
+        max_tracks: int = 4000,
+    ) -> None:
         self.iou_threshold = iou_threshold
         self.max_missed = max_missed
+        self.max_tracks = max_tracks
         self._next_id = 1
         self._tracks: dict[int, _TrackState] = {}
 
@@ -54,29 +58,45 @@ class ByteTrackLite:
         self._tracks.clear()
 
     def update(self, detections: list[Detection]) -> list[Track]:
+        if self.max_tracks > 0 and len(self._tracks) > self.max_tracks:
+            # Drop stalest/lowest-confidence tracks first to cap memory.
+            victims = sorted(
+                self._tracks.items(),
+                key=lambda kv: (kv[1].missed, -kv[1].confidence),
+                reverse=True,
+            )[: max(0, len(self._tracks) - self.max_tracks)]
+            for track_id, _ in victims:
+                self._tracks.pop(track_id, None)
+
         track_ids = list(self._tracks.keys())
         unmatched_tracks = set(track_ids)
         unmatched_det = set(range(len(detections)))
 
-        pairs: list[tuple[float, int, int]] = []
+        # Greedy matching without allocating a giant global (track x det) pair list.
         for track_id in track_ids:
-            t = self._tracks[track_id]
-            for d_idx, det in enumerate(detections):
-                pairs.append((_iou(t.bbox, det.bbox), track_id, d_idx))
-        pairs.sort(key=lambda x: x[0], reverse=True)
+            if track_id not in unmatched_tracks:
+                continue
+            if not unmatched_det:
+                break
 
-        for iou_score, track_id, d_idx in pairs:
-            if iou_score < self.iou_threshold:
-                continue
-            if track_id not in unmatched_tracks or d_idx not in unmatched_det:
-                continue
             t = self._tracks[track_id]
+            best_det = None
+            best_iou = self.iou_threshold
+            for d_idx in unmatched_det:
+                iou_score = _iou(t.bbox, detections[d_idx].bbox)
+                if iou_score > best_iou:
+                    best_iou = iou_score
+                    best_det = d_idx
+
+            if best_det is None:
+                continue
+
             t.prev_center = t.center
-            t.bbox = detections[d_idx].bbox
-            t.confidence = detections[d_idx].confidence
+            t.bbox = detections[best_det].bbox
+            t.confidence = detections[best_det].confidence
             t.missed = 0
             unmatched_tracks.remove(track_id)
-            unmatched_det.remove(d_idx)
+            unmatched_det.remove(best_det)
 
         for track_id in list(unmatched_tracks):
             t = self._tracks[track_id]

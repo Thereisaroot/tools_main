@@ -42,7 +42,10 @@ then
     echo "[setup] rapidocr install failed. OCR fallback will use pytesseract."
   fi
 else
-  echo "[setup] python>=3.13 detected. rapidocr skipped, pytesseract fallback mode."
+  echo "[setup] python>=3.13 detected. installing rapidocr (new package)."
+  if ! python -m pip install "rapidocr>=3.7.0"; then
+    echo "[setup] rapidocr install failed. OCR fallback will use pytesseract."
+  fi
 fi
 
 if ! python -m pip install av; then
