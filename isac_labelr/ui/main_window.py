@@ -312,7 +312,7 @@ class MainWindow(QMainWindow):
         notice_layout = QVBoxLayout(notice_box)
         self.notice_text = QTextEdit()
         self.notice_text.setReadOnly(True)
-        self.notice_text.setMinimumHeight(120)
+        self.notice_text.setFixedHeight(36)
         notice_layout.addWidget(self.notice_text)
         right_layout.addWidget(notice_box)
 
@@ -1096,6 +1096,9 @@ class MainWindow(QMainWindow):
 
         mode = self._current_mode()
         correction = int(self.correction_edit.text() or 0)
+        analysis_ocr_roi = self.ocr_manual_roi
+        if analysis_ocr_roi is None:
+            analysis_ocr_roi = self.timestamp_ocr.auto_roi
 
         if self.play_timer.isActive():
             self.play_timer.stop()
@@ -1111,7 +1114,7 @@ class MainWindow(QMainWindow):
             start_ms=0 if analyze_full else int(self.start_ms_spin.value()),
             duration_ms=None if analyze_full else int(self.duration_ms_spin.value()),
             timestamp_correction_ms=correction,
-            ocr_manual_roi=self.ocr_manual_roi,
+            ocr_manual_roi=analysis_ocr_roi,
             detector_model_path=self.preferences.detector_model_path,
             detector_confidence=self.preferences.detector_confidence,
             detector_iou=self.preferences.detector_iou,
