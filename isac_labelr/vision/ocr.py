@@ -21,6 +21,8 @@ except Exception:  # pragma: no cover - optional runtime import
 
 
 TS_REGEX = re.compile(r"(\d{13})")
+EPOCH_MIN_MS = 946684800000      # 2000-01-01
+EPOCH_MAX_MS = 4102444800000     # 2100-01-01
 
 
 @dataclass(slots=True)
@@ -108,34 +110,128 @@ class TimestampOCR:
             return frame_bgr, None
         return frame_bgr[y1:y2, x1:x2], ROI(n.roi_id, x1, y1, x2 - x1, y2 - y1)
 
-    def _try_extract(self, image_bgr: np.ndarray) -> OCRResult:
+    @staticmethod
+    def _expand_roi(roi: ROI, frame_shape: tuple[int, int, int], ratio: float = 0.15) -> ROI:
+        h, w = frame_shape[:2]
+        n = roi.normalized()
+        pad_x = int(n.w * ratio)
+        pad_y = int(n.h * ratio)
+        x1 = max(0, n.x - pad_x)
+        y1 = max(0, n.y - pad_y)
+        x2 = min(w, n.x + n.w + pad_x)
+        y2 = min(h, n.y + n.h + pad_y)
+        return ROI(n.roi_id + "_expanded", x1, y1, max(1, x2 - x1), max(1, y2 - y1))
+
+    def _build_candidate_rois(self, frame_bgr: np.ndarray, *, fast: bool = False) -> list[ROI]:
+        h, w = frame_bgr.shape[:2]
+        band_h = max(40, h // 8)
+
+        candidates: list[ROI] = []
+        if self._manual_roi is not None:
+            manual = self._manual_roi.normalized()
+            candidates.append(manual)
+            # Manual ROI 지정 시에는 주변만 추가 검사해 속도를 보장한다.
+            if not fast:
+                candidates.append(self._expand_roi(manual, frame_bgr.shape))
+        else:
+            if self._auto_roi is not None:
+                candidates.append(self._auto_roi.normalized())
+
+            if not fast:
+                detected = self.detect_auto_roi(frame_bgr)
+                if detected is not None:
+                    candidates.append(detected.normalized())
+
+            # Common overlay positions
+            candidates.append(ROI("timestamp_top", 0, 0, w, band_h))
+            if not fast:
+                candidates.append(ROI("timestamp_bottom", 0, h - band_h, w, band_h))
+
+        deduped: list[ROI] = []
+        seen: set[tuple[int, int, int, int]] = set()
+        for roi in candidates:
+            n = roi.normalized()
+            key = (n.x, n.y, n.w, n.h)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(n)
+        return deduped
+
+    def _try_extract(self, image_bgr: np.ndarray, *, fast: bool = False) -> OCRResult:
         if self._backend == "none":
             return OCRResult(None, None, False, None, "")
 
-        preprocess_candidates = []
-
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        preprocess_candidates.append(gray)
-        preprocess_candidates.append(cv2.equalizeHist(gray))
-        preprocess_candidates.append(cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1])
+        if fast:
+            preprocess_candidates = [gray]
+            if min(gray.shape[:2]) < 200:
+                preprocess_candidates.append(
+                    cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+                )
+        else:
+            preprocess_candidates = [
+                gray,
+                cv2.equalizeHist(gray),
+                cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+            ]
+            if min(gray.shape[:2]) < 200:
+                preprocess_candidates.append(
+                    cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+                )
 
         best_text = ""
         best_conf = 0.0
+        best_score = -1.0
 
         for candidate in preprocess_candidates:
             for rot in [0, 1, 2, 3]:
                 c = np.rot90(candidate, k=rot)
-                text, conf = self._ocr_once(c)
-                if conf > best_conf:
+                text, conf = self._ocr_once(c, fast=fast)
+                score = sum(ch.isdigit() for ch in text) + conf
+                if score > best_score:
+                    best_score = score
                     best_conf = conf
                     best_text = text
 
-        match = TS_REGEX.search(best_text)
-        if not match:
+        ts = self._extract_unix_ms(best_text)
+        if ts is None:
             return OCRResult(None, best_conf if best_conf > 0 else None, False, None, best_text)
-        return OCRResult(int(match.group(1)), best_conf, True, None, best_text)
+        return OCRResult(ts, best_conf, True, None, best_text)
 
-    def _ocr_once(self, image_gray: np.ndarray) -> tuple[str, float]:
+    @staticmethod
+    def _extract_unix_ms(text: str) -> int | None:
+        # 1) direct 13-digit match
+        match = TS_REGEX.search(text)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+
+        # 2) OCR가 숫자를 띄워서 반환하는 경우를 복원
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if len(digits) < 13:
+            return None
+
+        candidates: list[int] = []
+        for i in range(0, len(digits) - 12):
+            chunk = digits[i : i + 13]
+            try:
+                val = int(chunk)
+            except ValueError:
+                continue
+            candidates.append(val)
+
+        if not candidates:
+            return None
+
+        plausible = [v for v in candidates if EPOCH_MIN_MS <= v <= EPOCH_MAX_MS]
+        if plausible:
+            return plausible[0]
+        return candidates[0]
+
+    def _ocr_once(self, image_gray: np.ndarray, *, fast: bool = False) -> tuple[str, float]:
         if self._backend == "rapidocr" and self._engine is not None:
             result, _ = self._engine(image_gray)
             if not result:
@@ -145,51 +241,92 @@ class TimestampOCR:
             return text, conf
 
         if self._backend == "pytesseract" and pytesseract is not None:
-            config = "--psm 7 -c tessedit_char_whitelist=0123456789"
-            data = pytesseract.image_to_data(
-                image_gray,
-                output_type=pytesseract.Output.DICT,
-                config=config,
-            )
-            if not data or "text" not in data:
-                return "", 0.0
+            if fast:
+                configs = ["--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789"]
+                timeout_sec = 0.6
+            else:
+                configs = [
+                    "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789",
+                    "--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789",
+                ]
+                timeout_sec = 1.5
+            best_txt = ""
+            best_conf = 0.0
+            best_score = -1.0
 
-            texts = []
-            confs = []
-            for txt, conf in zip(data.get("text", []), data.get("conf", []), strict=False):
-                t = str(txt).strip()
-                if not t:
-                    continue
-                texts.append(t)
+            for config in configs:
                 try:
-                    c = float(conf)
-                    if c >= 0:
-                        confs.append(c / 100.0)
+                    data = pytesseract.image_to_data(
+                        image_gray,
+                        output_type=pytesseract.Output.DICT,
+                        config=config,
+                        timeout=timeout_sec,
+                    )
                 except Exception:
                     continue
 
-            if not texts:
+                if not data or "text" not in data:
+                    continue
+
+                texts = []
+                confs = []
+                for txt, conf in zip(data.get("text", []), data.get("conf", []), strict=False):
+                    t = str(txt).strip()
+                    if t:
+                        texts.append(t)
+                    try:
+                        c = float(conf)
+                        if c >= 0:
+                            confs.append(c / 100.0)
+                    except Exception:
+                        continue
+
+                text = " ".join(texts)
+                conf_score = float(np.mean(confs)) if confs else 0.0
+                digits_len = sum(ch.isdigit() for ch in text)
+                score = digits_len + conf_score
+
+                if score > best_score:
+                    best_score = score
+                    best_conf = conf_score
+                    best_txt = text
+
+            if not best_txt.strip():
                 return "", 0.0
-            merged = " ".join(texts)
-            score = float(np.mean(confs)) if confs else 0.0
-            return merged, score
+            return best_txt, best_conf
 
         return "", 0.0
 
-    def extract_timestamp(self, frame_bgr: np.ndarray) -> OCRResult:
-        roi_pref = self._manual_roi or self._auto_roi
-        crop, used_roi = self._crop_roi(frame_bgr, roi_pref)
-        result = self._try_extract(crop)
-        result.roi = used_roi
+    def extract_timestamp(self, frame_bgr: np.ndarray, *, fast: bool = False) -> OCRResult:
+        candidates = self._build_candidate_rois(frame_bgr, fast=fast)
 
-        if result.success:
-            return result
+        success_results: list[OCRResult] = []
+        best_fail: OCRResult | None = None
 
-        if self._manual_roi is None:
-            auto = self.detect_auto_roi(frame_bgr)
-            crop, used_roi = self._crop_roi(frame_bgr, auto)
-            result = self._try_extract(crop)
+        for roi in candidates:
+            crop, used_roi = self._crop_roi(frame_bgr, roi)
+            result = self._try_extract(crop, fast=fast)
             result.roi = used_roi
-            return result
 
-        return result
+            if result.success:
+                success_results.append(result)
+                continue
+
+            if best_fail is None:
+                best_fail = result
+            else:
+                curr = result.confidence if result.confidence is not None else -1.0
+                prev = best_fail.confidence if best_fail.confidence is not None else -1.0
+                if curr > prev:
+                    best_fail = result
+
+        if success_results:
+            success_results.sort(
+                key=lambda r: (r.confidence if r.confidence is not None else -1.0),
+                reverse=True,
+            )
+            return success_results[0]
+
+        if best_fail is not None:
+            return best_fail
+        return OCRResult(None, None, False, None, "")

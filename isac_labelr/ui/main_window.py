@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QThread, QTimer, Qt, QUrl
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -117,6 +117,28 @@ class PreferencesDialog(QDialog):
         )
 
 
+class OCRDebugWorker(QObject):
+    finished = Signal(object, str)
+    failed = Signal(str)
+
+    def __init__(self, frame_bgr, manual_roi: ROI | None) -> None:
+        super().__init__()
+        self.frame_bgr = frame_bgr
+        self.manual_roi = manual_roi
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            ocr = TimestampOCR()
+            if self.manual_roi is not None:
+                ocr.set_manual_roi(self.manual_roi)
+            # Debug button should return quickly; use fast OCR path.
+            result = ocr.extract_timestamp(self.frame_bgr, fast=True)
+            self.finished.emit(result, ocr.backend)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -144,6 +166,8 @@ class MainWindow(QMainWindow):
 
         self.analysis_thread: QThread | None = None
         self.analysis_worker: AnalysisWorker | None = None
+        self.ocr_debug_thread: QThread | None = None
+        self.ocr_debug_worker: OCRDebugWorker | None = None
 
         self.timestamp_ocr = TimestampOCR()
 
@@ -175,6 +199,8 @@ class MainWindow(QMainWindow):
         self.add_roi_button = QPushButton("Add ROI")
         self.rotate_left_button = QPushButton("Rotate -90")
         self.rotate_right_button = QPushButton("Rotate +90")
+        self.ocr_current_frame_button = QPushButton("OCR Current Frame")
+        self.ocr_current_frame_button.setToolTip("Debug OCR on the currently displayed frame.")
         self.start_analysis_button = QPushButton("Start Analysis")
         self.start_analysis_button.setToolTip(
             "Starts Full/Partial analysis based on 'Analyze full video' setting."
@@ -200,6 +226,7 @@ class MainWindow(QMainWindow):
             self.add_roi_button,
             self.rotate_left_button,
             self.rotate_right_button,
+            self.ocr_current_frame_button,
             self.start_analysis_button,
             self.start_full_button,
             self.start_partial_button,
@@ -354,6 +381,7 @@ class MainWindow(QMainWindow):
         self.add_roi_button.clicked.connect(lambda: self._dispatch_command(AppCommand.ADD_ROI))
         self.rotate_left_button.clicked.connect(lambda: self._dispatch_command(AppCommand.ROTATE_PREV))
         self.rotate_right_button.clicked.connect(lambda: self._dispatch_command(AppCommand.ROTATE_NEXT))
+        self.ocr_current_frame_button.clicked.connect(self._debug_ocr_current_frame)
         self.start_analysis_button.clicked.connect(
             lambda: self._start_analysis(force_full=self.full_checkbox.isChecked())
         )
@@ -712,6 +740,74 @@ class MainWindow(QMainWindow):
         if ok:
             self.correction_edit.setText(str(value))
 
+    def _debug_ocr_current_frame(self) -> None:
+        if self.current_frame_rotated is None:
+            QMessageBox.information(self, "OCR Debug", "No frame loaded")
+            return
+
+        if self.ocr_debug_worker is not None:
+            QMessageBox.information(self, "OCR Debug", "OCR debug is already running")
+            return
+
+        frame = self.current_frame_rotated.copy()
+        manual_roi = self.ocr_manual_roi.normalized() if self.ocr_manual_roi else None
+
+        self.ocr_debug_thread = QThread(self)
+        self.ocr_debug_worker = OCRDebugWorker(frame, manual_roi)
+        self.ocr_debug_worker.moveToThread(self.ocr_debug_thread)
+
+        self.ocr_debug_thread.started.connect(self.ocr_debug_worker.run)
+        self.ocr_debug_worker.finished.connect(self._on_ocr_debug_finished)
+        self.ocr_debug_worker.failed.connect(self._on_ocr_debug_failed)
+        self.ocr_debug_worker.finished.connect(self.ocr_debug_thread.quit)
+        self.ocr_debug_worker.failed.connect(self.ocr_debug_thread.quit)
+        self.ocr_debug_thread.finished.connect(self._cleanup_ocr_debug_worker)
+
+        self.status_label.setText("OCR debug running on current frame...")
+        self._refresh_action_states()
+        self.ocr_debug_thread.start()
+
+    def _on_ocr_debug_finished(self, result, backend: str) -> None:
+        ts_display = str(result.timestamp_ms) if result.timestamp_ms is not None else "-"
+        conf_display = f"{result.confidence:.3f}" if result.confidence is not None else "-"
+        roi_display = (
+            f"{result.roi.roi_id} ({result.roi.x},{result.roi.y},{result.roi.w},{result.roi.h})"
+            if result.roi is not None
+            else "-"
+        )
+
+        if result.roi is not None:
+            self.canvas.set_timestamp_roi(result.roi)
+
+        QMessageBox.information(
+            self,
+            "OCR Debug (Current Frame)",
+            "\n".join(
+                [
+                    f"backend: {backend}",
+                    f"success: {result.success}",
+                    f"timestamp_ms: {ts_display}",
+                    f"confidence: {conf_display}",
+                    f"roi: {roi_display}",
+                    f"raw_text: {result.raw_text!r}",
+                ]
+            ),
+        )
+        self.status_label.setText("OCR debug finished")
+
+    def _on_ocr_debug_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "OCR Debug failed", message)
+        self.status_label.setText("OCR debug failed")
+
+    def _cleanup_ocr_debug_worker(self) -> None:
+        if self.ocr_debug_worker is not None:
+            self.ocr_debug_worker.deleteLater()
+        if self.ocr_debug_thread is not None:
+            self.ocr_debug_thread.deleteLater()
+        self.ocr_debug_worker = None
+        self.ocr_debug_thread = None
+        self._refresh_action_states()
+
     def _current_mode(self) -> AnalysisMode:
         raw = self.mode_combo.currentData()
         if isinstance(raw, AnalysisMode):
@@ -1057,6 +1153,7 @@ class MainWindow(QMainWindow):
     def _refresh_action_states(self) -> None:
         has_video = self.video_path is not None
         running = self.analysis_worker is not None
+        ocr_debug_running = self.ocr_debug_worker is not None
         has_roi = bool(self.rois)
         has_selected_roi = self.roi_list.currentItem() is not None
         has_events = bool(self.events)
@@ -1099,6 +1196,7 @@ class MainWindow(QMainWindow):
             button.setEnabled(enable_map.get(command, True))
 
         self.start_analysis_button.setEnabled(has_video and has_roi and not running)
+        self.ocr_current_frame_button.setEnabled(has_video and not ocr_debug_running)
 
         preview_enabled = has_video and not running
         self.play_button.setEnabled(preview_enabled)
@@ -1121,5 +1219,8 @@ class MainWindow(QMainWindow):
         if self.analysis_thread is not None:
             self.analysis_thread.quit()
             self.analysis_thread.wait(2000)
+        if self.ocr_debug_thread is not None:
+            self.ocr_debug_thread.quit()
+            self.ocr_debug_thread.wait(2000)
         self._release_capture()
         super().closeEvent(event)
