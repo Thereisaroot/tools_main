@@ -1,0 +1,6 @@
+PySide6>=6.7
+numpy>=1.26
+opencv-python>=4.10
+onnxruntime>=1.18
+pytesseract>=0.3.10
+certifi>=2024.8.30

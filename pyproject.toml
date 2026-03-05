@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isac-labelr"
+version = "0.1.0"
+description = "Cross-platform video ROI entry/exit metadata labeling app"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "ISAC Labelr" }
+]
+dependencies = [
+  "PySide6>=6.7",
+  "numpy>=1.26",
+  "opencv-python>=4.10",
+  "onnxruntime>=1.18",
+  "pytesseract>=0.3.10",
+  "certifi>=2024.8.30",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+  "pytest-qt>=4.4",
+  "ruff>=0.6",
+]
+ocr_rapid = [
+  "rapidocr-onnxruntime>=1.2.3; python_version < '3.13'",
+]
+decoder_pyav = [
+  "av>=12.0",
+]
+
+[project.scripts]
+isac-labelr = "isac_labelr.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["isac_labelr*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
