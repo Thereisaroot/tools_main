@@ -147,6 +147,8 @@ class OCRDebugWorker(QObject):
 
 
 class MainWindow(QMainWindow):
+    MAX_UI_EVENTS = 5000
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("ISAC Labelr")
@@ -181,6 +183,7 @@ class MainWindow(QMainWindow):
         self.preview_event_engine = AnalysisEngine()
         self.preview_presence: dict[tuple[str, int], PresenceState] = {}
         self.preview_last_overlay_ts: int | None = None
+        self._ui_event_overflowed = False
 
         self.timestamp_ocr = TimestampOCR()
 
@@ -1167,6 +1170,17 @@ class MainWindow(QMainWindow):
         )
 
     def _on_analysis_event(self, event: EventRecord) -> None:
+        if len(self.events) >= self.MAX_UI_EVENTS:
+            self.events.clear()
+            self.event_list.clear()
+            if not self._ui_event_overflowed:
+                self._ui_event_overflowed = True
+                self._set_notice(
+                    "Detected Events UI cache reached limit. "
+                    "Older entries were dropped to keep memory stable. "
+                    "Full results are still saved to output/events.jsonl and events.csv."
+                )
+
         index = len(self.events)
         self.events.append(event)
 
@@ -1211,6 +1225,7 @@ class MainWindow(QMainWindow):
 
     def _clear_detected_events(self, *, confirm: bool) -> None:
         if not self.events:
+            self._ui_event_overflowed = False
             return
         if confirm:
             answer = QMessageBox.question(self, "Clear Events", "Delete all detected events?")
@@ -1219,6 +1234,7 @@ class MainWindow(QMainWindow):
 
         self.events.clear()
         self.event_list.clear()
+        self._ui_event_overflowed = False
         self._reset_preview_event_state()
         self._refresh_action_states()
 

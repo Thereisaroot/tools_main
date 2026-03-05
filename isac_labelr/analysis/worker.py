@@ -21,6 +21,10 @@ class AnalysisWorker(QObject):
         super().__init__()
         self.request = request
         self._stop_event = ThreadEvent()
+        self._ui_events_emitted = 0
+        self._max_ui_events = 5000
+        self._progress_emit_stride = 5
+        self._last_progress_frame = -1
 
     @Slot()
     def run(self) -> None:
@@ -63,8 +67,12 @@ class AnalysisWorker(QObject):
         self._stop_event.set()
 
     def _emit_progress(self, progress: AnalysisProgress) -> None:
-        self.progress.emit(progress)
+        if progress.frame_index - self._last_progress_frame >= self._progress_emit_stride:
+            self.progress.emit(progress)
+            self._last_progress_frame = progress.frame_index
 
     def _handle_event(self, event: EventRecord, writer: MetadataWriter) -> None:
         writer.write_event(event)
-        self.event.emit(event)
+        if self._ui_events_emitted < self._max_ui_events:
+            self.event.emit(event)
+            self._ui_events_emitted += 1

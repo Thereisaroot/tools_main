@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import uuid
 from dataclasses import dataclass
@@ -82,6 +83,7 @@ class AnalysisEngine:
         def on_chunk(chunk_idx: int, time_ms: int) -> None:
             logger.info("chunk_flush chunk=%s time_ms=%s events=%s", chunk_idx, time_ms, processed_events)
 
+        processed_frames = 0
         for packet in video_stream.iter_frames(
             rotation_deg=request.rotation_deg,
             start_ms=start_ms,
@@ -97,6 +99,7 @@ class AnalysisEngine:
                     aborted=True,
                 )
 
+            processed_frames += 1
             detections = detector.detect(packet.image_bgr)
             tracks = tracker.update(detections)
             events = self._update_presence(
@@ -133,6 +136,9 @@ class AnalysisEngine:
                     on_event(event)
                     processed_events += 1
 
+            if processed_frames % 600 == 0:
+                gc.collect()
+
             on_progress(
                 AnalysisProgress(
                     frame_index=packet.frame_index,
@@ -162,6 +168,7 @@ class AnalysisEngine:
         events: list[EventRecord] = []
         visible_person_count = len(tracks)
         roi_person_counts: dict[str, int] = {}
+        prune_exit_streak = 120
 
         for roi in rois:
             roi_n = roi.normalized()
@@ -222,6 +229,8 @@ class AnalysisEngine:
                 )
                 if event is not None:
                     events.append(event)
+                if not state.inside and state.exit_streak >= prune_exit_streak:
+                    presence.pop(key, None)
 
         return events
 
