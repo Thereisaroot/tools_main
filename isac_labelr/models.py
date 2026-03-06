@@ -98,6 +98,9 @@ class EventRecord:
     ocr_raw_text: str
     visible_person_count: int
     roi_person_count: int
+    confirmed_frame_index: int | None = None
+    confirmed_video_time_ms: int | None = None
+    ocr_frame_index: int | None = None
     rotation_deg: int = 0
     roi_x: int | None = None
     roi_y: int | None = None

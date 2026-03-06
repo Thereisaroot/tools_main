@@ -1,0 +1,375 @@
+{
+  "video_path": "/home/robot/ISAC/isac_channel_analyzer/video_labeler/s23_outdoor/20260303_111824_1772504304914.mp4",
+  "labels": [
+    {
+      "index": 0,
+      "label_id": 2,
+      "start_frame": 759,
+      "end_frame": 859,
+      "start_timestamp_unix": 1772504336537,
+      "start_timestamp_kst": "2026-03-03 11:18:56.537",
+      "end_timestamp_unix": 1772504343121,
+      "end_timestamp_kst": "2026-03-03 11:19:03.121"
+    },
+    {
+      "index": 1,
+      "label_id": 0,
+      "start_frame": 966,
+      "end_frame": 2605,
+      "start_timestamp_unix": 1772504345112,
+      "start_timestamp_kst": "2026-03-03 11:19:05.112",
+      "end_timestamp_unix": 1772504413387,
+      "end_timestamp_kst": "2026-03-03 11:20:13.387"
+    },
+    {
+      "index": 2,
+      "label_id": 2,
+      "start_frame": 2645,
+      "end_frame": 2747,
+      "start_timestamp_unix": 1772504415047,
+      "start_timestamp_kst": "2026-03-03 11:20:15.047",
+      "end_timestamp_unix": 1772504419300,
+      "end_timestamp_kst": "2026-03-03 11:20:19.300"
+    },
+    {
+      "index": 4,
+      "label_id": 0,
+      "start_frame": 2849,
+      "end_frame": 7558,
+      "start_timestamp_unix": 1772504423548,
+      "start_timestamp_kst": "2026-03-03 11:20:23.548",
+      "end_timestamp_unix": 1772504619645,
+      "end_timestamp_kst": "2026-03-03 11:23:39.645"
+    },
+    {
+      "index": 5,
+      "label_id": 2,
+      "start_frame": 7559,
+      "end_frame": 7665,
+      "start_timestamp_unix": 1772504619684,
+      "start_timestamp_kst": "2026-03-03 11:23:39.684",
+      "end_timestamp_unix": 1772504624146,
+      "end_timestamp_kst": "2026-03-03 11:23:44.146"
+    },
+    {
+      "index": 6,
+      "label_id": 0,
+      "start_frame": 7771,
+      "end_frame": 8504,
+      "start_timestamp_unix": 1772504628566,
+      "start_timestamp_kst": "2026-03-03 11:23:48.566",
+      "end_timestamp_unix": 1772504659092,
+      "end_timestamp_kst": "2026-03-03 11:24:19.092"
+    },
+    {
+      "index": 7,
+      "label_id": 2,
+      "start_frame": 8515,
+      "end_frame": 8690,
+      "start_timestamp_unix": 1772504659546,
+      "start_timestamp_kst": "2026-03-03 11:24:19.546",
+      "end_timestamp_unix": 1772504666829,
+      "end_timestamp_kst": "2026-03-03 11:24:26.829"
+    },
+    {
+      "index": 8,
+      "label_id": 0,
+      "start_frame": 8796,
+      "end_frame": 9733,
+      "start_timestamp_unix": 1772504671251,
+      "start_timestamp_kst": "2026-03-03 11:24:31.251",
+      "end_timestamp_unix": 1772504710279,
+      "end_timestamp_kst": "2026-03-03 11:25:10.279"
+    },
+    {
+      "index": 9,
+      "label_id": 2,
+      "start_frame": 9760,
+      "end_frame": 9881,
+      "start_timestamp_unix": 1772504711408,
+      "start_timestamp_kst": "2026-03-03 11:25:11.408",
+      "end_timestamp_unix": 1772504716457,
+      "end_timestamp_kst": "2026-03-03 11:25:16.457"
+    },
+    {
+      "index": 10,
+      "label_id": 0,
+      "start_frame": 10006,
+      "end_frame": 10945,
+      "start_timestamp_unix": 1772504721653,
+      "start_timestamp_kst": "2026-03-03 11:25:21.653",
+      "end_timestamp_unix": 1772504760767,
+      "end_timestamp_kst": "2026-03-03 11:26:00.767"
+    },
+    {
+      "index": 11,
+      "label_id": 2,
+      "start_frame": 10954,
+      "end_frame": 11111,
+      "start_timestamp_unix": 1772504761138,
+      "start_timestamp_kst": "2026-03-03 11:26:01.138",
+      "end_timestamp_unix": 1772504767684,
+      "end_timestamp_kst": "2026-03-03 11:26:07.684"
+    },
+    {
+      "index": 12,
+      "label_id": 0,
+      "start_frame": 11211,
+      "end_frame": 12219,
+      "start_timestamp_unix": 1772504771842,
+      "start_timestamp_kst": "2026-03-03 11:26:11.842",
+      "end_timestamp_unix": 1772504813831,
+      "end_timestamp_kst": "2026-03-03 11:26:53.831"
+    },
+    {
+      "index": 13,
+      "label_id": 2,
+      "start_frame": 12231,
+      "end_frame": 12379,
+      "start_timestamp_unix": 1772504814323,
+      "start_timestamp_kst": "2026-03-03 11:26:54.323",
+      "end_timestamp_unix": 1772504820492,
+      "end_timestamp_kst": "2026-03-03 11:27:00.492"
+    },
+    {
+      "index": 14,
+      "label_id": 2,
+      "start_frame": 12552,
+      "end_frame": 12683,
+      "start_timestamp_unix": 1772504827700,
+      "start_timestamp_kst": "2026-03-03 11:27:07.700",
+      "end_timestamp_unix": 1772504833154,
+      "end_timestamp_kst": "2026-03-03 11:27:13.154"
+    },
+    {
+      "index": 15,
+      "label_id": 0,
+      "start_frame": 12765,
+      "end_frame": 18959,
+      "start_timestamp_unix": 1772504836571,
+      "start_timestamp_kst": "2026-03-03 11:27:16.571",
+      "end_timestamp_unix": 1772505094566,
+      "end_timestamp_kst": "2026-03-03 11:31:34.566"
+    },
+    {
+      "index": 16,
+      "label_id": 2,
+      "start_frame": 18968,
+      "end_frame": 19095,
+      "start_timestamp_unix": 1772505094933,
+      "start_timestamp_kst": "2026-03-03 11:31:34.933",
+      "end_timestamp_unix": 1772505100223,
+      "end_timestamp_kst": "2026-03-03 11:31:40.223"
+    },
+    {
+      "index": 17,
+      "label_id": 0,
+      "start_frame": 19206,
+      "end_frame": 33727,
+      "start_timestamp_unix": 1772505104862,
+      "start_timestamp_kst": "2026-03-03 11:31:44.862",
+      "end_timestamp_unix": 1772505709677,
+      "end_timestamp_kst": "2026-03-03 11:41:49.677"
+    },
+    {
+      "index": 18,
+      "label_id": 2,
+      "start_frame": 33744,
+      "end_frame": 33862,
+      "start_timestamp_unix": 1772505710388,
+      "start_timestamp_kst": "2026-03-03 11:41:50.388",
+      "end_timestamp_unix": 1772505715301,
+      "end_timestamp_kst": "2026-03-03 11:41:55.301"
+    },
+    {
+      "index": 19,
+      "label_id": 0,
+      "start_frame": 33965,
+      "end_frame": 35634,
+      "start_timestamp_unix": 1772505719588,
+      "start_timestamp_kst": "2026-03-03 11:41:59.588",
+      "end_timestamp_unix": 1772505789148,
+      "end_timestamp_kst": "2026-03-03 11:43:09.148"
+    },
+    {
+      "index": 20,
+      "label_id": 2,
+      "start_frame": 35648,
+      "end_frame": 35784,
+      "start_timestamp_unix": 1772505789733,
+      "start_timestamp_kst": "2026-03-03 11:43:09.733",
+      "end_timestamp_unix": 1772505795399,
+      "end_timestamp_kst": "2026-03-03 11:43:15.399"
+    },
+    {
+      "index": 21,
+      "label_id": 0,
+      "start_frame": 35872,
+      "end_frame": 37735,
+      "start_timestamp_unix": 1772505799067,
+      "start_timestamp_kst": "2026-03-03 11:43:19.067",
+      "end_timestamp_unix": 1772505876659,
+      "end_timestamp_kst": "2026-03-03 11:44:36.659"
+    },
+    {
+      "index": 22,
+      "label_id": 2,
+      "start_frame": 37764,
+      "end_frame": 37845,
+      "start_timestamp_unix": 1772505877871,
+      "start_timestamp_kst": "2026-03-03 11:44:37.871",
+      "end_timestamp_unix": 1772505881245,
+      "end_timestamp_kst": "2026-03-03 11:44:41.245"
+    },
+    {
+      "index": 23,
+      "label_id": 0,
+      "start_frame": 37944,
+      "end_frame": 38619,
+      "start_timestamp_unix": 1772505885366,
+      "start_timestamp_kst": "2026-03-03 11:44:45.366",
+      "end_timestamp_unix": 1772505913445,
+      "end_timestamp_kst": "2026-03-03 11:45:13.445"
+    },
+    {
+      "index": 24,
+      "label_id": 2,
+      "start_frame": 38634,
+      "end_frame": 38780,
+      "start_timestamp_unix": 1772505914112,
+      "start_timestamp_kst": "2026-03-03 11:45:14.112",
+      "end_timestamp_unix": 1772505920185,
+      "end_timestamp_kst": "2026-03-03 11:45:20.185"
+    },
+    {
+      "index": 25,
+      "label_id": 0,
+      "start_frame": 38894,
+      "end_frame": 44859,
+      "start_timestamp_unix": 1772505924937,
+      "start_timestamp_kst": "2026-03-03 11:45:24.937",
+      "end_timestamp_unix": 1772506173398,
+      "end_timestamp_kst": "2026-03-03 11:49:33.398"
+    },
+    {
+      "index": 26,
+      "label_id": 2,
+      "start_frame": 44893,
+      "end_frame": 44947,
+      "start_timestamp_unix": 1772506174807,
+      "start_timestamp_kst": "2026-03-03 11:49:34.807",
+      "end_timestamp_unix": 1772506177054,
+      "end_timestamp_kst": "2026-03-03 11:49:37.054"
+    },
+    {
+      "index": 27,
+      "label_id": 0,
+      "start_frame": 45062,
+      "end_frame": 46152,
+      "start_timestamp_unix": 1772506181841,
+      "start_timestamp_kst": "2026-03-03 11:49:41.841",
+      "end_timestamp_unix": 1772506227262,
+      "end_timestamp_kst": "2026-03-03 11:50:27.262"
+    },
+    {
+      "index": 28,
+      "label_id": 2,
+      "start_frame": 46172,
+      "end_frame": 46307,
+      "start_timestamp_unix": 1772506228079,
+      "start_timestamp_kst": "2026-03-03 11:50:28.079",
+      "end_timestamp_unix": 1772506233699,
+      "end_timestamp_kst": "2026-03-03 11:50:33.699"
+    },
+    {
+      "index": 29,
+      "label_id": 0,
+      "start_frame": 46415,
+      "end_frame": 47197,
+      "start_timestamp_unix": 1772506238197,
+      "start_timestamp_kst": "2026-03-03 11:50:38.197",
+      "end_timestamp_unix": 1772506270774,
+      "end_timestamp_kst": "2026-03-03 11:51:10.774"
+    },
+    {
+      "index": 30,
+      "label_id": 2,
+      "start_frame": 47230,
+      "end_frame": 47536,
+      "start_timestamp_unix": 1772506272149,
+      "start_timestamp_kst": "2026-03-03 11:51:12.149",
+      "end_timestamp_unix": 1772506284893,
+      "end_timestamp_kst": "2026-03-03 11:51:24.893"
+    },
+    {
+      "index": 31,
+      "label_id": 0,
+      "start_frame": 47666,
+      "end_frame": 55200,
+      "start_timestamp_unix": 1772506290305,
+      "start_timestamp_kst": "2026-03-03 11:51:30.305",
+      "end_timestamp_unix": 1772506604117,
+      "end_timestamp_kst": "2026-03-03 11:56:44.117"
+    },
+    {
+      "index": 32,
+      "label_id": 2,
+      "start_frame": 55228,
+      "end_frame": 55359,
+      "start_timestamp_unix": 1772506605280,
+      "start_timestamp_kst": "2026-03-03 11:56:45.280",
+      "end_timestamp_unix": 1772506610732,
+      "end_timestamp_kst": "2026-03-03 11:56:50.732"
+    },
+    {
+      "index": 33,
+      "label_id": 0,
+      "start_frame": 55455,
+      "end_frame": 55841,
+      "start_timestamp_unix": 1772506614733,
+      "start_timestamp_kst": "2026-03-03 11:56:54.733",
+      "end_timestamp_unix": 1772506630767,
+      "end_timestamp_kst": "2026-03-03 11:57:10.767"
+    },
+    {
+      "index": 34,
+      "label_id": 2,
+      "start_frame": 55874,
+      "end_frame": 56011,
+      "start_timestamp_unix": 1772506632190,
+      "start_timestamp_kst": "2026-03-03 11:57:12.190",
+      "end_timestamp_unix": 1772506637887,
+      "end_timestamp_kst": "2026-03-03 11:57:17.887"
+    },
+    {
+      "index": 35,
+      "label_id": 2,
+      "start_frame": 56206,
+      "end_frame": 56318,
+      "start_timestamp_unix": 1772506646008,
+      "start_timestamp_kst": "2026-03-03 11:57:26.008",
+      "end_timestamp_unix": 1772506650682,
+      "end_timestamp_kst": "2026-03-03 11:57:30.682"
+    },
+    {
+      "index": 36,
+      "label_id": 2,
+      "start_frame": 58342,
+      "end_frame": 58607,
+      "start_timestamp_unix": 1772506734982,
+      "start_timestamp_kst": "2026-03-03 11:58:54.982",
+      "end_timestamp_unix": 1772506746021,
+      "end_timestamp_kst": "2026-03-03 11:59:06.021"
+    },
+    {
+      "index": 37,
+      "label_id": 0,
+      "start_frame": 56453,
+      "end_frame": 58164,
+      "start_timestamp_unix": 1772506656298,
+      "start_timestamp_kst": "2026-03-03 11:57:36.298",
+      "end_timestamp_unix": 1772506727567,
+      "end_timestamp_kst": "2026-03-03 11:58:47.567"
+    }
+  ]
+}

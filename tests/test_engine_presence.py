@@ -27,6 +27,8 @@ def test_entry_debounce_three_frames():
         )
     assert event is not None
     assert event.event_type == "enter"
+    assert event.frame_index == 0
+    assert event.confirmed_frame_index == 2
 
 
 def test_exit_in_mode_b_after_debounce():
@@ -50,3 +52,5 @@ def test_exit_in_mode_b_after_debounce():
 
     assert event is not None
     assert event.event_type == "exit"
+    assert event.frame_index == 0
+    assert event.confirmed_frame_index == 2

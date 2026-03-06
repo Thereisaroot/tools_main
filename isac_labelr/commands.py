@@ -12,7 +12,6 @@ class AppCommand(Enum):
     EXIT = "exit"
 
     ADD_ROI = "add_roi"
-    DELETE_SELECTED_ROI = "delete_selected_roi"
     CLEAR_ALL_ROIS = "clear_all_rois"
     PREFERENCES = "preferences"
 
@@ -66,7 +65,6 @@ def build_menu_action_map() -> MenuActionMap:
         ],
         "Edit": [
             MenuActionSpec(AppCommand.ADD_ROI, "Add ROI", "R"),
-            MenuActionSpec(AppCommand.DELETE_SELECTED_ROI, "Delete Selected ROI", "Del"),
             MenuActionSpec(
                 AppCommand.CLEAR_ALL_ROIS,
                 "Clear All ROIs",

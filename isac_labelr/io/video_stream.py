@@ -217,6 +217,7 @@ class VideoStream:
             cap.set(cv2.CAP_PROP_POS_MSEC, float(start_ms))
 
         fps = max(1.0, self._info.fps)
+        current_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
 
         try:
             while True:
@@ -224,11 +225,12 @@ class VideoStream:
                 if not ok or image is None:
                     break
 
-                pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
-                frame_no_next = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                # OpenCV reports "next frame index" after read; convert to actual decoded frame index.
-                frame_index = max(0, frame_no_next - 1)
-                time_ms = int(pos_msec) if pos_msec > 0 else int((frame_index / fps) * 1000)
+                # Keep an explicit decode-order frame index to avoid backend-specific CAP_PROP_POS_FRAMES semantics.
+                frame_index = max(0, current_frame_index)
+                current_frame_index = frame_index + 1
+                # Keep frame/time alignment stable by deriving time directly from decoded frame index.
+                # CAP_PROP_POS_MSEC may point to the next frame on some backends.
+                time_ms = int(round((frame_index / fps) * 1000.0))
 
                 if time_ms < start_ms:
                     continue
@@ -240,12 +242,13 @@ class VideoStream:
 
                 if on_chunk and (time_ms - last_chunk_tick) >= chunk_ms:
                     # Periodically refresh VideoCapture to avoid long-run decoder memory growth.
-                    next_frame_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (frame_index + 1))
+                    next_frame_pos = int(current_frame_index)
                     chunk_idx += 1
                     last_chunk_tick = time_ms
                     on_chunk(chunk_idx, time_ms)
                     cap.release()
                     cap = open_cap()
                     cap.set(cv2.CAP_PROP_POS_FRAMES, float(max(0, next_frame_pos)))
+                    current_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or next_frame_pos)
         finally:
             cap.release()
