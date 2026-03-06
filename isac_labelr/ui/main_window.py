@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 from isac_labelr.analysis.engine import AnalysisEngine, PresenceState
 from isac_labelr.analysis.worker import AnalysisWorker
 from isac_labelr.commands import AppCommand, MenuActionSpec, build_menu_action_map
-from isac_labelr.io.metadata_writer import MetadataWriter
+from isac_labelr.io.metadata_writer import MetadataStore
 from isac_labelr.io.video_stream import rotate_bgr
 from isac_labelr.models import (
     AnalysisMode,
@@ -184,6 +184,10 @@ class MainWindow(QMainWindow):
 
         self.events: list[EventRecord] = []
         self.output_dir: Path | None = None
+        self.primary_metadata_path: Path | None = None
+        self.debug_metadata_path: Path | None = None
+        self.metadata_video_path: str | None = None
+        self.log_path: Path | None = None
         self._events_edit_source: str | None = None
         self._events_initial_snapshot: list[dict] | None = None
         self._events_undo_stack: list[tuple[list[dict], str | None]] = []
@@ -262,9 +266,9 @@ class MainWindow(QMainWindow):
         self.start_partial_button.setToolTip("Analyze only Start ms ~ Duration ms range.")
         self.stop_analysis_button = QPushButton("Stop Analysis")
         self.open_metadata_button = QPushButton("Open Metadata Folder")
-        self.open_metadata_button.setToolTip("Open output folder containing events.jsonl / events.csv")
+        self.open_metadata_button.setToolTip("Open folder containing <video>.json and <video>_debug.json")
         self.load_metadata_button = QPushButton("Load Metadata")
-        self.load_metadata_button.setToolTip("Load events from events.jsonl or events.csv")
+        self.load_metadata_button.setToolTip("Load metadata from .json / _debug.json (legacy jsonl/csv supported)")
         self.manual_add_event_button = QPushButton("Manual Add")
         self.manual_add_event_button.setToolTip("Add one event at current frame using OCR timestamp")
         self.edit_event_json_button = QPushButton("Edit JSON")
@@ -667,7 +671,10 @@ class MainWindow(QMainWindow):
         self._clear_detected_events(confirm=False)
         self._reset_preview_inference(clear_detector=False, clear_overlay=True)
 
-        self.output_dir = MetadataWriter.default_output_dir(path)
+        self.metadata_video_path = path
+        self.primary_metadata_path, self.debug_metadata_path = MetadataStore.metadata_paths(path)
+        self.log_path = Path(path).with_name(f"{Path(path).stem}_run_log.txt")
+        self.output_dir = Path(path).parent
         self.setWindowTitle(f"ISAC Labelr - {Path(path).name}")
         self.status_label.setText(f"Loaded {Path(path).name}")
         self._set_notice(self._default_notice_text())
@@ -1549,7 +1556,7 @@ class MainWindow(QMainWindow):
                 self._set_notice(
                     "Detected Events UI cache reached limit. "
                     "Older entries were dropped to keep memory stable. "
-                    "Full results are still saved to output/events.jsonl and events.csv."
+                    "Full results are still saved to <video>.json and <video>_debug.json."
                 )
 
         self._append_event_to_ui(event)
@@ -1560,12 +1567,15 @@ class MainWindow(QMainWindow):
             f"Analysis {'aborted' if result.aborted else 'finished'} | events={result.total_events}"
         )
 
-        if result.output_dir:
-            self.output_dir = result.output_dir
-        elif self.video_path:
-            self.output_dir = MetadataWriter.default_output_dir(self.video_path)
+        if self.video_path:
+            self.metadata_video_path = self.video_path
+            self.primary_metadata_path, self.debug_metadata_path = MetadataStore.metadata_paths(
+                self.video_path
+            )
+            self.output_dir = Path(self.video_path).parent
+            self.log_path = Path(self.video_path).with_name(f"{Path(self.video_path).stem}_run_log.txt")
 
-        self._reload_events_from_output_for_edit_context()
+        self._reload_events_from_metadata_for_edit_context()
         self._set_events_edit_context(enabled=True, source="analysis_finished")
         self._refresh_action_states()
 
@@ -1778,10 +1788,7 @@ class MainWindow(QMainWindow):
             roi_h=0,
         )
         self._append_event_to_ui(manual_event)
-        if self.video_path is not None and self.output_dir is None:
-            self.output_dir = MetadataWriter.default_output_dir(self.video_path)
-        if self.output_dir is not None:
-            self._write_metadata(self.output_dir)
+        self._write_metadata()
         self.status_label.setText("Manual event added with OCR timestamp")
         self._refresh_action_states()
 
@@ -1836,8 +1843,7 @@ class MainWindow(QMainWindow):
                 self._push_undo_snapshot()
             self.events[index] = updated
             self._rebuild_event_list(preferred_index=index)
-            if self.output_dir is not None:
-                self._write_metadata(self.output_dir)
+            self._write_metadata()
             self._refresh_action_states()
             dialog.accept()
 
@@ -1845,7 +1851,46 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         dialog.exec()
 
-    def _read_events_from_metadata_file(self, file_path: Path) -> list[EventRecord]:
+    def _frame_to_video_time_ms(self, frame_index: int) -> int:
+        return int(round((int(frame_index) / max(float(self.fps), 1.0)) * 1000.0))
+
+    def _event_from_primary_label(self, row: dict, *, video_name: str) -> EventRecord:
+        label_id = self._to_int(row.get("label_id"), 0)
+        frame_index = self._to_int(row.get("start_frame"), 0)
+        start_ts = self._to_int_opt(row.get("start_timestamp_unix"))
+        status = OverlayTSStatus.OK if start_ts is not None else OverlayTSStatus.FAILED
+        return EventRecord(
+            event_id=str(uuid.uuid4()),
+            video_name=video_name,
+            roi_id=(f"roi_{label_id}" if label_id > 0 else "0"),
+            person_id=0,
+            event_type="label",
+            direction_label=None,
+            frame_index=frame_index,
+            video_time_ms=self._frame_to_video_time_ms(frame_index),
+            overlay_ts_ms=start_ts,
+            overlay_ts_status=status,
+            correction_ms=0,
+            corrected_ts_ms=start_ts,
+            det_conf=0.0,
+            ocr_conf=None,
+            ocr_raw_text=str(start_ts) if start_ts is not None else "",
+            visible_person_count=0,
+            roi_person_count=0,
+            confirmed_frame_index=frame_index,
+            confirmed_video_time_ms=self._frame_to_video_time_ms(frame_index),
+            ocr_frame_index=frame_index,
+            rotation_deg=int(self.rotation_deg) % 360,
+            roi_x=None,
+            roi_y=None,
+            roi_w=None,
+            roi_h=None,
+        )
+
+    def _read_events_from_metadata_file(
+        self,
+        file_path: Path,
+    ) -> tuple[list[EventRecord], dict | None, str | None, Path | None, Path | None]:
         loaded: list[EventRecord] = []
         suffix = file_path.suffix.lower()
         if suffix == ".jsonl":
@@ -1857,14 +1902,39 @@ class MainWindow(QMainWindow):
                     mapping = json.loads(raw)
                     if isinstance(mapping, dict):
                         loaded.append(self._event_from_mapping(mapping))
-            return loaded
+            return loaded, None, None, None, None
         if suffix == ".csv":
             with file_path.open("r", encoding="utf-8-sig", newline="") as fh:
                 reader = csv.DictReader(fh)
                 for row in reader:
                     if row:
                         loaded.append(self._event_from_mapping(dict(row)))
-            return loaded
+            return loaded, None, None, None, None
+        if suffix == ".json":
+            name_lower = file_path.name.lower()
+            if name_lower.endswith("_debug.json"):
+                video_path, session, rows = MetadataStore.load_debug(file_path)
+                for row in rows:
+                    loaded.append(self._event_from_mapping(row))
+                base_stem = file_path.stem[:-6] if file_path.stem.lower().endswith("_debug") else file_path.stem
+                primary_path = file_path.with_name(f"{base_stem}.json")
+                return loaded, session, video_path, primary_path, file_path
+
+            sibling_debug = file_path.with_name(f"{file_path.stem}_debug.json")
+            if sibling_debug.exists():
+                try:
+                    video_path, session, rows = MetadataStore.load_debug(sibling_debug)
+                    for row in rows:
+                        loaded.append(self._event_from_mapping(row))
+                    return loaded, session, video_path, file_path, sibling_debug
+                except Exception:
+                    loaded.clear()
+
+            video_path, labels = MetadataStore.load_primary(file_path)
+            inferred_video_name = Path(video_path).name if video_path else (Path(self.video_path).name if self.video_path else "")
+            for row in labels:
+                loaded.append(self._event_from_primary_label(row, video_name=inferred_video_name))
+            return loaded, None, video_path, file_path, sibling_debug
         raise ValueError("Unsupported file format.")
 
     def _load_events_into_ui_state(self, loaded: list[EventRecord]) -> None:
@@ -1876,18 +1946,17 @@ class MainWindow(QMainWindow):
                 "Only first entries are shown in Detected Events."
             )
 
-    def _reload_events_from_output_for_edit_context(self) -> None:
-        if self.output_dir is None:
-            return
-        candidates = [
-            self.output_dir / "events.jsonl",
-            self.output_dir / "events.csv",
-        ]
+    def _reload_events_from_metadata_for_edit_context(self) -> None:
+        candidates: list[Path] = []
+        if self.debug_metadata_path is not None:
+            candidates.append(self.debug_metadata_path)
+        if self.primary_metadata_path is not None:
+            candidates.append(self.primary_metadata_path)
         for candidate in candidates:
             if not candidate.exists():
                 continue
             try:
-                loaded = self._read_events_from_metadata_file(candidate)
+                loaded, _session, _video_path, _primary_path, _debug_path = self._read_events_from_metadata_file(candidate)
             except Exception:
                 continue
             self._load_events_into_ui_state(loaded)
@@ -1912,8 +1981,7 @@ class MainWindow(QMainWindow):
         self._push_undo_snapshot()
         self.events.pop(index)
         self._rebuild_event_list(preferred_index=index)
-        if self.output_dir is not None:
-            self._write_metadata(self.output_dir)
+        self._write_metadata()
         self._refresh_action_states()
 
     def _undo_event_edit(self) -> None:
@@ -1926,8 +1994,7 @@ class MainWindow(QMainWindow):
         if len(self._events_redo_stack) > self.MAX_EVENT_HISTORY_STEPS:
             self._events_redo_stack.pop(0)
         self._replace_events_from_snapshot(snapshot, preferred_event_id=preferred_event_id)
-        if self.output_dir is not None:
-            self._write_metadata(self.output_dir)
+        self._write_metadata()
         self._refresh_action_states()
 
     def _redo_event_edit(self) -> None:
@@ -1940,8 +2007,7 @@ class MainWindow(QMainWindow):
         if len(self._events_undo_stack) > self.MAX_EVENT_HISTORY_STEPS:
             self._events_undo_stack.pop(0)
         self._replace_events_from_snapshot(snapshot, preferred_event_id=preferred_event_id)
-        if self.output_dir is not None:
-            self._write_metadata(self.output_dir)
+        self._write_metadata()
         self._refresh_action_states()
 
     def _restore_initial_events(self) -> None:
@@ -1951,8 +2017,7 @@ class MainWindow(QMainWindow):
             return
         self._push_undo_snapshot()
         self._replace_events_from_snapshot(self._events_initial_snapshot)
-        if self.output_dir is not None:
-            self._write_metadata(self.output_dir)
+        self._write_metadata()
         self._refresh_action_states()
 
     def _clear_detected_events(self, *, confirm: bool, record_history: bool = False) -> None:
@@ -1970,8 +2035,8 @@ class MainWindow(QMainWindow):
         self.event_list.clear()
         self._ui_event_overflowed = False
         self._reset_preview_event_state()
-        if record_history and self.output_dir is not None:
-            self._write_metadata(self.output_dir)
+        if record_history:
+            self._write_metadata()
         self._refresh_action_states()
 
     def _rerun_ocr_on_selected_event(self) -> None:
@@ -2024,17 +2089,37 @@ class MainWindow(QMainWindow):
         )
         item.setText(self._event_text(event))
 
-        if self.output_dir is not None:
-            self._write_metadata(self.output_dir)
+        self._write_metadata()
 
-    def _write_metadata(self, output_dir: Path) -> None:
-        writer = MetadataWriter(output_dir)
-        try:
-            for event in self.events:
-                writer.write_event(event)
-            writer.write_session_config(self._session_config().to_dict())
-        finally:
-            writer.close()
+    def _write_metadata(self, target_dir: Path | None = None) -> None:
+        video_path = self.metadata_video_path or self.video_path
+        if not video_path:
+            return
+
+        store = MetadataStore(video_path)
+        if target_dir is not None:
+            target_primary = target_dir / f"{Path(video_path).stem}.json"
+            target_debug = target_dir / f"{Path(video_path).stem}_debug.json"
+            store.primary_path = target_primary
+            store.debug_path = target_debug
+        else:
+            if self.primary_metadata_path is not None:
+                store.primary_path = self.primary_metadata_path
+            if self.debug_metadata_path is not None:
+                store.debug_path = self.debug_metadata_path
+
+        session = self._session_config().to_dict()
+        max_frame_index = max(0, self.total_frames - 1) if self.total_frames > 0 else None
+        store.save_all(
+            events=self.events,
+            session=session,
+            max_frame_index=max_frame_index,
+        )
+
+        if target_dir is None:
+            self.primary_metadata_path = store.primary_path
+            self.debug_metadata_path = store.debug_path
+            self.output_dir = store.primary_path.parent
 
     def _append_event_to_ui(self, event: EventRecord) -> None:
         index = len(self.events)
@@ -2197,12 +2282,11 @@ class MainWindow(QMainWindow):
         self,
         metadata_file: Path,
         loaded_events: list[EventRecord],
+        session_payload: dict | None = None,
     ) -> str | None:
-        session_path = metadata_file.parent / "session_config.json"
-        if session_path.exists():
+        if session_payload is not None:
             try:
-                raw = json.loads(session_path.read_text(encoding="utf-8"))
-                config = SessionConfig.from_dict(raw)
+                config = SessionConfig.from_dict(dict(session_payload))
                 rois = {roi.roi_id: roi for roi in config.rois}
                 self._apply_scene_context(
                     rotation_deg=config.rotation_deg,
@@ -2210,7 +2294,7 @@ class MainWindow(QMainWindow):
                     direction_vectors=dict(config.direction_vectors),
                     ocr_manual_roi=config.ocr_manual_roi,
                 )
-                return "session_config.json"
+                return "debug.session"
             except Exception:
                 pass
 
@@ -2246,14 +2330,16 @@ class MainWindow(QMainWindow):
             self,
             "Load metadata events",
             str(self.output_dir) if self.output_dir else "",
-            "Event files (*.jsonl *.csv);;JSONL (*.jsonl);;CSV (*.csv)",
+            "Metadata files (*.json *.jsonl *.csv);;JSON (*.json);;JSONL (*.jsonl);;CSV (*.csv)",
         )
         if not path:
             return
 
         file_path = Path(path)
         try:
-            loaded = self._read_events_from_metadata_file(file_path)
+            loaded, session_payload, video_path, primary_path, debug_path = self._read_events_from_metadata_file(
+                file_path
+            )
         except ValueError as exc:
             QMessageBox.warning(self, "Load Metadata", str(exc))
             return
@@ -2274,7 +2360,18 @@ class MainWindow(QMainWindow):
         self._load_events_into_ui_state(loaded)
 
         self.output_dir = file_path.parent
-        context_src = self._load_scene_context_from_metadata(file_path, loaded)
+        self.primary_metadata_path = primary_path
+        self.debug_metadata_path = debug_path
+        if video_path:
+            self.metadata_video_path = video_path
+            self.log_path = Path(video_path).with_name(f"{Path(video_path).stem}_run_log.txt")
+        elif self.primary_metadata_path is not None:
+            self.log_path = self.primary_metadata_path.with_name(f"{self.primary_metadata_path.stem}_run_log.txt")
+        context_src = self._load_scene_context_from_metadata(
+            file_path,
+            loaded,
+            session_payload=session_payload,
+        )
         self._set_events_edit_context(enabled=True, source="metadata_loaded")
         if context_src:
             self.status_label.setText(
@@ -2294,7 +2391,7 @@ class MainWindow(QMainWindow):
         if not selected:
             return
         out = Path(selected)
-        self._write_metadata(out)
+        self._write_metadata(target_dir=out)
         QMessageBox.information(self, "Export", f"Exported metadata to:\n{out}")
 
     def _save_session_dialog(self) -> None:
@@ -2351,7 +2448,7 @@ class MainWindow(QMainWindow):
     def _session_config(self) -> SessionConfig:
         mode = self._current_mode()
         return SessionConfig(
-            video_path=self.video_path or "",
+            video_path=self.metadata_video_path or self.video_path or "",
             rotation_deg=self.rotation_deg,
             mode=mode,
             rois=[roi.normalized() for roi in self.rois.values()],
@@ -2382,20 +2479,28 @@ class MainWindow(QMainWindow):
         self.canvas.zoom_reset()
 
     def _open_output_folder(self) -> None:
-        if self.output_dir is None:
+        target = (
+            self.primary_metadata_path.parent
+            if self.primary_metadata_path is not None
+            else self.output_dir
+        )
+        if target is None:
             QMessageBox.information(self, "Output", "No output directory available")
             return
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.output_dir)))
+        target.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def _view_logs_dialog(self) -> None:
-        if self.output_dir is None:
-            QMessageBox.information(self, "Logs", "No output directory available")
+        path = self.log_path
+        if path is None and self.metadata_video_path:
+            video = Path(self.metadata_video_path)
+            path = video.with_name(f"{video.stem}_run_log.txt")
+        if path is None:
+            QMessageBox.information(self, "Logs", "No log file path available")
             return
 
-        path = self.output_dir / "run_log.txt"
         if not path.exists():
-            QMessageBox.information(self, "Logs", "run_log.txt not found")
+            QMessageBox.information(self, "Logs", f"Log file not found:\n{path}")
             return
 
         dlg = QDialog(self)
@@ -2452,8 +2557,8 @@ class MainWindow(QMainWindow):
             AppCommand.MANUAL_OCR_ROI: has_video,
             AppCommand.SET_CORRECTION_MS: True,
             AppCommand.RERUN_OCR_SELECTED_EVENT: has_selected_event and has_video,
-            AppCommand.OPEN_OUTPUT_FOLDER: self.output_dir is not None,
-            AppCommand.VIEW_LOGS: self.output_dir is not None,
+            AppCommand.OPEN_OUTPUT_FOLDER: (self.primary_metadata_path is not None) or (self.output_dir is not None),
+            AppCommand.VIEW_LOGS: (self.log_path is not None) or (self.metadata_video_path is not None),
             AppCommand.RESET_LAYOUT: True,
             AppCommand.PREFERENCES: not running,
             AppCommand.DEBUG_OCR_CURRENT_FRAME: has_video and not ocr_debug_running,
