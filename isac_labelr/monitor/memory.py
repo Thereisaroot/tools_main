@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import ctypes
 import os
-import resource
 import sys
 from dataclasses import dataclass
+
+try:
+    import resource
+except Exception:  # pragma: no cover - not available on Windows
+    resource = None
 
 try:
     import psutil
@@ -22,6 +26,8 @@ class MemorySnapshot:
 
 
 def _ru_maxrss_mb() -> float:
+    if resource is None:
+        return 0.0
     rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     if sys.platform == "darwin":
         return rss / (1024.0 * 1024.0)
@@ -81,7 +87,7 @@ def get_memory_snapshot() -> MemorySnapshot:
             tree_rss_mb=value,
             phys_footprint_mb=footprint,
             child_count=0,
-            backend="resource",
+            backend="resource" if resource is not None else "none",
         )
 
     proc = psutil.Process(pid)

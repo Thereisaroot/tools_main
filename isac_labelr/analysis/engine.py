@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,12 +41,10 @@ class AnalysisEngine:
         self._last_overlay_ts: int | None = None
         self._last_overlay_video_time_ms: int | None = None
         self._last_ocr_frame_index: int | None = None
-        self._mem_diag_enabled = str(os.getenv("ISAC_MEM_DIAG", "0")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        self._mem_diag_enabled = (
+            str(os.getenv("ISAC_MEM_DIAG", "0")).strip().lower() in {"1", "true", "yes", "on"}
+            and (sys.platform != "win32")
+        )
 
     @staticmethod
     def _coerce_mode(mode: AnalysisMode | str) -> AnalysisMode:

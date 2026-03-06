@@ -8,7 +8,7 @@ from pathlib import Path
 import uuid
 
 import cv2
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -155,6 +155,7 @@ class OCRDebugWorker(QObject):
 
 class MainWindow(QMainWindow):
     MAX_UI_EVENTS = 5000
+    MAX_EVENT_HISTORY_STEPS = 30
 
     def __init__(self) -> None:
         super().__init__()
@@ -182,6 +183,10 @@ class MainWindow(QMainWindow):
 
         self.events: list[EventRecord] = []
         self.output_dir: Path | None = None
+        self._events_edit_source: str | None = None
+        self._events_initial_snapshot: list[dict] | None = None
+        self._events_undo_stack: list[tuple[list[dict], str | None]] = []
+        self._events_redo_stack: list[tuple[list[dict], str | None]] = []
 
         self.analysis_thread: QThread | None = None
         self.analysis_worker: AnalysisWorker | None = None
@@ -206,6 +211,7 @@ class MainWindow(QMainWindow):
             1, int(os.getenv("ISAC_PREVIEW_OCR_SAMPLE_FRAMES", "5"))
         )
         self._ui_event_overflowed = False
+        self._memory_monitor_enabled = os.name != "nt"
 
         self.timestamp_ocr = TimestampOCR()
 
@@ -250,6 +256,16 @@ class MainWindow(QMainWindow):
         self.open_metadata_button.setToolTip("Open output folder containing events.jsonl / events.csv")
         self.load_metadata_button = QPushButton("Load Metadata")
         self.load_metadata_button.setToolTip("Load events from events.jsonl or events.csv")
+        self.delete_event_button = QPushButton("X Delete")
+        self.delete_event_button.setToolTip("Delete selected event")
+        self.undo_event_button = QPushButton("Undo")
+        self.undo_event_button.setToolTip("Undo last event edit (max 30)")
+        self.redo_event_button = QPushButton("Redo")
+        self.redo_event_button.setToolTip("Redo undone event edit")
+        self.restore_events_button = QPushButton("Restore Initial")
+        self.restore_events_button.setToolTip(
+            "Restore events to the initial snapshot from metadata load or analysis finish"
+        )
 
         self.command_buttons = {
             AppCommand.OPEN_VIDEO: self.open_file_button,
@@ -380,6 +396,15 @@ class MainWindow(QMainWindow):
         event_buttons_layout.addWidget(self.open_metadata_button)
         event_buttons_layout.addWidget(self.load_metadata_button)
         event_layout.addWidget(event_buttons)
+        event_edit_buttons = QWidget()
+        event_edit_buttons_layout = QHBoxLayout(event_edit_buttons)
+        event_edit_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        event_edit_buttons_layout.addWidget(self.delete_event_button)
+        event_edit_buttons_layout.addWidget(self.undo_event_button)
+        event_edit_buttons_layout.addWidget(self.redo_event_button)
+        event_edit_buttons_layout.addWidget(self.restore_events_button)
+        event_edit_buttons_layout.addStretch(1)
+        event_layout.addWidget(event_edit_buttons)
         self.event_list = QListWidget()
         event_layout.addWidget(self.event_list)
         right_layout.addWidget(event_box, 2)
@@ -391,7 +416,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
         self.status_label = QLabel("Idle")
-        self.memory_label = QLabel("Mem(total): -")
+        if self._memory_monitor_enabled:
+            self.memory_label = QLabel("Mem(total): -")
+        else:
+            self.memory_label = QLabel("Mem monitor disabled on Windows")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -400,7 +428,8 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.progress_bar)
 
         self._toggle_partial_fields()
-        self.memory_timer.start(1000)
+        if self._memory_monitor_enabled:
+            self.memory_timer.start(1000)
 
     def _build_menubar(self) -> None:
         action_map = build_menu_action_map()
@@ -452,6 +481,10 @@ class MainWindow(QMainWindow):
             lambda: self._dispatch_command(AppCommand.OPEN_OUTPUT_FOLDER)
         )
         self.load_metadata_button.clicked.connect(self._load_metadata_dialog)
+        self.delete_event_button.clicked.connect(self._delete_selected_event)
+        self.undo_event_button.clicked.connect(self._undo_event_edit)
+        self.redo_event_button.clicked.connect(self._redo_event_edit)
+        self.restore_events_button.clicked.connect(self._restore_initial_events)
 
         self.play_button.clicked.connect(self._toggle_play)
         self.prev_button.clicked.connect(lambda: self._seek_frame(self.current_frame_index - 1))
@@ -464,7 +497,8 @@ class MainWindow(QMainWindow):
         self.roi_list.currentItemChanged.connect(self._on_roi_list_selection_changed)
         self.dx_spin.valueChanged.connect(self._on_direction_changed)
         self.dy_spin.valueChanged.connect(self._on_direction_changed)
-        self.event_list.itemClicked.connect(self._on_event_item_clicked)
+        self.event_list.currentItemChanged.connect(self._on_event_item_current_changed)
+        self.event_list.installEventFilter(self)
 
         self.canvas.roi_created.connect(self._on_canvas_roi_created)
         self.canvas.roi_selected.connect(self._on_canvas_roi_selected)
@@ -511,7 +545,7 @@ class MainWindow(QMainWindow):
         elif command == AppCommand.STOP_ANALYSIS:
             self._stop_analysis()
         elif command == AppCommand.CLEAR_DETECTED_EVENTS:
-            self._clear_detected_events(confirm=True)
+            self._clear_detected_events(confirm=True, record_history=self._can_manage_events())
         elif command == AppCommand.SET_MODE_A:
             self.mode_combo.setCurrentIndex(0)
         elif command == AppCommand.SET_MODE_B:
@@ -582,6 +616,7 @@ class MainWindow(QMainWindow):
         self.timestamp_ocr.clear_auto_roi()
         self.canvas.set_timestamp_roi(None)
 
+        self._set_events_edit_context(enabled=False)
         self._clear_detected_events(confirm=False)
         self._reset_preview_inference(clear_detector=False, clear_overlay=True)
 
@@ -1321,6 +1356,7 @@ class MainWindow(QMainWindow):
             chunk_seconds=self.preferences.chunk_seconds,
         )
 
+        self._set_events_edit_context(enabled=False)
         self._clear_detected_events(confirm=False)
         self.progress_bar.setValue(0)
 
@@ -1391,6 +1427,8 @@ class MainWindow(QMainWindow):
         elif self.video_path:
             self.output_dir = MetadataWriter.default_output_dir(self.video_path)
 
+        self._reload_events_from_output_for_edit_context()
+        self._set_events_edit_context(enabled=True, source="analysis_finished")
         self._refresh_action_states()
 
     def _on_analysis_failed(self, message: str) -> None:
@@ -1407,15 +1445,217 @@ class MainWindow(QMainWindow):
             f"all={event.visible_person_count} roi={event.roi_person_count}"
         )
 
-    def _on_event_item_clicked(self, item: QListWidgetItem) -> None:
+    def _activate_event_item(self, item: QListWidgetItem) -> None:
         idx = item.data(Qt.UserRole)
         if idx is None:
             return
-        event = self.events[int(idx)]
+        try:
+            index = int(idx)
+        except Exception:
+            return
+        if index < 0 or index >= len(self.events):
+            return
+        event = self.events[index]
         self._seek_frame(event.frame_index)
         self._refresh_action_states()
 
-    def _clear_detected_events(self, *, confirm: bool) -> None:
+    def _on_event_item_clicked(self, item: QListWidgetItem) -> None:
+        self._activate_event_item(item)
+
+    def _on_event_item_current_changed(
+        self,
+        current: QListWidgetItem | None,
+        _prev: QListWidgetItem | None,
+    ) -> None:
+        if current is None:
+            self._refresh_action_states()
+            return
+        self._activate_event_item(current)
+
+    def _snapshot_events(self) -> list[dict]:
+        return [dict(event.to_dict()) for event in self.events]
+
+    def _selected_event_id(self) -> str | None:
+        item = self.event_list.currentItem()
+        if item is None:
+            return None
+        idx = item.data(Qt.UserRole)
+        if idx is None:
+            return None
+        try:
+            index = int(idx)
+        except Exception:
+            return None
+        if index < 0 or index >= len(self.events):
+            return None
+        return self.events[index].event_id
+
+    def _can_manage_events(self) -> bool:
+        return self._events_edit_source is not None and self.analysis_worker is None
+
+    def _set_events_edit_context(self, *, enabled: bool, source: str | None = None) -> None:
+        if not enabled:
+            self._events_edit_source = None
+            self._events_initial_snapshot = None
+            self._events_undo_stack.clear()
+            self._events_redo_stack.clear()
+            return
+        self._events_edit_source = source or "unknown"
+        self._events_initial_snapshot = self._snapshot_events()
+        self._events_undo_stack.clear()
+        self._events_redo_stack.clear()
+
+    def _events_changed_from_initial(self) -> bool:
+        if self._events_initial_snapshot is None:
+            return False
+        return self._snapshot_events() != self._events_initial_snapshot
+
+    def _push_undo_snapshot(self) -> None:
+        if not self._can_manage_events():
+            return
+        self._events_undo_stack.append((self._snapshot_events(), self._selected_event_id()))
+        if len(self._events_undo_stack) > self.MAX_EVENT_HISTORY_STEPS:
+            self._events_undo_stack.pop(0)
+        self._events_redo_stack.clear()
+
+    def _rebuild_event_list(self, *, preferred_event_id: str | None = None, preferred_index: int = 0) -> None:
+        self.event_list.clear()
+        visible_count = min(len(self.events), self.MAX_UI_EVENTS)
+        self._ui_event_overflowed = len(self.events) > self.MAX_UI_EVENTS
+        selected_index: int | None = None
+        for idx in range(visible_count):
+            event = self.events[idx]
+            item = QListWidgetItem(self._event_text(event))
+            item.setData(Qt.UserRole, idx)
+            self.event_list.addItem(item)
+            if preferred_event_id is not None and event.event_id == preferred_event_id:
+                selected_index = idx
+        if selected_index is None and visible_count > 0:
+            selected_index = max(0, min(preferred_index, visible_count - 1))
+        if selected_index is not None:
+            self.event_list.setCurrentRow(selected_index)
+
+    def _replace_events_from_snapshot(
+        self,
+        snapshot: list[dict],
+        *,
+        preferred_event_id: str | None = None,
+        preferred_index: int = 0,
+    ) -> None:
+        self.events = [self._event_from_mapping(dict(row)) for row in snapshot]
+        self._rebuild_event_list(preferred_event_id=preferred_event_id, preferred_index=preferred_index)
+
+    def _read_events_from_metadata_file(self, file_path: Path) -> list[EventRecord]:
+        loaded: list[EventRecord] = []
+        suffix = file_path.suffix.lower()
+        if suffix == ".jsonl":
+            with file_path.open("r", encoding="utf-8-sig") as fh:
+                for line in fh:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    mapping = json.loads(raw)
+                    if isinstance(mapping, dict):
+                        loaded.append(self._event_from_mapping(mapping))
+            return loaded
+        if suffix == ".csv":
+            with file_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    if row:
+                        loaded.append(self._event_from_mapping(dict(row)))
+            return loaded
+        raise ValueError("Unsupported file format.")
+
+    def _load_events_into_ui_state(self, loaded: list[EventRecord]) -> None:
+        self.events = list(loaded)
+        self._rebuild_event_list(preferred_index=0)
+        if self._ui_event_overflowed:
+            self._set_notice(
+                "Loaded metadata exceeded UI limit. "
+                "Only first entries are shown in Detected Events."
+            )
+
+    def _reload_events_from_output_for_edit_context(self) -> None:
+        if self.output_dir is None:
+            return
+        candidates = [
+            self.output_dir / "events.jsonl",
+            self.output_dir / "events.csv",
+        ]
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                loaded = self._read_events_from_metadata_file(candidate)
+            except Exception:
+                continue
+            self._load_events_into_ui_state(loaded)
+            return
+
+    def _delete_selected_event(self) -> None:
+        if not self._can_manage_events():
+            return
+        item = self.event_list.currentItem()
+        if item is None:
+            return
+        idx = item.data(Qt.UserRole)
+        if idx is None:
+            return
+        try:
+            index = int(idx)
+        except Exception:
+            return
+        if index < 0 or index >= len(self.events):
+            return
+
+        self._push_undo_snapshot()
+        self.events.pop(index)
+        self._rebuild_event_list(preferred_index=index)
+        if self.output_dir is not None:
+            self._write_metadata(self.output_dir)
+        self._refresh_action_states()
+
+    def _undo_event_edit(self) -> None:
+        if not self._can_manage_events() or not self._events_undo_stack:
+            return
+        current_snapshot = self._snapshot_events()
+        current_selected_id = self._selected_event_id()
+        snapshot, preferred_event_id = self._events_undo_stack.pop()
+        self._events_redo_stack.append((current_snapshot, current_selected_id))
+        if len(self._events_redo_stack) > self.MAX_EVENT_HISTORY_STEPS:
+            self._events_redo_stack.pop(0)
+        self._replace_events_from_snapshot(snapshot, preferred_event_id=preferred_event_id)
+        if self.output_dir is not None:
+            self._write_metadata(self.output_dir)
+        self._refresh_action_states()
+
+    def _redo_event_edit(self) -> None:
+        if not self._can_manage_events() or not self._events_redo_stack:
+            return
+        current_snapshot = self._snapshot_events()
+        current_selected_id = self._selected_event_id()
+        snapshot, preferred_event_id = self._events_redo_stack.pop()
+        self._events_undo_stack.append((current_snapshot, current_selected_id))
+        if len(self._events_undo_stack) > self.MAX_EVENT_HISTORY_STEPS:
+            self._events_undo_stack.pop(0)
+        self._replace_events_from_snapshot(snapshot, preferred_event_id=preferred_event_id)
+        if self.output_dir is not None:
+            self._write_metadata(self.output_dir)
+        self._refresh_action_states()
+
+    def _restore_initial_events(self) -> None:
+        if not self._can_manage_events() or self._events_initial_snapshot is None:
+            return
+        if not self._events_changed_from_initial():
+            return
+        self._push_undo_snapshot()
+        self._replace_events_from_snapshot(self._events_initial_snapshot)
+        if self.output_dir is not None:
+            self._write_metadata(self.output_dir)
+        self._refresh_action_states()
+
+    def _clear_detected_events(self, *, confirm: bool, record_history: bool = False) -> None:
         if not self.events:
             self._ui_event_overflowed = False
             return
@@ -1424,10 +1664,14 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 return
 
+        if record_history and self._can_manage_events():
+            self._push_undo_snapshot()
         self.events.clear()
         self.event_list.clear()
         self._ui_event_overflowed = False
         self._reset_preview_event_state()
+        if record_history and self.output_dir is not None:
+            self._write_metadata(self.output_dir)
         self._refresh_action_states()
 
     def _rerun_ocr_on_selected_event(self) -> None:
@@ -1676,25 +1920,10 @@ class MainWindow(QMainWindow):
 
         file_path = Path(path)
         try:
-            loaded: list[EventRecord] = []
-            if file_path.suffix.lower() == ".jsonl":
-                with file_path.open("r", encoding="utf-8-sig") as fh:
-                    for line in fh:
-                        raw = line.strip()
-                        if not raw:
-                            continue
-                        mapping = json.loads(raw)
-                        if isinstance(mapping, dict):
-                            loaded.append(self._event_from_mapping(mapping))
-            elif file_path.suffix.lower() == ".csv":
-                with file_path.open("r", encoding="utf-8-sig", newline="") as fh:
-                    reader = csv.DictReader(fh)
-                    for row in reader:
-                        if row:
-                            loaded.append(self._event_from_mapping(dict(row)))
-            else:
-                QMessageBox.warning(self, "Load Metadata", "Unsupported file format.")
-                return
+            loaded = self._read_events_from_metadata_file(file_path)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Load Metadata", str(exc))
+            return
         except Exception as exc:
             QMessageBox.critical(self, "Load Metadata", f"Failed to load metadata:\n{exc}")
             return
@@ -1704,21 +1933,16 @@ class MainWindow(QMainWindow):
         self._ui_event_overflowed = False
 
         if not loaded:
+            self._set_events_edit_context(enabled=False)
             self.status_label.setText("No events in selected metadata file")
             self._refresh_action_states()
             return
 
-        for event in loaded[: self.MAX_UI_EVENTS]:
-            self._append_event_to_ui(event)
-        if len(loaded) > self.MAX_UI_EVENTS:
-            self._ui_event_overflowed = True
-            self._set_notice(
-                "Loaded metadata exceeded UI limit. "
-                "Only first entries are shown in Detected Events."
-            )
+        self._load_events_into_ui_state(loaded)
 
         self.output_dir = file_path.parent
         context_src = self._load_scene_context_from_metadata(file_path, loaded)
+        self._set_events_edit_context(enabled=True, source="metadata_loaded")
         if context_src:
             self.status_label.setText(
                 f"Loaded metadata events: {len(loaded)} | scene restored from {context_src}"
@@ -1872,6 +2096,7 @@ class MainWindow(QMainWindow):
         has_selected_roi = self.roi_list.currentItem() is not None
         has_events = bool(self.events)
         has_selected_event = self.event_list.currentItem() is not None
+        can_manage_events = self._can_manage_events()
 
         enable_map = {
             AppCommand.SAVE_SESSION: has_video,
@@ -1918,6 +2143,10 @@ class MainWindow(QMainWindow):
         self.preview_detection_checkbox.setEnabled(preview_enabled)
         self.frame_slider.setEnabled(has_video)
         self.load_metadata_button.setEnabled(not running)
+        self.delete_event_button.setEnabled(can_manage_events and has_selected_event)
+        self.undo_event_button.setEnabled(can_manage_events and bool(self._events_undo_stack))
+        self.redo_event_button.setEnabled(can_manage_events and bool(self._events_redo_stack))
+        self.restore_events_button.setEnabled(can_manage_events and self._events_changed_from_initial())
 
         self._sync_mode_actions()
 
@@ -1927,6 +2156,14 @@ class MainWindow(QMainWindow):
         self.menu_actions[AppCommand.SET_MODE_B].setChecked(
             mode == AnalysisMode.ENTRY_EXIT_DIRECTION
         )
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if obj is self.event_list and event.type() == QEvent.KeyPress:
+            key = getattr(event, "key", lambda: None)()
+            if key in (Qt.Key_Delete, Qt.Key_Backspace):
+                self._delete_selected_event()
+                return True
+        return super().eventFilter(obj, event)
 
     def _on_mode_changed(self, _index: int) -> None:
         self._reset_preview_event_state()
@@ -1947,6 +2184,8 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _update_memory_label(self) -> None:
+        if not self._memory_monitor_enabled:
+            return
         try:
             snap = get_memory_snapshot()
             footprint_txt = (

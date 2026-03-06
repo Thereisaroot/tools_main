@@ -30,10 +30,12 @@ python -m isac_labelr
 - macOS: `scripts/setup_run_macos.sh`
 - Ubuntu: `scripts/setup_run_ubuntu.sh`
 - Windows: `scripts/setup_run_windows.ps1`
+- Windows(권장): `scripts/setup_run_windows.cmd`  (ExecutionPolicy 우회 실행)
 
 위 스크립트는 가상환경 생성, 의존성 설치, 모델 자동 다운로드 시도 후 앱 실행까지 수행한다.
 또한 파이썬 버전 fallback을 포함한다.
 - `python3.12`가 있으면 우선 사용(권장).
+- `py` 런처가 없거나 실패하면 `python/python3` 명령을 자동 탐색한다.
 - 3.13 이상이면 `rapidocr` 설치를 건너뛰고 `pytesseract` fallback OCR 사용.
 - `av` 설치 실패 시 OpenCV 디코더 fallback 사용.
 
@@ -41,6 +43,7 @@ python -m isac_labelr
 - macOS: `scripts/build_macos.sh`
 - Ubuntu: `scripts/build_ubuntu.sh`
 - Windows: `scripts/build_windows.ps1`
+- Windows(권장): `scripts/build_windows.cmd`  (ExecutionPolicy 우회 실행)
 
 각 스크립트는 PyInstaller one-folder 방식으로 `dist/isac_labelr_portable`를 생성한다.
 빌드 스크립트도 실행 스크립트와 동일하게 Python/version fallback을 적용한다.
@@ -78,7 +81,7 @@ python scripts/download_default_model.py --output models/person_detector.onnx --
 `tesseract`가 없으면 OCR 인식률이 급격히 떨어지거나 실패할 수 있다.
 - macOS: `brew install tesseract`
 - Ubuntu: `sudo apt-get install -y tesseract-ocr`
-- Windows: tesseract 설치 후 PATH 등록
+- Windows: `winget install UB-Mannheim.TesseractOCR` 후 새 터미널에서 실행
 
 ## macOS AV 경고 대응
 macOS에서 `cv2`와 `av`가 FFmpeg dylib를 중복 로드하는 경고가 날 수 있다.  
