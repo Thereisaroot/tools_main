@@ -9,7 +9,7 @@ import uuid
 
 import cv2
 from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QDesktopServices, QIntValidator
+from PySide6.QtGui import QAction, QDesktopServices, QIntValidator, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -198,6 +198,7 @@ class MainWindow(QMainWindow):
         self.preview_presence: dict[tuple[str, int], PresenceState] = {}
         self.preview_last_overlay_ts: int | None = None
         self.preview_last_overlay_video_time_ms: int | None = None
+        self.preview_last_ocr_raw_text: str = ""
         self.preview_last_ocr_frame_index: int | None = None
         self.preview_detector_infer_count = 0
         self.preview_detector_reset_interval = max(
@@ -217,6 +218,7 @@ class MainWindow(QMainWindow):
 
         self.menu_actions: dict[AppCommand, QAction] = {}
         self.command_buttons: dict[AppCommand, QPushButton] = {}
+        self._shortcuts: list[QShortcut] = []
 
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._play_tick)
@@ -226,6 +228,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menubar()
         self._bind_signals()
+        self._install_shortcuts()
         self._refresh_recent_menu()
         self.status_label.setText(f"Idle | OCR backend: {self.timestamp_ocr.backend}")
         self._set_notice(self._default_notice_text())
@@ -256,6 +259,10 @@ class MainWindow(QMainWindow):
         self.open_metadata_button.setToolTip("Open output folder containing events.jsonl / events.csv")
         self.load_metadata_button = QPushButton("Load Metadata")
         self.load_metadata_button.setToolTip("Load events from events.jsonl or events.csv")
+        self.manual_add_event_button = QPushButton("Manual Add")
+        self.manual_add_event_button.setToolTip("Add one event at current frame using OCR timestamp")
+        self.edit_event_json_button = QPushButton("Edit JSON")
+        self.edit_event_json_button.setToolTip("Edit selected event metadata as raw JSON")
         self.delete_event_button = QPushButton("X Delete")
         self.delete_event_button.setToolTip("Delete selected event")
         self.undo_event_button = QPushButton("Undo")
@@ -395,6 +402,8 @@ class MainWindow(QMainWindow):
         event_buttons_layout.setContentsMargins(0, 0, 0, 0)
         event_buttons_layout.addWidget(self.open_metadata_button)
         event_buttons_layout.addWidget(self.load_metadata_button)
+        event_buttons_layout.addWidget(self.manual_add_event_button)
+        event_buttons_layout.addWidget(self.edit_event_json_button)
         event_layout.addWidget(event_buttons)
         event_edit_buttons = QWidget()
         event_edit_buttons_layout = QHBoxLayout(event_edit_buttons)
@@ -481,6 +490,8 @@ class MainWindow(QMainWindow):
             lambda: self._dispatch_command(AppCommand.OPEN_OUTPUT_FOLDER)
         )
         self.load_metadata_button.clicked.connect(self._load_metadata_dialog)
+        self.manual_add_event_button.clicked.connect(self._add_manual_event)
+        self.edit_event_json_button.clicked.connect(self._edit_selected_event_json)
         self.delete_event_button.clicked.connect(self._delete_selected_event)
         self.undo_event_button.clicked.connect(self._undo_event_edit)
         self.redo_event_button.clicked.connect(self._redo_event_edit)
@@ -498,11 +509,43 @@ class MainWindow(QMainWindow):
         self.dx_spin.valueChanged.connect(self._on_direction_changed)
         self.dy_spin.valueChanged.connect(self._on_direction_changed)
         self.event_list.currentItemChanged.connect(self._on_event_item_current_changed)
+        self.event_list.itemDoubleClicked.connect(self._on_event_item_double_clicked)
         self.event_list.installEventFilter(self)
 
         self.canvas.roi_created.connect(self._on_canvas_roi_created)
         self.canvas.roi_selected.connect(self._on_canvas_roi_selected)
         self.canvas.timestamp_roi_created.connect(self._on_manual_timestamp_roi_created)
+
+    def _install_shortcuts(self) -> None:
+        bindings = [
+            (QKeySequence(Qt.Key_Left), self._on_shortcut_prev_frame),
+            (QKeySequence(Qt.Key_Right), self._on_shortcut_next_frame),
+            (QKeySequence(Qt.Key_Space), self._on_shortcut_toggle_preview),
+        ]
+        for sequence, handler in bindings:
+            shortcut = QShortcut(sequence, self)
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.activated.connect(handler)
+            self._shortcuts.append(shortcut)
+
+    def _is_text_input_focus(self) -> bool:
+        widget = self.focusWidget()
+        return isinstance(widget, (QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox))
+
+    def _on_shortcut_prev_frame(self) -> None:
+        if self._is_text_input_focus() or not self.prev_button.isEnabled():
+            return
+        self._seek_frame(self.current_frame_index - 1)
+
+    def _on_shortcut_next_frame(self) -> None:
+        if self._is_text_input_focus() or not self.next_button.isEnabled():
+            return
+        self._seek_frame(self.current_frame_index + 1)
+
+    def _on_shortcut_toggle_preview(self) -> None:
+        if self._is_text_input_focus() or not self.play_button.isEnabled():
+            return
+        self._toggle_play()
 
     def _dispatch_command(self, command: AppCommand) -> None:
         if command == AppCommand.OPEN_VIDEO:
@@ -799,6 +842,7 @@ class MainWindow(QMainWindow):
         self.preview_presence.clear()
         self.preview_last_overlay_ts = None
         self.preview_last_overlay_video_time_ms = None
+        self.preview_last_ocr_raw_text = ""
         self.preview_last_ocr_frame_index = None
         self.preview_ocr_use_count = 0
 
@@ -897,10 +941,11 @@ class MainWindow(QMainWindow):
             overlay_ts_ms = int(self.preview_last_overlay_ts) + delta
             overlay_status = OverlayTSStatus.INTERPOLATED_PREV
             ocr_conf = None
+            ocr_raw_text = self.preview_last_ocr_raw_text
             self.preview_last_overlay_ts = overlay_ts_ms
             self.preview_last_overlay_video_time_ms = self.current_video_time_ms
         else:
-            overlay_ts_ms, overlay_status, ocr_conf = self._resolve_overlay_timestamp_for_frame(
+            overlay_ts_ms, overlay_status, ocr_conf, ocr_raw_text = self._resolve_overlay_timestamp_for_frame(
                 frame_bgr=self.current_frame_rotated,
                 frame_index=self.current_frame_index,
                 video_time_ms=self.current_video_time_ms,
@@ -909,6 +954,8 @@ class MainWindow(QMainWindow):
             )
             self.preview_ocr_use_count += 1
             self.preview_last_ocr_frame_index = self.current_frame_index
+            if ocr_raw_text:
+                self.preview_last_ocr_raw_text = ocr_raw_text
             if overlay_status in {OverlayTSStatus.OK, OverlayTSStatus.INTERPOLATED_NEIGHBOR}:
                 self.preview_last_overlay_ts = overlay_ts_ms
                 self.preview_last_overlay_video_time_ms = self.current_video_time_ms
@@ -925,6 +972,7 @@ class MainWindow(QMainWindow):
             event.correction_ms = correction
             event.corrected_ts_ms = corrected_ts
             event.ocr_conf = ocr_conf
+            event.ocr_raw_text = ocr_raw_text
             self._on_analysis_event(event)
         if (
             self.preview_ocr_reset_interval > 0
@@ -942,7 +990,7 @@ class MainWindow(QMainWindow):
         video_time_ms: int,
         last_valid_ts: int | None,
         last_valid_video_time_ms: int | None,
-    ) -> tuple[int | None, OverlayTSStatus, float | None]:
+    ) -> tuple[int | None, OverlayTSStatus, float | None, str]:
         ocr_result = self.timestamp_ocr.extract_timestamp(frame_bgr, fast=True)
         if self.video_path is not None:
             self.timestamp_ocr.cache_video_frame_result(
@@ -967,10 +1015,20 @@ class MainWindow(QMainWindow):
                 expected_ts = int(last_valid_ts)
                 tolerance = 1500
 
-        if expected_ts is not None and candidates:
+        if candidates:
+            if expected_ts is None:
+                return int(candidates[0]), OverlayTSStatus.OK, ocr_result.confidence, ocr_result.raw_text
             best = min(candidates, key=lambda ts: abs(int(ts) - int(expected_ts)))
             if abs(int(best) - int(expected_ts)) <= tolerance:
-                return int(best), OverlayTSStatus.OK, ocr_result.confidence
+                picked = int(best)
+                if picked > int(expected_ts):
+                    return (
+                        int(expected_ts),
+                        OverlayTSStatus.INTERPOLATED_PREV,
+                        ocr_result.confidence,
+                        ocr_result.raw_text,
+                    )
+                return picked, OverlayTSStatus.OK, ocr_result.confidence, ocr_result.raw_text
 
         if self.video_path is not None:
             neighbor_ts, neighbor_conf = self.timestamp_ocr.interpolate_timestamp_from_neighbors(
@@ -983,22 +1041,31 @@ class MainWindow(QMainWindow):
                 if expected_ts is None:
                     picked = int(neighbor_ts)
                     conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
-                    return picked, OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf
+                    return picked, OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf, ocr_result.raw_text
                 if self._is_plausible_preview_timestamp(
                     neighbor_ts,
                     video_time_ms,
                     last_valid_ts,
                     last_valid_video_time_ms,
                 ):
+                    picked = int(neighbor_ts)
+                    if picked > int(expected_ts):
+                        conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
+                        return int(expected_ts), OverlayTSStatus.INTERPOLATED_PREV, conf, ocr_result.raw_text
                     conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
-                    return int(neighbor_ts), OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf
+                    return picked, OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf, ocr_result.raw_text
 
         if last_valid_ts is not None and self.timestamp_ocr.is_valid_timestamp(last_valid_ts):
             if last_valid_video_time_ms is not None:
                 delta = max(0, int(video_time_ms) - int(last_valid_video_time_ms))
-                return int(last_valid_ts) + delta, OverlayTSStatus.INTERPOLATED_PREV, ocr_result.confidence
-            return last_valid_ts, OverlayTSStatus.INTERPOLATED_PREV, ocr_result.confidence
-        return None, OverlayTSStatus.FAILED, ocr_result.confidence
+                return (
+                    int(last_valid_ts) + delta,
+                    OverlayTSStatus.INTERPOLATED_PREV,
+                    ocr_result.confidence,
+                    ocr_result.raw_text,
+                )
+            return last_valid_ts, OverlayTSStatus.INTERPOLATED_PREV, ocr_result.confidence, ocr_result.raw_text
+        return None, OverlayTSStatus.FAILED, ocr_result.confidence, ocr_result.raw_text
 
     @staticmethod
     def _is_plausible_preview_timestamp(
@@ -1235,6 +1302,8 @@ class MainWindow(QMainWindow):
         ts_display = str(result.timestamp_ms) if result.timestamp_ms is not None else "-"
         conf_display = f"{result.confidence:.3f}" if result.confidence is not None else "-"
         valid_display = str(self.timestamp_ocr.is_valid_timestamp(result.timestamp_ms))
+        candidates = self.timestamp_ocr.extract_timestamp_candidates(result.raw_text)
+        candidates_display = ", ".join(str(v) for v in candidates[:5]) if candidates else "-"
         roi_display = (
             f"{result.roi.roi_id} ({result.roi.x},{result.roi.y},{result.roi.w},{result.roi.h})"
             if result.roi is not None
@@ -1256,6 +1325,7 @@ class MainWindow(QMainWindow):
                     f"confidence: {conf_display}",
                     f"roi: {roi_display}",
                     f"raw_text: {result.raw_text!r}",
+                    f"top_candidates: {candidates_display}",
                 ]
             ),
         )
@@ -1445,22 +1515,52 @@ class MainWindow(QMainWindow):
             f"all={event.visible_person_count} roi={event.roi_person_count}"
         )
 
-    def _activate_event_item(self, item: QListWidgetItem) -> None:
+    def _event_from_list_item(self, item: QListWidgetItem | None) -> tuple[int, EventRecord] | None:
+        if item is None:
+            return None
         idx = item.data(Qt.UserRole)
         if idx is None:
-            return
+            return None
         try:
             index = int(idx)
         except Exception:
-            return
+            return None
         if index < 0 or index >= len(self.events):
+            return None
+        return index, self.events[index]
+
+    def _activate_event_item(self, item: QListWidgetItem) -> None:
+        resolved = self._event_from_list_item(item)
+        if resolved is None:
             return
-        event = self.events[index]
+        _index, event = resolved
         self._seek_frame(event.frame_index)
         self._refresh_action_states()
 
     def _on_event_item_clicked(self, item: QListWidgetItem) -> None:
         self._activate_event_item(item)
+
+    def _on_event_item_double_clicked(self, item: QListWidgetItem) -> None:
+        self._activate_event_item(item)
+        resolved = self._event_from_list_item(item)
+        if resolved is None:
+            return
+        _index, event = resolved
+        raw_text = event.ocr_raw_text.strip() if event.ocr_raw_text is not None else ""
+        if not raw_text:
+            raw_text = "(empty)"
+        QMessageBox.information(
+            self,
+            "Event OCR Raw Text",
+            "\n".join(
+                [
+                    f"event_id: {event.event_id}",
+                    f"frame_index: {event.frame_index}",
+                    f"overlay_ts_status: {event.overlay_ts_status.value}",
+                    f"raw_text: {raw_text}",
+                ]
+            ),
+        )
 
     def _on_event_item_current_changed(
         self,
@@ -1544,6 +1644,128 @@ class MainWindow(QMainWindow):
     ) -> None:
         self.events = [self._event_from_mapping(dict(row)) for row in snapshot]
         self._rebuild_event_list(preferred_event_id=preferred_event_id, preferred_index=preferred_index)
+
+    def _latest_valid_overlay_anchor(self) -> tuple[int | None, int | None]:
+        for event in reversed(self.events):
+            if event.overlay_ts_ms is None:
+                continue
+            if not self.timestamp_ocr.is_valid_timestamp(event.overlay_ts_ms):
+                continue
+            return int(event.overlay_ts_ms), int(event.video_time_ms)
+        if self.preview_last_overlay_ts is not None and self.preview_last_overlay_video_time_ms is not None:
+            if self.timestamp_ocr.is_valid_timestamp(self.preview_last_overlay_ts):
+                return int(self.preview_last_overlay_ts), int(self.preview_last_overlay_video_time_ms)
+        return None, None
+
+    def _add_manual_event(self) -> None:
+        if self.video_path is None or self.current_frame_rotated is None:
+            QMessageBox.information(self, "Manual Add", "Open a video first.")
+            return
+        if self.analysis_worker is not None:
+            QMessageBox.information(self, "Manual Add", "Stop analysis before manual add.")
+            return
+
+        last_ts, last_video_ms = self._latest_valid_overlay_anchor()
+        overlay, status, ocr_conf, ocr_raw_text = self._resolve_overlay_timestamp_for_frame(
+            frame_bgr=self.current_frame_rotated,
+            frame_index=self.current_frame_index,
+            video_time_ms=self.current_video_time_ms,
+            last_valid_ts=last_ts,
+            last_valid_video_time_ms=last_video_ms,
+        )
+        correction = int(self.correction_edit.text() or 0)
+        corrected = overlay + correction if overlay is not None else None
+        manual_event = EventRecord(
+            event_id=str(uuid.uuid4()),
+            video_name=Path(self.video_path).name,
+            roi_id="1",
+            person_id=0,
+            event_type="enter",
+            direction_label=None,
+            frame_index=int(self.current_frame_index),
+            video_time_ms=int(self.current_video_time_ms),
+            overlay_ts_ms=overlay,
+            overlay_ts_status=status,
+            correction_ms=correction,
+            corrected_ts_ms=corrected,
+            det_conf=0.0,
+            ocr_conf=ocr_conf,
+            ocr_raw_text=ocr_raw_text,
+            visible_person_count=0,
+            roi_person_count=0,
+            rotation_deg=int(self.rotation_deg) % 360,
+            roi_x=0,
+            roi_y=0,
+            roi_w=0,
+            roi_h=0,
+        )
+        self._append_event_to_ui(manual_event)
+        if self.video_path is not None and self.output_dir is None:
+            self.output_dir = MetadataWriter.default_output_dir(self.video_path)
+        if self.output_dir is not None:
+            self._write_metadata(self.output_dir)
+        self.status_label.setText("Manual event added with OCR timestamp")
+        self._refresh_action_states()
+
+    def _edit_selected_event_json(self) -> None:
+        item = self.event_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "Edit JSON", "Select an event first.")
+            return
+        if self.analysis_worker is not None:
+            QMessageBox.information(self, "Edit JSON", "Stop analysis before editing metadata.")
+            return
+        idx_raw = item.data(Qt.UserRole)
+        if idx_raw is None:
+            return
+        try:
+            index = int(idx_raw)
+        except Exception:
+            return
+        if index < 0 or index >= len(self.events):
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Event JSON")
+        dialog.resize(780, 520)
+        layout = QVBoxLayout(dialog)
+        editor = QTextEdit()
+        editor.setPlainText(json.dumps(self.events[index].to_dict(), ensure_ascii=False, indent=2))
+        layout.addWidget(editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def on_accept() -> None:
+            raw = editor.toPlainText().strip()
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                QMessageBox.warning(
+                    dialog,
+                    "Invalid JSON",
+                    "JSON 양식이 올바르지 않습니다. JSON 문법을 맞춰주세요.",
+                )
+                return
+            if not isinstance(parsed, dict):
+                QMessageBox.warning(
+                    dialog,
+                    "Invalid JSON",
+                    "이벤트 JSON은 객체(object) 형태여야 합니다.",
+                )
+                return
+            updated = self._event_from_mapping(parsed)
+            if self._can_manage_events():
+                self._push_undo_snapshot()
+            self.events[index] = updated
+            self._rebuild_event_list(preferred_index=index)
+            if self.output_dir is not None:
+                self._write_metadata(self.output_dir)
+            self._refresh_action_states()
+            dialog.accept()
+
+        buttons.accepted.connect(on_accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec()
 
     def _read_events_from_metadata_file(self, file_path: Path) -> list[EventRecord]:
         loaded: list[EventRecord] = []
@@ -1694,7 +1916,7 @@ class MainWindow(QMainWindow):
             return
 
         rotated = rotate_bgr(frame, self.rotation_deg)
-        overlay, status, ocr_conf = self._resolve_overlay_timestamp_for_frame(
+        overlay, status, ocr_conf, ocr_raw_text = self._resolve_overlay_timestamp_for_frame(
             frame_bgr=rotated,
             frame_index=event.frame_index,
             video_time_ms=event.video_time_ms,
@@ -1710,6 +1932,7 @@ class MainWindow(QMainWindow):
         event.correction_ms = correction
         event.corrected_ts_ms = corrected
         event.ocr_conf = ocr_conf
+        event.ocr_raw_text = ocr_raw_text
         item.setText(self._event_text(event))
 
         if self.output_dir is not None:
@@ -1791,6 +2014,11 @@ class MainWindow(QMainWindow):
             direction = str(direction).strip()
             if direction in {"", "-", "none", "null", "None", "Null"}:
                 direction = None
+        ocr_raw_text = row.get("ocr_raw_text")
+        if ocr_raw_text is None:
+            ocr_raw_text = ""
+        else:
+            ocr_raw_text = str(ocr_raw_text)
 
         return EventRecord(
             event_id=str(row.get("event_id") or str(uuid.uuid4())),
@@ -1807,6 +2035,7 @@ class MainWindow(QMainWindow):
             corrected_ts_ms=self._to_int_opt(row.get("corrected_ts_ms")),
             det_conf=self._to_float(row.get("det_conf"), 0.0),
             ocr_conf=self._to_float_opt(row.get("ocr_conf")),
+            ocr_raw_text=ocr_raw_text,
             visible_person_count=self._to_int(row.get("visible_person_count"), 0),
             roi_person_count=self._to_int(row.get("roi_person_count"), 0),
             rotation_deg=self._to_int(row.get("rotation_deg"), 0) % 360,
@@ -2143,6 +2372,8 @@ class MainWindow(QMainWindow):
         self.preview_detection_checkbox.setEnabled(preview_enabled)
         self.frame_slider.setEnabled(has_video)
         self.load_metadata_button.setEnabled(not running)
+        self.manual_add_event_button.setEnabled(has_video and not running)
+        self.edit_event_json_button.setEnabled(has_selected_event and not running)
         self.delete_event_button.setEnabled(can_manage_events and has_selected_event)
         self.undo_event_button.setEnabled(can_manage_events and bool(self._events_undo_stack))
         self.redo_event_button.setEnabled(can_manage_events and bool(self._events_redo_stack))

@@ -23,6 +23,7 @@ CSV_FIELDS = [
     "corrected_ts_ms",
     "det_conf",
     "ocr_conf",
+    "ocr_raw_text",
     "visible_person_count",
     "roi_person_count",
     "rotation_deg",

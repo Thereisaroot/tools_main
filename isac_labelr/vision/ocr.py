@@ -357,36 +357,72 @@ class TimestampOCR:
 
     @staticmethod
     def extract_timestamp_candidates(text: str) -> list[int]:
-        ordered: list[int] = []
-        seen: set[int] = set()
+        source_quality: dict[int, int] = {}
+
+        def add_candidate(token: str, *, quality: int) -> None:
+            try:
+                val = int(token)
+            except ValueError:
+                return
+            prev = source_quality.get(val, -1)
+            if quality > prev:
+                source_quality[val] = quality
 
         # 1) direct contiguous 13-digit chunks from OCR text
         for match in TS_REGEX.finditer(text):
             token = match.group(1)
-            try:
-                val = int(token)
-            except ValueError:
-                continue
-            if val in seen:
-                continue
-            seen.add(val)
-            ordered.append(val)
+            add_candidate(token, quality=3)
 
-        # 2) OCR가 숫자를 띄워서 반환하는 경우를 복원
+        # 1.5) repair duplicated adjacent digit chunks inside a single OCR block
+        # Example: "177252627575383" -> remove duplicated "75" -> "1772526275383"
+        def _add_dedup_candidates(block: str) -> None:
+            if len(block) <= 13:
+                return
+            max_chunk = min(4, len(block) // 2)
+            for chunk_len in range(1, max_chunk + 1):
+                end = len(block) - (2 * chunk_len) + 1
+                for i in range(0, max(0, end)):
+                    left = block[i : i + chunk_len]
+                    right = block[i + chunk_len : i + (2 * chunk_len)]
+                    if left != right:
+                        continue
+                    repaired = block[: i + chunk_len] + block[i + (2 * chunk_len) :]
+                    if len(repaired) < 13:
+                        continue
+                    if len(repaired) == 13:
+                        add_candidate(repaired, quality=4)
+                        continue
+                    for j in range(0, len(repaired) - 12):
+                        add_candidate(repaired[j : j + 13], quality=4)
+
+        for blk in re.findall(r"\d+", text):
+            _add_dedup_candidates(blk)
+
+        # 2) merge split digit blocks with suffix/prefix overlap
+        # Example: "1772526275 75383" -> overlap "75" -> "1772526275383"
+        digit_blocks = [blk for blk in re.findall(r"\d+", text) if blk]
+        if len(digit_blocks) >= 2:
+            merged = digit_blocks[0]
+            for blk in digit_blocks[1:]:
+                max_ov = min(4, len(merged), len(blk))
+                ov = 0
+                for k in range(max_ov, 0, -1):
+                    if merged[-k:] == blk[:k]:
+                        ov = k
+                        break
+                merged += blk[ov:]
+            if len(merged) >= 13:
+                for i in range(0, len(merged) - 12):
+                    add_candidate(merged[i : i + 13], quality=2)
+
+        # 3) OCR가 숫자를 띄워서 반환하는 경우를 복원 (fallback)
         digits = "".join(ch for ch in text if ch.isdigit())
         if len(digits) >= 13:
             for i in range(0, len(digits) - 12):
                 token = digits[i : i + 13]
-                try:
-                    val = int(token)
-                except ValueError:
-                    continue
-                if val in seen:
-                    continue
-                seen.add(val)
-                ordered.append(val)
+                add_candidate(token, quality=1)
 
-        if not ordered:
+        if not source_quality:
             return []
 
         # Prefer realistic unix-ms range and expected prefix.
@@ -394,9 +430,18 @@ class TimestampOCR:
             txt = str(v)
             in_range = EPOCH_MIN_MS <= v <= EPOCH_MAX_MS
             has_prefix = len(txt) == EXPECTED_TS_DIGITS and txt.startswith(EXPECTED_TS_PREFIX)
-            return (int(in_range), int(has_prefix))
+            non_repetitive = (
+                len(txt) == EXPECTED_TS_DIGITS
+                and not TimestampOCR._looks_repetitive_timestamp_text(txt)
+            )
+            return (
+                int(in_range),
+                int(has_prefix),
+                int(non_repetitive),
+                int(source_quality.get(v, 0)),
+            )
 
-        ordered.sort(key=score, reverse=True)
+        ordered = sorted(source_quality.keys(), key=score, reverse=True)
         return ordered
 
     def _ocr_once(self, image_gray: np.ndarray, *, fast: bool = False) -> tuple[str, float]:
@@ -488,11 +533,23 @@ class TimestampOCR:
         return "", 0.0
 
     @staticmethod
+    def _looks_repetitive_timestamp_text(text: str) -> bool:
+        tail = text[len(EXPECTED_TS_PREFIX) :]
+        if re.search(r"(\d)\1{4,}", tail):
+            return True
+        pair_tokens = [tail[i : i + 2] for i in range(0, len(tail) - 1, 2)]
+        if len(pair_tokens) >= 4 and len(set(pair_tokens)) <= 2:
+            return True
+        return False
+
+    @staticmethod
     def is_valid_timestamp(timestamp_ms: int | None) -> bool:
         if timestamp_ms is None:
             return False
         txt = str(int(timestamp_ms))
-        return len(txt) == EXPECTED_TS_DIGITS and txt.startswith(EXPECTED_TS_PREFIX)
+        if len(txt) != EXPECTED_TS_DIGITS or not txt.startswith(EXPECTED_TS_PREFIX):
+            return False
+        return not TimestampOCR._looks_repetitive_timestamp_text(txt)
 
     def _get_neighbor_cap(self, video_path: str) -> cv2.VideoCapture | None:
         norm_path = str(video_path)

@@ -225,8 +225,10 @@ class VideoStream:
                     break
 
                 pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
-                frame_no = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                time_ms = int(pos_msec) if pos_msec > 0 else int((frame_no / fps) * 1000)
+                frame_no_next = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                # OpenCV reports "next frame index" after read; convert to actual decoded frame index.
+                frame_index = max(0, frame_no_next - 1)
+                time_ms = int(pos_msec) if pos_msec > 0 else int((frame_index / fps) * 1000)
 
                 if time_ms < start_ms:
                     continue
@@ -234,12 +236,11 @@ class VideoStream:
                     break
 
                 rotated = rotate_bgr(image, rotation_deg)
-                frame_index = int((time_ms / 1000.0) * fps)
                 yield FramePacket(frame_index=frame_index, time_ms=time_ms, image_bgr=rotated)
 
                 if on_chunk and (time_ms - last_chunk_tick) >= chunk_ms:
                     # Periodically refresh VideoCapture to avoid long-run decoder memory growth.
-                    next_frame_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (frame_no + 1))
+                    next_frame_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or (frame_index + 1))
                     chunk_idx += 1
                     last_chunk_tick = time_ms
                     on_chunk(chunk_idx, time_ms)

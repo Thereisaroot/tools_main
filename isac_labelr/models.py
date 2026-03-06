@@ -95,6 +95,7 @@ class EventRecord:
     corrected_ts_ms: int | None
     det_conf: float
     ocr_conf: float | None
+    ocr_raw_text: str
     visible_person_count: int
     roi_person_count: int
     rotation_deg: int = 0
