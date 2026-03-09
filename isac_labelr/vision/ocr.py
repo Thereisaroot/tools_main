@@ -58,7 +58,7 @@ class TimestampOCR:
         self._neighbor_cap_path: str | None = None
         self._neighbor_cap: cv2.VideoCapture | None = None
         self._neighbor_next_index: int | None = None
-        self._frame_ocr_cache: OrderedDict[tuple[str, int, int], OCRResult] = OrderedDict()
+        self._frame_ocr_cache: OrderedDict[tuple[str, int, int, bool], OCRResult] = OrderedDict()
         self._frame_ocr_cache_max = 2048
         self._single_rotation_ocr = str(
             os.getenv("ISAC_OCR_SINGLE_ROTATION", "1")
@@ -136,14 +136,14 @@ class TimestampOCR:
     def clear_auto_roi(self) -> None:
         self._auto_roi = None
 
-    def _cache_get(self, key: tuple[str, int, int]) -> OCRResult | None:
+    def _cache_get(self, key: tuple[str, int, int, bool]) -> OCRResult | None:
         value = self._frame_ocr_cache.get(key)
         if value is None:
             return None
         self._frame_ocr_cache.move_to_end(key)
         return value
 
-    def _cache_put(self, key: tuple[str, int, int], value: OCRResult) -> None:
+    def _cache_put(self, key: tuple[str, int, int, bool], value: OCRResult) -> None:
         self._frame_ocr_cache[key] = value
         self._frame_ocr_cache.move_to_end(key)
         while len(self._frame_ocr_cache) > self._frame_ocr_cache_max:
@@ -155,9 +155,10 @@ class TimestampOCR:
         video_path: str,
         frame_index: int,
         rotation_deg: int,
+        fast: bool = True,
         result: OCRResult,
     ) -> None:
-        key = (str(video_path), int(frame_index), int(rotation_deg) % 360)
+        key = (str(video_path), int(frame_index), int(rotation_deg) % 360, bool(fast))
         self._cache_put(key, result)
 
     def detect_auto_roi(self, frame_bgr: np.ndarray) -> ROI | None:
@@ -622,7 +623,7 @@ class TimestampOCR:
         rotation_deg: int,
         fast: bool,
     ) -> OCRResult:
-        key = (str(video_path), int(frame_index), int(rotation_deg) % 360)
+        key = (str(video_path), int(frame_index), int(rotation_deg) % 360, bool(fast))
         cached = self._cache_get(key)
         if cached is not None:
             return cached

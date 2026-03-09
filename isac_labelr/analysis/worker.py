@@ -57,11 +57,15 @@ class AnalysisWorker(QObject):
                 on_event=self._handle_event,
                 logger=logger,
             )
+            # Persist buffered events even when analysis was stopped.
+            # Do not propagate stop_event into save path, otherwise write loops
+            # can short-circuit and overwrite metadata with partial/empty payloads.
+            resolve_missing_timestamps = not bool(result.aborted)
             store.save_all(
                 events=self._events_buffer,
                 session=session.to_dict(),
-                resolve_missing_timestamps=False,
-                stop_event=self._stop_event,
+                resolve_missing_timestamps=resolve_missing_timestamps,
+                stop_event=None,
             )
             result.output_dir = store.primary_path.parent
             self.finished.emit(result)

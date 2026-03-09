@@ -315,6 +315,20 @@ def _make_label_windows(
 
     merged = _merge_intervals([(w.start_frame, w.end_frame) for w in roi_windows])
     zero_windows: list[_LabelWindow] = list(manual_zero_windows)
+    # Leading gap: before the first ROI-labeled window, treat as label_id=0.
+    if merged:
+        lead_start = 0
+        lead_end = int(merged[0][0]) - 1
+        if lead_start <= lead_end:
+            zero_windows.append(
+                _LabelWindow(
+                    label_id=0,
+                    start_frame=lead_start,
+                    end_frame=lead_end,
+                    start_ts_hint=None,
+                    end_ts_hint=None,
+                )
+            )
     for idx in range(len(merged) - 1):
         current_end = int(merged[idx][1])
         next_start = int(merged[idx + 1][0])
@@ -326,6 +340,20 @@ def _make_label_windows(
                     label_id=0,
                     start_frame=gap_start,
                     end_frame=gap_end,
+                    start_ts_hint=None,
+                    end_ts_hint=None,
+                )
+            )
+    # Tail gap: after the last ROI-labeled window, the rest is label_id=0.
+    if merged and max_frame_index is not None:
+        tail_start = int(merged[-1][1]) + 1
+        tail_end = int(max_frame_index)
+        if tail_start <= tail_end:
+            zero_windows.append(
+                _LabelWindow(
+                    label_id=0,
+                    start_frame=tail_start,
+                    end_frame=tail_end,
                     start_ts_hint=None,
                     end_ts_hint=None,
                 )

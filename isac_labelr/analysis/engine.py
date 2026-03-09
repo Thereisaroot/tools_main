@@ -669,21 +669,25 @@ class AnalysisEngine:
         logger: logging.Logger,
         allow_interpolation: bool = True,
     ) -> tuple[int | None, OverlayTSStatus, float | None, str]:
-        if frame_bgr is None:
-            ocr_result = ocr._extract_timestamp_for_video_frame(
-                video_path=video_path,
-                frame_index=frame_index,
-                rotation_deg=rotation_deg,
-                fast=True,
-            )
-        else:
-            ocr_result = ocr.extract_timestamp(frame_bgr, fast=True)
+        def run_ocr_once(fast_mode: bool):
+            if frame_bgr is None:
+                return ocr._extract_timestamp_for_video_frame(
+                    video_path=video_path,
+                    frame_index=frame_index,
+                    rotation_deg=rotation_deg,
+                    fast=fast_mode,
+                )
+            result = ocr.extract_timestamp(frame_bgr, fast=fast_mode)
             ocr.cache_video_frame_result(
                 video_path=video_path,
                 frame_index=frame_index,
                 rotation_deg=rotation_deg,
-                result=ocr_result,
+                fast=fast_mode,
+                result=result,
             )
+            return result
+
+        ocr_result = run_ocr_once(True)
         expected_ts, _tolerance = self._expected_overlay_ts(video_time_ms)
         candidates = [
             ts
@@ -702,6 +706,31 @@ class AnalysisEngine:
             self._last_overlay_ts = picked
             self._last_overlay_video_time_ms = video_time_ms
             return picked, OverlayTSStatus.OK, ocr_result.confidence, ocr_result.raw_text
+
+        # Fast OCR miss: retry once with richer preprocessing to reduce empty raw_text events.
+        ocr_result_slow = run_ocr_once(False)
+        slow_candidates = [
+            ts
+            for ts in ocr.extract_timestamp_candidates(ocr_result_slow.raw_text)
+            if ocr.is_valid_timestamp(ts)
+        ]
+        slow_primary = (
+            int(ocr_result_slow.timestamp_ms)
+            if ocr.is_valid_timestamp(ocr_result_slow.timestamp_ms)
+            else None
+        )
+        if slow_primary is not None:
+            picked = int(slow_primary)
+            self._last_overlay_ts = picked
+            self._last_overlay_video_time_ms = video_time_ms
+            return picked, OverlayTSStatus.OK, ocr_result_slow.confidence, ocr_result_slow.raw_text
+        if slow_candidates:
+            picked = int(slow_candidates[0])
+            self._last_overlay_ts = picked
+            self._last_overlay_video_time_ms = video_time_ms
+            return picked, OverlayTSStatus.OK, ocr_result_slow.confidence, ocr_result_slow.raw_text
+        if (not ocr_result.raw_text) and ocr_result_slow.raw_text:
+            ocr_result = ocr_result_slow
 
         if allow_interpolation and self._allow_neighbor_interp:
             neighbor_ts, neighbor_conf = ocr.interpolate_timestamp_from_neighbors(

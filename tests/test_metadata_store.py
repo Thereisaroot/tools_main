@@ -63,10 +63,12 @@ def test_build_labels_creates_non_overlapping_zero_gap() -> None:
 
     rows = [row.to_dict() for row in labels]
     # ROI windows are kept per event (+100 inclusive), gap is computed from merged ROI union.
-    assert rows[0]["label_id"] == 1 and rows[0]["start_frame"] == 10 and rows[0]["end_frame"] == 110
-    assert rows[1]["label_id"] == 1 and rows[1]["start_frame"] == 50 and rows[1]["end_frame"] == 150
-    assert rows[2]["label_id"] == 0 and rows[2]["start_frame"] == 151 and rows[2]["end_frame"] == 199
-    assert rows[3]["label_id"] == 2 and rows[3]["start_frame"] == 200 and rows[3]["end_frame"] == 300
+    assert rows[0]["label_id"] == 0 and rows[0]["start_frame"] == 0 and rows[0]["end_frame"] == 9
+    assert rows[1]["label_id"] == 1 and rows[1]["start_frame"] == 10 and rows[1]["end_frame"] == 110
+    assert rows[2]["label_id"] == 1 and rows[2]["start_frame"] == 50 and rows[2]["end_frame"] == 150
+    assert rows[3]["label_id"] == 0 and rows[3]["start_frame"] == 151 and rows[3]["end_frame"] == 199
+    assert rows[4]["label_id"] == 2 and rows[4]["start_frame"] == 200 and rows[4]["end_frame"] == 300
+    assert rows[5]["label_id"] == 0 and rows[5]["start_frame"] == 301 and rows[5]["end_frame"] == 999
 
 
 def test_parse_label_id_mapping() -> None:
@@ -112,7 +114,7 @@ def test_store_save_all_writes_primary_and_debug(monkeypatch, tmp_path: Path) ->
 
     assert primary_payload["video_path"] == str(video_path)
     assert isinstance(primary_payload["labels"], list)
-    assert len(primary_payload["labels"]) == 3  # 2 ROI windows + 1 zero-gap window
+    assert len(primary_payload["labels"]) == 5  # 2 ROI windows + leading/mid/tail zero windows
     assert "index" not in primary_payload["labels"][0]
 
     assert debug_payload["video_path"] == str(video_path)

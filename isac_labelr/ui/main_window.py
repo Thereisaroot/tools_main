@@ -14,6 +14,7 @@ import cv2
 from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QIntValidator, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QProgressDialog,
     QSpinBox,
     QDoubleSpinBox,
     QSplitter,
@@ -43,7 +45,7 @@ from PySide6.QtWidgets import (
 from isac_labelr.analysis.engine import AnalysisEngine, PresenceState
 from isac_labelr.analysis.worker import AnalysisWorker
 from isac_labelr.commands import AppCommand, MenuActionSpec, build_menu_action_map
-from isac_labelr.io.metadata_writer import MetadataStore
+from isac_labelr.io.metadata_writer import FrameTimestampResolver, MetadataStore, build_label_records
 from isac_labelr.io.video_stream import rotate_bgr
 from isac_labelr.models import (
     AnalysisMode,
@@ -284,6 +286,14 @@ class MainWindow(QMainWindow):
         self.manual_add_event_button.setToolTip("Add one event at current frame using OCR timestamp")
         self.edit_event_json_button = QPushButton("Edit JSON")
         self.edit_event_json_button.setToolTip("Edit selected event metadata as raw JSON")
+        self.fix_timestamp_button = QPushButton("Fix Timestamp")
+        self.fix_timestamp_button.setToolTip(
+            "Fix selected event start/end frame and recompute start/end timestamps via OCR"
+        )
+        self.recalc_label0_button = QPushButton("Recalc Label 0")
+        self.recalc_label0_button.setToolTip(
+            "Recalculate label_id=0 windows and re-run OCR for start/end timestamps"
+        )
         self.delete_event_button = QPushButton("X Delete")
         self.delete_event_button.setToolTip("Delete selected event")
         self.undo_event_button = QPushButton("Undo")
@@ -437,6 +447,8 @@ class MainWindow(QMainWindow):
         event_buttons_layout.addWidget(self.load_metadata_button)
         event_buttons_layout.addWidget(self.manual_add_event_button)
         event_buttons_layout.addWidget(self.edit_event_json_button)
+        event_buttons_layout.addWidget(self.fix_timestamp_button)
+        event_buttons_layout.addWidget(self.recalc_label0_button)
         event_layout.addWidget(event_buttons)
         event_edit_buttons = QWidget()
         event_edit_buttons_layout = QHBoxLayout(event_edit_buttons)
@@ -527,6 +539,8 @@ class MainWindow(QMainWindow):
         self.load_metadata_button.clicked.connect(self._load_metadata_dialog)
         self.manual_add_event_button.clicked.connect(self._add_manual_event)
         self.edit_event_json_button.clicked.connect(self._edit_selected_event_json)
+        self.fix_timestamp_button.clicked.connect(self._fix_selected_event_timestamp)
+        self.recalc_label0_button.clicked.connect(self._recalculate_label_zero_manual)
         self.delete_event_button.clicked.connect(self._delete_selected_event)
         self.undo_event_button.clicked.connect(self._undo_event_edit)
         self.redo_event_button.clicked.connect(self._redo_event_edit)
@@ -1146,24 +1160,30 @@ class MainWindow(QMainWindow):
         last_valid_video_time_ms: int | None,
         allow_interpolation: bool = True,
     ) -> tuple[int | None, OverlayTSStatus, float | None, str]:
-        if frame_bgr is None:
-            if self.video_path is None:
-                return None, OverlayTSStatus.FAILED, None, ""
-            ocr_result = self.timestamp_ocr._extract_timestamp_for_video_frame(
-                video_path=self.video_path,
-                frame_index=frame_index,
-                rotation_deg=self.rotation_deg,
-                fast=True,
-            )
-        else:
-            ocr_result = self.timestamp_ocr.extract_timestamp(frame_bgr, fast=True)
+        def run_ocr_once(fast_mode: bool):
+            if frame_bgr is None:
+                if self.video_path is None:
+                    return None
+                return self.timestamp_ocr._extract_timestamp_for_video_frame(
+                    video_path=self.video_path,
+                    frame_index=frame_index,
+                    rotation_deg=self.rotation_deg,
+                    fast=fast_mode,
+                )
+            result = self.timestamp_ocr.extract_timestamp(frame_bgr, fast=fast_mode)
             if self.video_path is not None:
                 self.timestamp_ocr.cache_video_frame_result(
                     video_path=self.video_path,
                     frame_index=frame_index,
                     rotation_deg=self.rotation_deg,
-                    result=ocr_result,
+                    fast=fast_mode,
+                    result=result,
                 )
+            return result
+
+        ocr_result = run_ocr_once(True)
+        if ocr_result is None:
+            return None, OverlayTSStatus.FAILED, None, ""
         candidates = [
             ts
             for ts in self.timestamp_ocr.extract_timestamp_candidates(ocr_result.raw_text)
@@ -1190,6 +1210,36 @@ class MainWindow(QMainWindow):
 
         if candidates:
             return int(candidates[0]), OverlayTSStatus.OK, ocr_result.confidence, ocr_result.raw_text
+
+        # Fast OCR miss: one slow retry for better raw_text capture.
+        ocr_result_slow = run_ocr_once(False)
+        if ocr_result_slow is not None:
+            slow_candidates = [
+                ts
+                for ts in self.timestamp_ocr.extract_timestamp_candidates(ocr_result_slow.raw_text)
+                if self.timestamp_ocr.is_valid_timestamp(ts)
+            ]
+            slow_primary = (
+                int(ocr_result_slow.timestamp_ms)
+                if self.timestamp_ocr.is_valid_timestamp(ocr_result_slow.timestamp_ms)
+                else None
+            )
+            if slow_primary is not None:
+                return (
+                    int(slow_primary),
+                    OverlayTSStatus.OK,
+                    ocr_result_slow.confidence,
+                    ocr_result_slow.raw_text,
+                )
+            if slow_candidates:
+                return (
+                    int(slow_candidates[0]),
+                    OverlayTSStatus.OK,
+                    ocr_result_slow.confidence,
+                    ocr_result_slow.raw_text,
+                )
+            if (not ocr_result.raw_text) and ocr_result_slow.raw_text:
+                ocr_result = ocr_result_slow
 
         if allow_interpolation and self._allow_neighbor_interp and self.video_path is not None:
             neighbor_ts, neighbor_conf = self.timestamp_ocr.interpolate_timestamp_from_neighbors(
@@ -1645,6 +1695,15 @@ class MainWindow(QMainWindow):
             self.log_path = Path(self.video_path).with_name(f"{Path(self.video_path).stem}_run_log.txt")
 
         self._reload_events_from_metadata_for_edit_context()
+        added_zero = self._merge_zero_labels_from_primary_into_events(
+            persist=True,
+            show_popup=True,
+            popup_title="Label 0 Post-Process",
+        )
+        if added_zero > 0:
+            self._set_notice(
+                f"Analysis finished: added {added_zero} label_id=0 segments after final OCR pass."
+            )
         self._set_events_edit_context(enabled=True, source="analysis_finished")
         self._refresh_action_states()
 
@@ -2121,6 +2180,141 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         dialog.exec()
 
+    def _fix_selected_event_timestamp(self) -> None:
+        if self.analysis_worker is not None:
+            QMessageBox.information(self, "Fix Timestamp", "Stop analysis before fixing timestamps.")
+            return
+        if self.video_path is None:
+            QMessageBox.information(self, "Fix Timestamp", "Open the target video first.")
+            return
+
+        item = self.event_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "Fix Timestamp", "Select an event first.")
+            return
+        idx_raw = item.data(Qt.UserRole)
+        if idx_raw is None:
+            return
+        try:
+            index = int(idx_raw)
+        except Exception:
+            return
+        if index < 0 or index >= len(self.events):
+            return
+
+        event = self.events[index]
+        start_default = int(event.frame_index)
+        end_default = int(self._event_end_frame(event))
+        max_frame = self.total_frames - 1 if self.total_frames > 0 else 2_000_000_000
+        start_default = max(0, min(start_default, max_frame))
+        end_default = max(start_default, min(end_default, max_frame))
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Fix Timestamp")
+        dialog.resize(420, 160)
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        start_spin = QSpinBox()
+        start_spin.setRange(0, max_frame)
+        start_spin.setValue(start_default)
+
+        end_spin = QSpinBox()
+        end_spin.setRange(start_default, max_frame)
+        end_spin.setValue(end_default)
+
+        def _sync_end_min(value: int) -> None:
+            end_spin.setMinimum(int(value))
+            if end_spin.value() < int(value):
+                end_spin.setValue(int(value))
+
+        start_spin.valueChanged.connect(_sync_end_min)
+
+        form.addRow("Start frame", start_spin)
+        form.addRow("End frame", end_spin)
+        layout.addLayout(form)
+
+        hint = QLabel("Selected event start/end frame and timestamps will be recalculated via OCR.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def on_accept() -> None:
+            start_frame = int(start_spin.value())
+            end_frame = int(end_spin.value())
+            if end_frame < start_frame:
+                QMessageBox.warning(
+                    dialog,
+                    "Invalid Range",
+                    "end_frame은 start_frame 이상이어야 합니다.",
+                )
+                return
+
+            start_video_time_ms = self._frame_to_video_time_ms(start_frame)
+            last_ts, last_video_time = self._latest_valid_overlay_anchor()
+            start_ts, start_status, start_conf, start_raw = self._resolve_overlay_timestamp_for_frame(
+                frame_bgr=None,
+                frame_index=start_frame,
+                video_time_ms=start_video_time_ms,
+                last_valid_ts=last_ts,
+                last_valid_video_time_ms=last_video_time,
+                allow_interpolation=True,
+            )
+
+            if start_ts is not None:
+                anchor_ts = int(start_ts)
+                anchor_video_time = int(start_video_time_ms)
+            else:
+                anchor_ts = last_ts
+                anchor_video_time = last_video_time
+
+            end_video_time_ms = self._frame_to_video_time_ms(end_frame)
+            end_ts, _end_status, _end_conf, _end_raw = self._resolve_overlay_timestamp_for_frame(
+                frame_bgr=None,
+                frame_index=end_frame,
+                video_time_ms=end_video_time_ms,
+                last_valid_ts=anchor_ts,
+                last_valid_video_time_ms=anchor_video_time,
+                allow_interpolation=True,
+            )
+
+            correction = int(self.correction_edit.text() or 0)
+
+            if self._can_manage_events():
+                self._push_undo_snapshot()
+
+            updated = self.events[index]
+            updated.frame_index = int(start_frame)
+            updated.video_time_ms = int(start_video_time_ms)
+            updated.overlay_ts_ms = int(start_ts) if start_ts is not None else None
+            updated.overlay_ts_status = start_status
+            updated.correction_ms = correction
+            updated.corrected_ts_ms = (
+                int(start_ts) + correction if start_ts is not None else None
+            )
+            updated.ocr_conf = start_conf
+            updated.ocr_raw_text = start_raw
+            updated.ocr_frame_index = int(start_frame)
+            updated.confirmed_frame_index = int(start_frame)
+            updated.confirmed_video_time_ms = int(start_video_time_ms)
+            updated.label_end_frame = int(end_frame)
+            updated.label_end_timestamp_unix = int(end_ts) if end_ts is not None else None
+
+            self.events[index] = updated
+            self._rebuild_event_list(preferred_index=index)
+            self._write_metadata()
+            self._refresh_action_states()
+            self.status_label.setText(
+                f"Fixed event timestamps: start={start_frame}, end={end_frame}"
+            )
+            dialog.accept()
+
+        buttons.accepted.connect(on_accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec()
+
     def _frame_to_video_time_ms(self, frame_index: int) -> int:
         return int(round((int(frame_index) / max(float(self.fps), 1.0)) * 1000.0))
 
@@ -2221,6 +2415,229 @@ class MainWindow(QMainWindow):
                 "Loaded metadata exceeded UI limit. "
                 "Only first entries are shown in Detected Events."
             )
+
+    def _open_loading_popup(self, *, title: str, message: str) -> QProgressDialog:
+        dialog = QProgressDialog(message, None, 0, 0, self)
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(Qt.ApplicationModal)
+        dialog.setCancelButton(None)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.show()
+        QApplication.processEvents()
+        return dialog
+
+    @staticmethod
+    def _update_loading_popup(dialog: QProgressDialog, message: str) -> None:
+        dialog.setLabelText(message)
+        QApplication.processEvents()
+
+    def _merge_zero_labels_from_primary_into_events(
+        self,
+        *,
+        persist: bool,
+        show_popup: bool = False,
+        popup_title: str = "Label 0",
+    ) -> int:
+        loading_dialog: QProgressDialog | None = None
+        if show_popup:
+            loading_dialog = self._open_loading_popup(
+                title=popup_title,
+                message="label_id=0 계산 로그 로딩 중...",
+            )
+        primary_path = self.primary_metadata_path
+        if primary_path is None and self.metadata_video_path:
+            primary_path, _debug_path = MetadataStore.metadata_paths(self.metadata_video_path)
+        if primary_path is None or (not primary_path.exists()):
+            if loading_dialog is not None:
+                loading_dialog.close()
+            return 0
+
+        try:
+            if loading_dialog is not None:
+                self._update_loading_popup(loading_dialog, "1/3 기본 메타데이터 로드 중...")
+            video_path, labels = MetadataStore.load_primary(primary_path)
+        except Exception:
+            if loading_dialog is not None:
+                loading_dialog.close()
+            return 0
+
+        inferred_video_name = (
+            Path(video_path).name
+            if video_path
+            else (Path(self.video_path).name if self.video_path else "")
+        )
+        if loading_dialog is not None:
+            self._update_loading_popup(loading_dialog, "2/3 label_id=0 이벤트 병합 중...")
+        existing_zero_keys = {
+            (int(event.frame_index), int(self._event_end_frame(event)))
+            for event in self.events
+            if str(event.event_type) == "label" and self._label_id_from_roi_id(event.roi_id) == 0
+        }
+        added: list[EventRecord] = []
+        for row in labels:
+            if self._to_int(row.get("label_id"), 0) != 0:
+                continue
+            event = self._event_from_primary_label(row, video_name=inferred_video_name)
+            key = (int(event.frame_index), int(self._event_end_frame(event)))
+            if key in existing_zero_keys:
+                continue
+            existing_zero_keys.add(key)
+            added.append(event)
+
+        if not added:
+            if loading_dialog is not None:
+                loading_dialog.close()
+            return 0
+
+        preferred_event_id = self._selected_event_id()
+        self.events.extend(added)
+        self.events.sort(
+            key=lambda event: (
+                int(event.frame_index),
+                int(self._event_end_frame(event)),
+                self._label_id_from_roi_id(event.roi_id),
+                str(event.event_id),
+            )
+        )
+        self._rebuild_event_list(preferred_event_id=preferred_event_id, preferred_index=0)
+        if persist:
+            if loading_dialog is not None:
+                self._update_loading_popup(loading_dialog, "3/3 메타데이터 저장 중(OCR 포함)...")
+            self._write_metadata(resolve_missing_timestamps=True)
+        if loading_dialog is not None:
+            loading_dialog.close()
+        return len(added)
+
+    def _recalculate_label_zero_manual(self) -> None:
+        if self.analysis_worker is not None:
+            QMessageBox.information(self, "Recalc Label 0", "Stop analysis before recalculating label_id=0.")
+            return
+
+        video_ref = self.metadata_video_path or self.video_path
+        if not video_ref:
+            QMessageBox.information(self, "Recalc Label 0", "Open a video or load metadata first.")
+            return
+
+        store = MetadataStore(video_ref)
+        if self.primary_metadata_path is not None:
+            store.primary_path = self.primary_metadata_path
+        if self.debug_metadata_path is not None:
+            store.debug_path = self.debug_metadata_path
+
+        if not store.debug_path.exists():
+            QMessageBox.information(
+                self,
+                "Recalc Label 0",
+                "Saved debug metadata not found. Run analysis or save metadata first.",
+            )
+            return
+
+        loading_dialog = self._open_loading_popup(
+            title="Recalc Label 0",
+            message="1/5 저장된 debug 메타데이터 로드 중...",
+        )
+        try:
+            _video_path, session_payload, debug_rows = MetadataStore.load_debug(store.debug_path)
+            saved_events = [self._event_from_mapping(dict(row)) for row in debug_rows]
+
+            self._update_loading_popup(
+                loading_dialog,
+                "2/5 저장된 이벤트로 label_id=0 구간 계산 중...",
+            )
+            base_events = [
+                event
+                for event in saved_events
+                if not (
+                    str(event.event_type) == "label"
+                    and self._label_id_from_roi_id(event.roi_id) == 0
+                )
+            ]
+
+            max_frame_index: int | None = None
+            if self.total_frames > 0:
+                max_frame_index = max(0, self.total_frames - 1)
+            elif store.primary_path.exists():
+                try:
+                    _vp, labels = MetadataStore.load_primary(store.primary_path)
+                    label_end_values = [
+                        self._to_int_opt(row.get("end_frame"))
+                        for row in labels
+                        if isinstance(row, dict)
+                    ]
+                    valid_end_values = [int(v) for v in label_end_values if v is not None]
+                    if valid_end_values:
+                        max_frame_index = max(valid_end_values)
+                except Exception:
+                    max_frame_index = None
+
+            rotation_deg = int(self.rotation_deg) % 360
+            manual_roi: ROI | None = None
+            if isinstance(session_payload, dict):
+                rotation_deg = int(session_payload.get("rotation_deg", rotation_deg)) % 360
+                raw_roi = session_payload.get("ocr_manual_roi")
+                if isinstance(raw_roi, dict):
+                    try:
+                        manual_roi = ROI(**raw_roi).normalized()
+                    except Exception:
+                        manual_roi = None
+
+            self._update_loading_popup(
+                loading_dialog,
+                "3/5 start/end frame OCR 수행 중...",
+            )
+            resolver = FrameTimestampResolver(
+                video_path=video_ref,
+                rotation_deg=rotation_deg,
+                ocr_manual_roi=manual_roi,
+            )
+            try:
+                label_rows = build_label_records(
+                    base_events,
+                    resolver=resolver,
+                    max_frame_index=max_frame_index,
+                    resolve_missing_timestamps=True,
+                )
+            finally:
+                resolver.close()
+            inferred_video_name = Path(video_ref).name
+            zero_events = [
+                self._event_from_primary_label(row.to_dict(), video_name=inferred_video_name)
+                for row in label_rows
+                if int(row.label_id) == 0
+            ]
+
+            self._update_loading_popup(loading_dialog, "4/5 Events 목록 반영 중...")
+            if self._can_manage_events():
+                self._push_undo_snapshot()
+            preferred_event_id = self._selected_event_id()
+            self.events = [*base_events, *zero_events]
+            self.events.sort(
+                key=lambda event: (
+                    int(event.frame_index),
+                    int(self._event_end_frame(event)),
+                    self._label_id_from_roi_id(event.roi_id),
+                    str(event.event_id),
+                )
+            )
+            self._rebuild_event_list(preferred_event_id=preferred_event_id, preferred_index=0)
+
+            self._update_loading_popup(loading_dialog, "5/5 메타데이터 저장 중...")
+            self._write_metadata(resolve_missing_timestamps=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Recalc Label 0", f"Failed to recalculate label_id=0:\n{exc}")
+            return
+        finally:
+            loading_dialog.close()
+
+        self._set_notice(
+            "label_id=0 manual recalculation completed from saved metadata."
+        )
+        self.status_label.setText(
+            f"Recalc Label 0 done | added_zero={len([e for e in self.events if self._label_id_from_roi_id(e.roi_id) == 0 and str(e.event_type) == 'label'])}"
+        )
+        self._refresh_action_states()
 
     def _reload_events_from_metadata_for_edit_context(self) -> None:
         candidates: list[Path] = []
@@ -2652,18 +3069,20 @@ class MainWindow(QMainWindow):
             self.log_path = Path(video_path).with_name(f"{Path(video_path).stem}_run_log.txt")
         elif self.primary_metadata_path is not None:
             self.log_path = self.primary_metadata_path.with_name(f"{self.primary_metadata_path.stem}_run_log.txt")
+        self._merge_zero_labels_from_primary_into_events(persist=False)
         context_src = self._load_scene_context_from_metadata(
             file_path,
-            loaded,
+            self.events,
             session_payload=session_payload,
         )
         self._set_events_edit_context(enabled=True, source="metadata_loaded")
+        current_count = len(self.events)
         if context_src:
             self.status_label.setText(
-                f"Loaded metadata events: {len(loaded)} | scene restored from {context_src}"
+                f"Loaded metadata events: {current_count} | scene restored from {context_src}"
             )
         else:
-            self.status_label.setText(f"Loaded metadata events: {len(loaded)}")
+            self.status_label.setText(f"Loaded metadata events: {current_count}")
         self._refresh_action_states()
 
     def _export_metadata_dialog(self) -> None:
@@ -2870,6 +3289,8 @@ class MainWindow(QMainWindow):
         self.load_metadata_button.setEnabled(not running)
         self.manual_add_event_button.setEnabled(has_video and not running)
         self.edit_event_json_button.setEnabled(has_selected_event and not running)
+        self.fix_timestamp_button.setEnabled(can_manage_events and has_selected_event and has_video)
+        self.recalc_label0_button.setEnabled(can_manage_events and has_video and not running)
         self.delete_event_button.setEnabled(can_manage_events and has_selected_event)
         self.undo_event_button.setEnabled(can_manage_events and bool(self._events_undo_stack))
         self.redo_event_button.setEnabled(can_manage_events and bool(self._events_redo_stack))
