@@ -77,6 +77,8 @@ class AnalysisRequest:
     detector_confidence: float = 0.25
     detector_iou: float = 0.5
     chunk_seconds: int = 60
+    enter_debounce_frames: int = 1
+    exit_debounce_frames: int = 2
 
 
 @dataclass(slots=True)
@@ -106,6 +108,8 @@ class EventRecord:
     roi_y: int | None = None
     roi_w: int | None = None
     roi_h: int | None = None
+    label_end_frame: int | None = None
+    label_end_timestamp_unix: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -130,6 +134,11 @@ class Track:
     def center(self) -> tuple[float, float]:
         x1, y1, x2, y2 = self.bbox
         return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+    @property
+    def foot_point(self) -> tuple[float, float]:
+        x1, _y1, x2, y2 = self.bbox
+        return ((x1 + x2) / 2.0, y2)
 
 
 @dataclass(slots=True)
@@ -186,6 +195,8 @@ class SessionConfig:
     duration_ms: int | None = None
     timestamp_correction_ms: int = 0
     ocr_manual_roi: ROI | None = None
+    enter_debounce_frames: int = 1
+    exit_debounce_frames: int = 2
 
     def to_dict(self) -> dict[str, Any]:
         mode_value = self.mode.value if isinstance(self.mode, AnalysisMode) else str(self.mode)
@@ -202,6 +213,8 @@ class SessionConfig:
             "duration_ms": self.duration_ms,
             "timestamp_correction_ms": self.timestamp_correction_ms,
             "ocr_manual_roi": self.ocr_manual_roi.to_dict() if self.ocr_manual_roi else None,
+            "enter_debounce_frames": self.enter_debounce_frames,
+            "exit_debounce_frames": self.exit_debounce_frames,
         }
 
     @classmethod
@@ -225,4 +238,6 @@ class SessionConfig:
             ),
             timestamp_correction_ms=int(data.get("timestamp_correction_ms", 0)),
             ocr_manual_roi=ocr_roi,
+            enter_debounce_frames=max(1, int(data.get("enter_debounce_frames", 1))),
+            exit_debounce_frames=max(1, int(data.get("exit_debounce_frames", 2))),
         )

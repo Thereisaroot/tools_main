@@ -39,6 +39,7 @@ class _LabelWindow:
     start_frame: int
     end_frame: int
     start_ts_hint: int | None = None
+    end_ts_hint: int | None = None
 
 
 def _parse_label_id(roi_id: str) -> int:
@@ -85,6 +86,71 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
         ) as tf:
             json.dump(payload, tf, ensure_ascii=False, indent=2)
             tf.write("\n")
+            tmp_name = tf.name
+        os.replace(tmp_name, path)
+        tmp_name = None
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+def _is_stop_requested(stop_event: object | None) -> bool:
+    if stop_event is None:
+        return False
+    checker = getattr(stop_event, "is_set", None)
+    if checker is None:
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+def _atomic_write_debug_payload(
+    path: Path,
+    *,
+    video_path: str,
+    session: dict,
+    events: Iterable[EventRecord],
+    stop_event: object | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tf:
+            tf.write("{\n")
+            tf.write('  "version": 1,\n')
+            tf.write('  "video_path": ')
+            json.dump(video_path, tf, ensure_ascii=False)
+            tf.write(",\n")
+            tf.write('  "session": ')
+            json.dump(session, tf, ensure_ascii=False, indent=2)
+            tf.write(",\n")
+            tf.write('  "events": [\n')
+
+            first = True
+            for event in events:
+                if _is_stop_requested(stop_event):
+                    break
+                row = event.to_dict() if isinstance(event, EventRecord) else dict(event)
+                if not first:
+                    tf.write(",\n")
+                tf.write("    ")
+                json.dump(row, tf, ensure_ascii=False)
+                first = False
+
+            tf.write("\n  ]\n")
+            tf.write("}\n")
             tmp_name = tf.name
         os.replace(tmp_name, path)
         tmp_name = None
@@ -215,28 +281,40 @@ def _make_label_windows(
     max_frame_index: int | None,
 ) -> tuple[list[_LabelWindow], list[_LabelWindow]]:
     roi_windows: list[_LabelWindow] = []
+    manual_zero_windows: list[_LabelWindow] = []
     for event in sorted(events, key=lambda e: (int(e.frame_index), str(e.event_id))):
         label_id = _parse_label_id(event.roi_id)
-        if label_id <= 0:
-            continue
         start = max(0, int(event.frame_index))
-        end = int(start + 100)
+        end_override = event.label_end_frame
+        if end_override is not None:
+            end = int(end_override)
+        else:
+            end = int(start + 100)
         if max_frame_index is not None:
             end = min(end, int(max_frame_index))
+        end = max(start, end)
         if end < start:
             continue
         hint = int(event.overlay_ts_ms) if event.overlay_ts_ms is not None else None
-        roi_windows.append(
-            _LabelWindow(
-                label_id=label_id,
-                start_frame=start,
-                end_frame=end,
-                start_ts_hint=hint,
-            )
+        end_hint = (
+            int(event.label_end_timestamp_unix)
+            if event.label_end_timestamp_unix is not None
+            else None
         )
+        window = _LabelWindow(
+            label_id=label_id,
+            start_frame=start,
+            end_frame=end,
+            start_ts_hint=hint,
+            end_ts_hint=end_hint,
+        )
+        if label_id > 0:
+            roi_windows.append(window)
+        elif (event.event_type == "label") or (event.label_end_frame is not None):
+            manual_zero_windows.append(window)
 
     merged = _merge_intervals([(w.start_frame, w.end_frame) for w in roi_windows])
-    zero_windows: list[_LabelWindow] = []
+    zero_windows: list[_LabelWindow] = list(manual_zero_windows)
     for idx in range(len(merged) - 1):
         current_end = int(merged[idx][1])
         next_start = int(merged[idx + 1][0])
@@ -249,27 +327,47 @@ def _make_label_windows(
                     start_frame=gap_start,
                     end_frame=gap_end,
                     start_ts_hint=None,
+                    end_ts_hint=None,
                 )
             )
-    return roi_windows, zero_windows
+    deduped_zero: list[_LabelWindow] = []
+    seen_zero: set[tuple[int, int]] = set()
+    for window in sorted(zero_windows, key=lambda w: (w.start_frame, w.end_frame)):
+        key = (int(window.start_frame), int(window.end_frame))
+        if key in seen_zero:
+            continue
+        seen_zero.add(key)
+        deduped_zero.append(window)
+    return roi_windows, deduped_zero
 
 
 def build_label_records(
     events: Iterable[EventRecord],
     *,
-    resolver: FrameTimestampResolver,
+    resolver: FrameTimestampResolver | None = None,
     max_frame_index: int | None = None,
+    resolve_missing_timestamps: bool = True,
+    stop_event: object | None = None,
 ) -> list[LabelRecord]:
     roi_windows, zero_windows = _make_label_windows(events, max_frame_index=max_frame_index)
     windows = [*roi_windows, *zero_windows]
     windows.sort(key=lambda w: (int(w.start_frame), 1 if w.label_id == 0 else 0, int(w.label_id)))
 
+    if resolve_missing_timestamps and resolver is None:
+        raise ValueError("resolver is required when resolve_missing_timestamps=True")
+
     rows: list[LabelRecord] = []
     for window in windows:
+        if _is_stop_requested(stop_event):
+            break
         start_frame = int(window.start_frame)
         end_frame = int(window.end_frame)
-        start_ts = resolver.resolve(start_frame, preferred_ts=window.start_ts_hint)
-        end_ts = resolver.resolve(end_frame)
+        if resolve_missing_timestamps and resolver is not None:
+            start_ts = resolver.resolve(start_frame, preferred_ts=window.start_ts_hint)
+            end_ts = resolver.resolve(end_frame, preferred_ts=window.end_ts_hint)
+        else:
+            start_ts = int(window.start_ts_hint) if window.start_ts_hint is not None else None
+            end_ts = int(window.end_ts_hint) if window.end_ts_hint is not None else None
         rows.append(
             LabelRecord(
                 label_id=int(window.label_id),
@@ -319,6 +417,8 @@ class MetadataStore:
         events: Iterable[EventRecord],
         session: dict | None,
         max_frame_index: int | None = None,
+        resolve_missing_timestamps: bool = True,
+        stop_event: object | None = None,
     ) -> tuple[Path, Path]:
         events_list = list(events)
         session_dict = dict(session or {})
@@ -333,32 +433,42 @@ class MetadataStore:
             except Exception:
                 manual_roi = None
 
-        rotation_deg = int(session_dict.get("rotation_deg", 0))
-        resolver = FrameTimestampResolver(
-            video_path=self.video_path,
-            rotation_deg=rotation_deg,
-            ocr_manual_roi=manual_roi,
-        )
-        try:
+        if resolve_missing_timestamps:
+            rotation_deg = int(session_dict.get("rotation_deg", 0))
+            resolver = FrameTimestampResolver(
+                video_path=self.video_path,
+                rotation_deg=rotation_deg,
+                ocr_manual_roi=manual_roi,
+            )
+            try:
+                labels = build_label_records(
+                    events_list,
+                    resolver=resolver,
+                    max_frame_index=max_frame_index,
+                    resolve_missing_timestamps=True,
+                    stop_event=stop_event,
+                )
+            finally:
+                resolver.close()
+        else:
             labels = build_label_records(
                 events_list,
-                resolver=resolver,
                 max_frame_index=max_frame_index,
+                resolve_missing_timestamps=False,
+                stop_event=stop_event,
             )
-        finally:
-            resolver.close()
 
         primary_payload = {
             "video_path": self.video_path,
             "labels": [row.to_dict() for row in labels],
         }
-        debug_payload = {
-            "version": 1,
-            "video_path": self.video_path,
-            "session": session_dict,
-            "events": [event.to_dict() for event in events_list],
-        }
 
         _atomic_write_json(self.primary_path, primary_payload)
-        _atomic_write_json(self.debug_path, debug_payload)
+        _atomic_write_debug_payload(
+            self.debug_path,
+            video_path=self.video_path,
+            session=session_dict,
+            events=events_list,
+            stop_event=stop_event,
+        )
         return self.primary_path, self.debug_path

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from collections import OrderedDict
 import logging
 from shutil import which
@@ -70,13 +71,42 @@ class TimestampOCR:
     def _init_backend(self) -> None:
         self._backend = "none"
         self._engine = None
-        if RapidOCROnnxRuntime is not None:
+        forced = os.getenv("ISAC_OCR_BACKEND", "auto").strip().lower()
+        has_tesseract = pytesseract is not None and which("tesseract")
+        default_prefer_tesseract = "1" if sys.platform == "darwin" else "0"
+        prefer_tesseract = str(
+            os.getenv("ISAC_OCR_PREFER_PYTESSERACT", default_prefer_tesseract)
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+        if forced in {"pytesseract", "tesseract"}:
+            if has_tesseract:
+                self._backend = "pytesseract"
+            return
+
+        if forced in {"rapidocr-onnxruntime", "rapidocr_onnxruntime", "rapidocr-ort"}:
+            if RapidOCROnnxRuntime is not None:
+                self._engine = RapidOCROnnxRuntime()
+                self._backend = "rapidocr-onnxruntime"
+            return
+
+        if forced in {"rapidocr", "rapidocr-unified"}:
+            if RapidOCRUnified is not None:
+                self._engine = RapidOCRUnified()
+                self._backend = "rapidocr"
+            elif RapidOCROnnxRuntime is not None:
+                self._engine = RapidOCROnnxRuntime()
+                self._backend = "rapidocr-onnxruntime"
+            return
+
+        if prefer_tesseract and has_tesseract:
+            self._backend = "pytesseract"
+        elif RapidOCROnnxRuntime is not None:
             self._engine = RapidOCROnnxRuntime()
             self._backend = "rapidocr-onnxruntime"
         elif RapidOCRUnified is not None:
             self._engine = RapidOCRUnified()
             self._backend = "rapidocr"
-        elif pytesseract is not None and which("tesseract"):
+        elif has_tesseract:
             self._backend = "pytesseract"
 
     def reset(self, *, preserve_rois: bool = True) -> None:
@@ -650,6 +680,23 @@ class TimestampOCR:
             self._neighbor_cap = None
             self._neighbor_cap_path = None
             self._neighbor_next_index = None
+        self._frame_ocr_cache.clear()
+        engine = self._engine
+        self._engine = None
+        self._backend = "none"
+        if engine is not None:
+            close_fn = getattr(engine, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            release_fn = getattr(engine, "release", None)
+            if callable(release_fn):
+                try:
+                    release_fn()
+                except Exception:
+                    pass
 
     def extract_timestamp(self, frame_bgr: np.ndarray, *, fast: bool = False) -> OCRResult:
         candidates = self._build_candidate_rois(frame_bgr, fast=fast)

@@ -44,6 +44,8 @@ class AnalysisWorker(QObject):
             duration_ms=self.request.duration_ms,
             timestamp_correction_ms=self.request.timestamp_correction_ms,
             ocr_manual_roi=self.request.ocr_manual_roi,
+            enter_debounce_frames=int(self.request.enter_debounce_frames),
+            exit_debounce_frames=int(self.request.exit_debounce_frames),
         )
 
         engine = AnalysisEngine()
@@ -58,6 +60,8 @@ class AnalysisWorker(QObject):
             store.save_all(
                 events=self._events_buffer,
                 session=session.to_dict(),
+                resolve_missing_timestamps=False,
+                stop_event=self._stop_event,
             )
             result.output_dir = store.primary_path.parent
             self.finished.emit(result)

@@ -55,7 +55,7 @@ class AnalysisEngine:
             str(os.getenv("ISAC_TS_DIAG", "0")).strip().lower() in {"1", "true", "yes", "on"}
         )
         self._mem_diag_enabled = (
-            str(os.getenv("ISAC_MEM_DIAG", "0")).strip().lower() in {"1", "true", "yes", "on"}
+            str(os.getenv("ISAC_MEM_DIAG", "1")).strip().lower() in {"1", "true", "yes", "on"}
             and (sys.platform != "win32")
         )
 
@@ -88,11 +88,11 @@ class AnalysisEngine:
         )
         detector_reset_interval = max(
             0,
-            int(os.getenv("ISAC_DETECTOR_RESET_INTERVAL", "100")),
+            int(os.getenv("ISAC_DETECTOR_RESET_INTERVAL", "20")),
         )
         ocr_reset_interval = max(
             0,
-            int(os.getenv("ISAC_OCR_RESET_INTERVAL", "50")),
+            int(os.getenv("ISAC_OCR_RESET_INTERVAL", "20")),
         )
         ocr_sample_frames = max(
             1,
@@ -102,6 +102,18 @@ class AnalysisEngine:
         detector = OnnxYoloPersonDetector(detector_cfg)
         if detector.backend == "onnxruntime" and detector.providers:
             logger.info("detector_provider providers=%s", ",".join(detector.providers))
+        force_hard_detector_reset = (
+            str(os.getenv("ISAC_DETECTOR_HARD_RESET", "0")).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if detector.backend == "onnxruntime" and not force_hard_detector_reset:
+            if detector_reset_interval > 0:
+                logger.info(
+                    "detector_reset_disabled backend=%s interval=%s",
+                    detector.backend,
+                    detector_reset_interval,
+                )
+            detector_reset_interval = 0
         tracker = ByteTrackLite(iou_threshold=request.detector_iou)
         ocr = TimestampOCR()
         ocr.set_manual_roi(request.ocr_manual_roi)
@@ -133,7 +145,7 @@ class AnalysisEngine:
 
         processed_frames = 0
         frame_cache: OrderedDict[int, object] = OrderedDict()
-        frame_cache_size = 16
+        frame_cache_size = max(2, int(os.getenv("ISAC_FRAME_CACHE_SIZE", "6")))
         try:
             for packet in video_stream.iter_frames(
                 rotation_deg=request.rotation_deg,
@@ -158,6 +170,10 @@ class AnalysisEngine:
                     if processed_frames % detector_reset_interval == 0:
                         old = detector
                         detector = OnnxYoloPersonDetector(detector_cfg)
+                        try:
+                            old.close()
+                        except Exception:
+                            pass
                         del old
                         gc.collect()
                         logger.info(
@@ -172,6 +188,8 @@ class AnalysisEngine:
                     direction_vectors=request.direction_vectors,
                     rotation_deg=request.rotation_deg,
                     mode=mode,
+                    enter_debounce_frames=max(1, int(request.enter_debounce_frames)),
+                    exit_debounce_frames=max(1, int(request.exit_debounce_frames)),
                     frame_index=packet.frame_index,
                     video_time_ms=packet.time_ms,
                     video_name=Path(request.video_path).name,
@@ -259,6 +277,14 @@ class AnalysisEngine:
                         event.ocr_frame_index = int(ocr_frame_index) if ocr_frame_index is not None else None
                         event.confirmed_frame_index = confirmed_frame_index
                         event.confirmed_video_time_ms = confirmed_video_time_ms
+                        end_frame = int(event.frame_index) + 100
+                        if int(info.total_frames) > 0:
+                            end_frame = min(end_frame, int(info.total_frames) - 1)
+                        event.label_end_frame = max(int(event.frame_index), int(end_frame))
+                        if event.overlay_ts_ms is not None:
+                            delta_frames = max(0, int(event.label_end_frame) - int(event.frame_index))
+                            delta_ms = int(round((delta_frames / max(float(info.fps), 1.0)) * 1000.0))
+                            event.label_end_timestamp_unix = int(event.overlay_ts_ms) + delta_ms
                         if self._ts_diag_enabled:
                             logger.info(
                                 (
@@ -328,6 +354,10 @@ class AnalysisEngine:
                     )
                 )
         finally:
+            try:
+                detector.close()
+            except Exception:
+                pass
             ocr.close()
 
         logger.info(
@@ -350,6 +380,8 @@ class AnalysisEngine:
         video_name: str,
         tracks: list[Track],
         presence: dict[tuple[str, int], PresenceState],
+        enter_debounce_frames: int = 1,
+        exit_debounce_frames: int = 2,
     ) -> list[EventRecord]:
         active_ids = {t.track_id for t in tracks}
         tracks_by_id = {t.track_id: t for t in tracks}
@@ -362,8 +394,8 @@ class AnalysisEngine:
             roi_n = roi.normalized()
             count = 0
             for track in tracks:
-                cx, cy = track.center
-                if roi_n.contains(cx, cy):
+                fx, fy = track.foot_point
+                if roi_n.contains(fx, fy):
                     count += 1
             roi_person_counts[roi_n.roi_id] = count
 
@@ -373,8 +405,8 @@ class AnalysisEngine:
 
             # Step 1: active tracks
             for track in tracks:
-                center = track.center
-                inside = roi_n.contains(center[0], center[1])
+                foot = track.foot_point
+                inside = roi_n.contains(foot[0], foot[1])
 
                 key = (roi_n.roi_id, track.track_id)
                 state = presence.setdefault(key, PresenceState())
@@ -382,6 +414,8 @@ class AnalysisEngine:
                     state=state,
                     inside=inside,
                     mode=mode,
+                    enter_debounce_frames=enter_debounce_frames,
+                    exit_debounce_frames=exit_debounce_frames,
                     rotation_deg=rotation_deg,
                     track=track,
                     roi=roi_n,
@@ -406,6 +440,8 @@ class AnalysisEngine:
                     state=state,
                     inside=False,
                     mode=mode,
+                    enter_debounce_frames=enter_debounce_frames,
+                    exit_debounce_frames=exit_debounce_frames,
                     rotation_deg=rotation_deg,
                     track=tracks_by_id.get(person_id),
                     roi=roi_n,
@@ -450,8 +486,11 @@ class AnalysisEngine:
         visible_person_count: int = 0,
         roi_person_count: int = 0,
         person_id_override: int | None = None,
+        enter_debounce_frames: int = 1,
+        exit_debounce_frames: int = 2,
     ) -> EventRecord | None:
-        debounce = 3
+        enter_debounce = max(1, int(enter_debounce_frames))
+        exit_debounce = max(1, int(exit_debounce_frames))
         person_id = person_id_override if person_id_override is not None else (track.track_id if track else -1)
         conf = track.confidence if track else 0.0
 
@@ -464,7 +503,7 @@ class AnalysisEngine:
             state.pending_exit_frame_index = None
             state.pending_exit_video_time_ms = None
             state.last_center = track.center if track else state.last_center
-            if not state.inside and state.enter_streak >= debounce:
+            if not state.inside and state.enter_streak >= enter_debounce:
                 state.inside = True
                 anchor_frame_index = (
                     int(state.pending_enter_frame_index)
@@ -515,7 +554,7 @@ class AnalysisEngine:
             state.pending_exit_frame_index = int(frame_index)
             state.pending_exit_video_time_ms = int(video_time_ms)
 
-        if state.inside and mode == AnalysisMode.ENTRY_EXIT_DIRECTION and state.exit_streak >= debounce:
+        if state.inside and mode == AnalysisMode.ENTRY_EXIT_DIRECTION and state.exit_streak >= exit_debounce:
             state.inside = False
             anchor_frame_index = (
                 int(state.pending_exit_frame_index)
@@ -584,6 +623,8 @@ class AnalysisEngine:
             allow_interpolation=False,
         )
         if anchor_status == OverlayTSStatus.OK and anchor_overlay is not None:
+            self._last_overlay_ts = int(anchor_overlay)
+            self._last_overlay_video_time_ms = int(anchor_video_time_ms)
             return anchor_overlay, anchor_status, anchor_conf, anchor_raw, int(anchor_frame_index)
 
         if int(fallback_frame_index) == int(anchor_frame_index):
@@ -600,8 +641,15 @@ class AnalysisEngine:
             allow_interpolation=True,
         )
         if fallback_overlay is not None:
+            adjusted_overlay = int(fallback_overlay)
+            delta_ms = int(fallback_video_time_ms) - int(anchor_video_time_ms)
+            if delta_ms > 0:
+                # Keep overlay timestamp anchored to event first-frame time.
+                adjusted_overlay = int(fallback_overlay) - int(delta_ms)
+            self._last_overlay_ts = int(adjusted_overlay)
+            self._last_overlay_video_time_ms = int(anchor_video_time_ms)
             return (
-                fallback_overlay,
+                adjusted_overlay,
                 fallback_status,
                 fallback_conf,
                 fallback_raw,

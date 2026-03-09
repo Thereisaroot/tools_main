@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "video_path": "/Users/jaekeunlee/Desktop/COMP/isac_labelr/낮침입.mp4",
+  "session": {
+  "video_path": "/Users/jaekeunlee/Desktop/COMP/isac_labelr/낮침입.mp4",
+  "rotation_deg": 270,
+  "mode": "entry_only",
+  "rois": [
+    {
+      "roi_id": "roi_1",
+      "x": 870,
+      "y": 348,
+      "w": 111,
+      "h": 344
+    },
+    {
+      "roi_id": "roi_2",
+      "x": 731,
+      "y": 369,
+      "w": 95,
+      "h": 260
+    },
+    {
+      "roi_id": "roi_3",
+      "x": 653,
+      "y": 414,
+      "w": 53,
+      "h": 175
+    }
+  ],
+  "direction_vectors": {
+    "roi_1": {
+      "dx": 1.0,
+      "dy": 0.0
+    },
+    "roi_2": {
+      "dx": 1.0,
+      "dy": 0.0
+    },
+    "roi_3": {
+      "dx": 1.0,
+      "dy": 0.0
+    }
+  },
+  "analyze_full": true,
+  "start_ms": 0,
+  "duration_ms": null,
+  "timestamp_correction_ms": 0,
+  "ocr_manual_roi": {
+    "roi_id": "timestamp_manual",
+    "x": 22,
+    "y": 274,
+    "w": 131,
+    "h": 552
+  },
+  "enter_debounce_frames": 1,
+  "exit_debounce_frames": 2
+},
+  "events": [
+
+  ]
+}

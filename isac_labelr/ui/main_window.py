@@ -4,9 +4,11 @@ import gc
 import csv
 import json
 import os
+from datetime import datetime
 from collections import OrderedDict
 from pathlib import Path
 import uuid
+from zoneinfo import ZoneInfo
 
 import cv2
 from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
@@ -70,6 +72,8 @@ from isac_labelr.vision.detector import (
 )
 from isac_labelr.vision.ocr import TimestampOCR
 from isac_labelr.vision.tracker import ByteTrackLite
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 class PreferencesDialog(QDialog):
@@ -174,7 +178,9 @@ class MainWindow(QMainWindow):
         self.current_frame_raw = None
         self.current_frame_rotated = None
         self._preview_reads_since_reopen = 0
-        self._preview_reopen_interval = 900
+        self._preview_reopen_interval = max(
+            0, int(os.getenv("ISAC_PREVIEW_REOPEN_INTERVAL", "0"))
+        )
 
         self.rotation_deg = 0
         self.rois: dict[str, ROI] = {}
@@ -206,13 +212,16 @@ class MainWindow(QMainWindow):
         self.preview_last_ocr_raw_text: str = ""
         self.preview_last_ocr_frame_index: int | None = None
         self._preview_frame_cache: OrderedDict[int, object] = OrderedDict()
+        self._preview_frame_cache_max = max(
+            2, int(os.getenv("ISAC_PREVIEW_FRAME_CACHE_SIZE", "6"))
+        )
         self.preview_detector_infer_count = 0
         self.preview_detector_reset_interval = max(
-            0, int(os.getenv("ISAC_PREVIEW_DETECTOR_RESET_INTERVAL", "100"))
+            0, int(os.getenv("ISAC_PREVIEW_DETECTOR_RESET_INTERVAL", "20"))
         )
         self.preview_ocr_use_count = 0
         self.preview_ocr_reset_interval = max(
-            0, int(os.getenv("ISAC_PREVIEW_OCR_RESET_INTERVAL", "50"))
+            0, int(os.getenv("ISAC_PREVIEW_OCR_RESET_INTERVAL", "20"))
         )
         self.preview_ocr_sample_frames = max(
             1, int(os.getenv("ISAC_PREVIEW_OCR_SAMPLE_FRAMES", "1"))
@@ -257,6 +266,8 @@ class MainWindow(QMainWindow):
 
         self.open_file_button = QPushButton("Open File")
         self.add_roi_button = QPushButton("Add ROI")
+        self.reset_rois_button = QPushButton("Reset ROIs")
+        self.reset_rois_button.setToolTip("Delete all ROIs and reset numbering to roi_1")
         self.add_ts_roi_button = QPushButton("Add TS ROI")
         self.rotate_left_button = QPushButton("Rotate -90")
         self.rotate_right_button = QPushButton("Rotate +90")
@@ -287,6 +298,7 @@ class MainWindow(QMainWindow):
         self.command_buttons = {
             AppCommand.OPEN_VIDEO: self.open_file_button,
             AppCommand.ADD_ROI: self.add_roi_button,
+            AppCommand.CLEAR_ALL_ROIS: self.reset_rois_button,
             AppCommand.MANUAL_OCR_ROI: self.add_ts_roi_button,
             AppCommand.ROTATE_PREV: self.rotate_left_button,
             AppCommand.ROTATE_NEXT: self.rotate_right_button,
@@ -362,6 +374,14 @@ class MainWindow(QMainWindow):
         self.duration_ms_spin.setRange(1, 2_000_000_000)
         self.duration_ms_spin.setValue(60_000)
 
+        self.enter_debounce_spin = QSpinBox()
+        self.enter_debounce_spin.setRange(1, 30)
+        self.enter_debounce_spin.setValue(1)
+
+        self.exit_debounce_spin = QSpinBox()
+        self.exit_debounce_spin.setRange(1, 30)
+        self.exit_debounce_spin.setValue(2)
+
         self.correction_edit = QLineEdit("0")
         self.correction_edit.setValidator(QIntValidator(-2_000_000_000, 2_000_000_000, self))
 
@@ -369,6 +389,8 @@ class MainWindow(QMainWindow):
         settings_form.addRow("Scope", self.full_checkbox)
         settings_form.addRow("Start ms", self.start_ms_spin)
         settings_form.addRow("Duration ms", self.duration_ms_spin)
+        settings_form.addRow("Enter debounce", self.enter_debounce_spin)
+        settings_form.addRow("Exit debounce", self.exit_debounce_spin)
         settings_form.addRow("TS correction ms", self.correction_edit)
 
         right_layout.addWidget(settings_box)
@@ -403,6 +425,7 @@ class MainWindow(QMainWindow):
 
         roi_layout.addWidget(self.roi_list)
         roi_layout.addWidget(dir_widget)
+        roi_layout.addWidget(self.reset_rois_button)
         right_layout.addWidget(roi_box, 1)
 
         event_box = QGroupBox("Detected Events")
@@ -425,6 +448,7 @@ class MainWindow(QMainWindow):
         event_edit_buttons_layout.addStretch(1)
         event_layout.addWidget(event_edit_buttons)
         self.event_list = QListWidget()
+        self.event_list.setFocusPolicy(Qt.StrongFocus)
         event_layout.addWidget(self.event_list)
         right_layout.addWidget(event_box, 2)
 
@@ -490,6 +514,7 @@ class MainWindow(QMainWindow):
     def _bind_signals(self) -> None:
         self.open_file_button.clicked.connect(lambda: self._dispatch_command(AppCommand.OPEN_VIDEO))
         self.add_roi_button.clicked.connect(lambda: self._dispatch_command(AppCommand.ADD_ROI))
+        self.reset_rois_button.clicked.connect(lambda: self._dispatch_command(AppCommand.CLEAR_ALL_ROIS))
         self.add_ts_roi_button.clicked.connect(lambda: self._dispatch_command(AppCommand.MANUAL_OCR_ROI))
         self.rotate_left_button.clicked.connect(lambda: self._dispatch_command(AppCommand.ROTATE_PREV))
         self.rotate_right_button.clicked.connect(lambda: self._dispatch_command(AppCommand.ROTATE_NEXT))
@@ -538,6 +563,12 @@ class MainWindow(QMainWindow):
             shortcut.activated.connect(handler)
             self._shortcuts.append(shortcut)
 
+        for key in (Qt.Key_Delete, Qt.Key_Backspace):
+            shortcut = QShortcut(QKeySequence(key), self.event_list)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(self._on_shortcut_delete_event)
+            self._shortcuts.append(shortcut)
+
     def _is_text_input_focus(self) -> bool:
         widget = self.focusWidget()
         return isinstance(widget, (QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox))
@@ -556,6 +587,13 @@ class MainWindow(QMainWindow):
         if self._is_text_input_focus() or not self.play_button.isEnabled():
             return
         self._toggle_play()
+
+    def _on_shortcut_delete_event(self) -> None:
+        focus = self.focusWidget()
+        if focus is None:
+            return
+        if (focus is self.event_list) or self.event_list.isAncestorOf(focus) or self.event_list.hasFocus():
+            self._delete_selected_event()
 
     def _dispatch_command(self, command: AppCommand) -> None:
         if command == AppCommand.OPEN_VIDEO:
@@ -715,7 +753,11 @@ class MainWindow(QMainWindow):
 
         self.frame_label.setText(f"frame: {actual_index} / {self.total_frames - 1}")
 
-        if sequential_hint and self.play_timer.isActive():
+        if (
+            sequential_hint
+            and self.play_timer.isActive()
+            and self._preview_reopen_interval > 0
+        ):
             self._preview_reads_since_reopen += 1
             if self._preview_reads_since_reopen >= self._preview_reopen_interval:
                 self._preview_reopen_capture_at_next_frame()
@@ -826,6 +868,10 @@ class MainWindow(QMainWindow):
         old = self.preview_detector
         self.preview_detector = None
         if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
             del old
         gc.collect()
         ok = self._ensure_preview_detector()
@@ -860,6 +906,11 @@ class MainWindow(QMainWindow):
         self._reset_preview_event_state()
         self.preview_detector_infer_count = 0
         if clear_detector:
+            if self.preview_detector is not None:
+                try:
+                    self.preview_detector.close()
+                except Exception:
+                    pass
             self.preview_detector = None
             self.preview_tracker = None
         if clear_overlay:
@@ -878,11 +929,18 @@ class MainWindow(QMainWindow):
 
         assert self.preview_detector is not None
         assert self.preview_tracker is not None
+        force_hard_detector_reset = (
+            str(os.getenv("ISAC_DETECTOR_HARD_RESET", "0")).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        effective_reset_interval = self.preview_detector_reset_interval
+        if self.preview_detector.backend == "onnxruntime" and not force_hard_detector_reset:
+            effective_reset_interval = 0
 
         if (
-            self.preview_detector_reset_interval > 0
+            effective_reset_interval > 0
             and self.preview_detector_infer_count > 0
-            and self.preview_detector_infer_count % self.preview_detector_reset_interval == 0
+            and self.preview_detector_infer_count % effective_reset_interval == 0
         ):
             if not self._recreate_preview_detector():
                 self.preview_detection_checkbox.blockSignals(True)
@@ -911,8 +969,8 @@ class MainWindow(QMainWindow):
         for roi_id, roi in self.rois.items():
             n = roi.normalized()
             for track in tracks:
-                cx, cy = track.center
-                if n.contains(cx, cy):
+                fx, fy = track.foot_point
+                if n.contains(fx, fy):
                     active_roi_ids.add(roi_id)
                     break
 
@@ -927,6 +985,8 @@ class MainWindow(QMainWindow):
             direction_vectors=dict(self.direction_vectors),
             rotation_deg=self.rotation_deg,
             mode=self._current_mode(),
+            enter_debounce_frames=int(self.enter_debounce_spin.value()),
+            exit_debounce_frames=int(self.exit_debounce_spin.value()),
             frame_index=self.current_frame_index,
             video_time_ms=self.current_video_time_ms,
             video_name=Path(self.video_path).name,
@@ -937,7 +997,7 @@ class MainWindow(QMainWindow):
             return
 
         self._preview_frame_cache[int(self.current_frame_index)] = self.current_frame_rotated
-        while len(self._preview_frame_cache) > 16:
+        while len(self._preview_frame_cache) > self._preview_frame_cache_max:
             self._preview_frame_cache.popitem(last=False)
 
         correction = int(self.correction_edit.text() or 0)
@@ -1002,10 +1062,7 @@ class MainWindow(QMainWindow):
                 self.preview_last_ocr_raw_text = ocr_raw_text
 
             if overlay_ts_ms is not None:
-                if int(ocr_frame_index) == anchor_frame_index:
-                    self.preview_last_overlay_video_time_ms = anchor_video_time_ms
-                else:
-                    self.preview_last_overlay_video_time_ms = confirmed_video_time_ms
+                self.preview_last_overlay_video_time_ms = anchor_video_time_ms
                 self.preview_last_overlay_ts = int(overlay_ts_ms)
 
             corrected_ts = overlay_ts_ms + correction if overlay_ts_ms is not None else None
@@ -1018,6 +1075,11 @@ class MainWindow(QMainWindow):
             event.ocr_frame_index = int(ocr_frame_index)
             event.confirmed_frame_index = confirmed_frame_index
             event.confirmed_video_time_ms = confirmed_video_time_ms
+            self._populate_event_label_window(
+                event,
+                start_ts=event.overlay_ts_ms,
+                start_video_time_ms=anchor_video_time_ms,
+            )
             self._on_analysis_event(event)
         if (
             self.preview_ocr_reset_interval > 0
@@ -1060,8 +1122,13 @@ class MainWindow(QMainWindow):
             allow_interpolation=True,
         )
         if fallback_overlay is not None:
+            adjusted_overlay = int(fallback_overlay)
+            delta_ms = int(fallback_video_time_ms) - int(anchor_video_time_ms)
+            if delta_ms > 0:
+                # Keep overlay timestamp anchored to event first-frame time.
+                adjusted_overlay = int(fallback_overlay) - int(delta_ms)
             return (
-                fallback_overlay,
+                adjusted_overlay,
                 fallback_status,
                 fallback_conf,
                 fallback_raw,
@@ -1499,6 +1566,8 @@ class MainWindow(QMainWindow):
             detector_confidence=self.preferences.detector_confidence,
             detector_iou=self.preferences.detector_iou,
             chunk_seconds=self.preferences.chunk_seconds,
+            enter_debounce_frames=int(self.enter_debounce_spin.value()),
+            exit_debounce_frames=int(self.exit_debounce_spin.value()),
         )
 
         self._set_events_edit_context(enabled=False)
@@ -1585,6 +1654,15 @@ class MainWindow(QMainWindow):
         self._refresh_action_states()
 
     def _event_text(self, event: EventRecord) -> str:
+        if str(event.event_type) == "label":
+            label_id = self._label_id_from_roi_id(event.roi_id)
+            corrected = event.corrected_ts_ms if event.corrected_ts_ms is not None else "-"
+            end_frame = self._event_end_frame(event)
+            return (
+                f"[label {label_id}] start={event.frame_index} end={end_frame} "
+                f"ts={corrected}"
+            )
+
         corrected = event.corrected_ts_ms if event.corrected_ts_ms is not None else "-"
         direction = event.direction_label if event.direction_label is not None else "-"
         confirmed_frame = (
@@ -1597,6 +1675,78 @@ class MainWindow(QMainWindow):
             f"dir={direction} ts={corrected} first={event.frame_index} confirmed={confirmed_frame} "
             f"all={event.visible_person_count} roi={event.roi_person_count}"
         )
+
+    @staticmethod
+    def _label_id_from_roi_id(roi_id: str) -> int:
+        text = str(roi_id or "").strip()
+        if text.isdigit():
+            return int(text)
+        if text.lower().startswith("roi_"):
+            tail = text.split("_", 1)[1].strip()
+            if tail.isdigit():
+                return int(tail)
+        return 0
+
+    @staticmethod
+    def _roi_id_from_label_id(label_id: int) -> str:
+        return "0" if int(label_id) <= 0 else f"roi_{int(label_id)}"
+
+    @staticmethod
+    def _to_kst_text(timestamp_ms: int | None) -> str | None:
+        if timestamp_ms is None:
+            return None
+        try:
+            dt = datetime.fromtimestamp(float(timestamp_ms) / 1000.0, tz=KST)
+        except Exception:
+            return None
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    def _event_end_frame(self, event: EventRecord) -> int:
+        if event.label_end_frame is not None:
+            return max(int(event.frame_index), int(event.label_end_frame))
+        end = int(event.frame_index) + 100
+        if self.total_frames > 0:
+            end = min(end, self.total_frames - 1)
+        return end
+
+    def _populate_event_label_window(
+        self,
+        event: EventRecord,
+        *,
+        start_ts: int | None,
+        start_video_time_ms: int,
+    ) -> None:
+        end_frame = self._event_end_frame(event)
+        event.label_end_frame = int(end_frame)
+        if event.label_end_timestamp_unix is not None:
+            return
+        if self.video_path is None:
+            return
+        end_video_time_ms = self._frame_to_video_time_ms(int(end_frame))
+        end_ts, _status, _conf, _raw_text = self._resolve_overlay_timestamp_for_frame(
+            frame_bgr=None,
+            frame_index=int(end_frame),
+            video_time_ms=int(end_video_time_ms),
+            last_valid_ts=self._to_int_opt(start_ts),
+            last_valid_video_time_ms=int(start_video_time_ms),
+            allow_interpolation=True,
+        )
+        if end_ts is not None:
+            event.label_end_timestamp_unix = int(end_ts)
+
+    def _event_to_label_payload(self, event: EventRecord) -> dict:
+        label_id = self._label_id_from_roi_id(event.roi_id)
+        start_ts = self._to_int_opt(event.overlay_ts_ms)
+        end_ts = self._to_int_opt(event.label_end_timestamp_unix)
+        return {
+            "label_id": int(label_id),
+            "start_frame": int(event.frame_index),
+            "end_frame": int(self._event_end_frame(event)),
+            "start_timestamp_unix": start_ts,
+            "start_timestamp_kst": self._to_kst_text(start_ts),
+            "end_timestamp_unix": end_ts,
+            "end_timestamp_kst": self._to_kst_text(end_ts),
+        }
 
     def _event_from_list_item(self, item: QListWidgetItem | None) -> tuple[int, EventRecord] | None:
         if item is None:
@@ -1750,6 +1900,16 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Manual Add", "Stop analysis before manual add.")
             return
 
+        selected_roi_item = self.roi_list.currentItem()
+        selected_roi_id = (
+            str(selected_roi_item.data(Qt.UserRole))
+            if selected_roi_item is not None and selected_roi_item.data(Qt.UserRole) is not None
+            else None
+        )
+        selected_label_id = (
+            self._label_id_from_roi_id(selected_roi_id) if selected_roi_id is not None else 0
+        )
+
         last_ts, last_video_ms = self._latest_valid_overlay_anchor()
         overlay, status, ocr_conf, ocr_raw_text = self._resolve_overlay_timestamp_for_frame(
             frame_bgr=self.current_frame_rotated,
@@ -1760,15 +1920,42 @@ class MainWindow(QMainWindow):
         )
         correction = int(self.correction_edit.text() or 0)
         corrected = overlay + correction if overlay is not None else None
+        start_frame = int(self.current_frame_index)
+
+        if selected_label_id > 0 and selected_roi_id is not None:
+            end_frame = start_frame + 100
+            if self.total_frames > 0:
+                end_frame = min(end_frame, self.total_frames - 1)
+            roi_id = selected_roi_id
+            selected_roi = self.rois.get(roi_id)
+        else:
+            max_frame = self.total_frames - 1 if self.total_frames > 0 else 2_000_000_000
+            default_end = start_frame + 100
+            if self.total_frames > 0:
+                default_end = min(default_end, max_frame)
+            roi_id = "0"
+            selected_roi = None
+            self._set_notice("ROI 미선택: label_id=0 수동 항목이 추가됩니다.")
+            end_frame, ok = QInputDialog.getInt(
+                self,
+                "Manual Add (label_id=0)",
+                "ROI 미선택 상태입니다. label_id=0으로 저장합니다.\nend_frame 값을 입력하세요.",
+                value=default_end,
+                minValue=start_frame,
+                maxValue=max_frame,
+            )
+            if not ok:
+                return
+
         manual_event = EventRecord(
             event_id=str(uuid.uuid4()),
             video_name=Path(self.video_path).name,
-            roi_id="1",
+            roi_id=roi_id,
             person_id=0,
-            event_type="enter",
+            event_type="label",
             direction_label=None,
-            frame_index=int(self.current_frame_index),
-            video_time_ms=int(self.current_video_time_ms),
+            frame_index=start_frame,
+            video_time_ms=self._frame_to_video_time_ms(start_frame),
             overlay_ts_ms=overlay,
             overlay_ts_status=status,
             correction_ms=correction,
@@ -1778,18 +1965,30 @@ class MainWindow(QMainWindow):
             ocr_raw_text=ocr_raw_text,
             visible_person_count=0,
             roi_person_count=0,
-            confirmed_frame_index=int(self.current_frame_index),
-            confirmed_video_time_ms=int(self.current_video_time_ms),
-            ocr_frame_index=int(self.current_frame_index),
+            confirmed_frame_index=start_frame,
+            confirmed_video_time_ms=self._frame_to_video_time_ms(start_frame),
+            ocr_frame_index=start_frame,
             rotation_deg=int(self.rotation_deg) % 360,
-            roi_x=0,
-            roi_y=0,
-            roi_w=0,
-            roi_h=0,
+            roi_x=(selected_roi.normalized().x if selected_roi is not None else None),
+            roi_y=(selected_roi.normalized().y if selected_roi is not None else None),
+            roi_w=(selected_roi.normalized().w if selected_roi is not None else None),
+            roi_h=(selected_roi.normalized().h if selected_roi is not None else None),
+            label_end_frame=int(end_frame),
+            label_end_timestamp_unix=None,
+        )
+        self._populate_event_label_window(
+            manual_event,
+            start_ts=manual_event.overlay_ts_ms,
+            start_video_time_ms=manual_event.video_time_ms,
         )
         self._append_event_to_ui(manual_event)
+        new_index = len(self.events) - 1
+        if new_index >= 0:
+            self.event_list.setCurrentRow(new_index)
         self._write_metadata()
-        self.status_label.setText("Manual event added with OCR timestamp")
+        self.status_label.setText(
+            f"Manual event added with OCR timestamp (end_frame={int(end_frame)})"
+        )
         self._refresh_action_states()
 
     def _edit_selected_event_json(self) -> None:
@@ -1815,7 +2014,13 @@ class MainWindow(QMainWindow):
         dialog.resize(780, 520)
         layout = QVBoxLayout(dialog)
         editor = QTextEdit()
-        editor.setPlainText(json.dumps(self.events[index].to_dict(), ensure_ascii=False, indent=2))
+        editor.setPlainText(
+            json.dumps(
+                self._event_to_label_payload(self.events[index]),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         layout.addWidget(editor)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         layout.addWidget(buttons)
@@ -1838,7 +2043,72 @@ class MainWindow(QMainWindow):
                     "이벤트 JSON은 객체(object) 형태여야 합니다.",
                 )
                 return
-            updated = self._event_from_mapping(parsed)
+            required = ("label_id", "start_frame", "end_frame")
+            missing = [key for key in required if key not in parsed]
+            if missing:
+                QMessageBox.warning(
+                    dialog,
+                    "Invalid JSON",
+                    f"필수 필드 누락: {', '.join(missing)}",
+                )
+                return
+
+            label_id = self._to_int(parsed.get("label_id"), 0)
+            start_frame = self._to_int(parsed.get("start_frame"), 0)
+            end_frame = self._to_int(parsed.get("end_frame"), start_frame)
+            if end_frame < start_frame:
+                QMessageBox.warning(
+                    dialog,
+                    "Invalid JSON",
+                    "end_frame은 start_frame 이상이어야 합니다.",
+                )
+                return
+            if self.total_frames > 0:
+                max_frame = self.total_frames - 1
+                start_frame = max(0, min(start_frame, max_frame))
+                end_frame = max(start_frame, min(end_frame, max_frame))
+
+            start_ts = self._to_int_opt(parsed.get("start_timestamp_unix"))
+            end_ts = self._to_int_opt(parsed.get("end_timestamp_unix"))
+            correction = int(self.correction_edit.text() or 0)
+
+            updated = self.events[index]
+            roi_id = self._roi_id_from_label_id(label_id)
+            updated.roi_id = roi_id
+            updated.event_type = "label"
+            updated.person_id = 0
+            updated.direction_label = None
+            updated.frame_index = int(start_frame)
+            updated.video_time_ms = self._frame_to_video_time_ms(start_frame)
+            updated.overlay_ts_ms = start_ts
+            updated.overlay_ts_status = (
+                OverlayTSStatus.OK if start_ts is not None else OverlayTSStatus.FAILED
+            )
+            updated.correction_ms = correction
+            updated.corrected_ts_ms = (
+                int(start_ts) + correction if start_ts is not None else None
+            )
+            updated.ocr_conf = None
+            updated.ocr_raw_text = str(start_ts) if start_ts is not None else ""
+            updated.confirmed_frame_index = int(start_frame)
+            updated.confirmed_video_time_ms = self._frame_to_video_time_ms(start_frame)
+            updated.ocr_frame_index = int(start_frame)
+            updated.label_end_frame = int(end_frame)
+            updated.label_end_timestamp_unix = end_ts
+
+            roi = self.rois.get(roi_id)
+            if roi is not None:
+                n = roi.normalized()
+                updated.roi_x = n.x
+                updated.roi_y = n.y
+                updated.roi_w = n.w
+                updated.roi_h = n.h
+            else:
+                updated.roi_x = None
+                updated.roi_y = None
+                updated.roi_w = None
+                updated.roi_h = None
+
             if self._can_manage_events():
                 self._push_undo_snapshot()
             self.events[index] = updated
@@ -1857,7 +2127,11 @@ class MainWindow(QMainWindow):
     def _event_from_primary_label(self, row: dict, *, video_name: str) -> EventRecord:
         label_id = self._to_int(row.get("label_id"), 0)
         frame_index = self._to_int(row.get("start_frame"), 0)
+        end_frame = self._to_int(row.get("end_frame"), frame_index)
+        if end_frame < frame_index:
+            end_frame = frame_index
         start_ts = self._to_int_opt(row.get("start_timestamp_unix"))
+        end_ts = self._to_int_opt(row.get("end_timestamp_unix"))
         status = OverlayTSStatus.OK if start_ts is not None else OverlayTSStatus.FAILED
         return EventRecord(
             event_id=str(uuid.uuid4()),
@@ -1885,6 +2159,8 @@ class MainWindow(QMainWindow):
             roi_y=None,
             roi_w=None,
             roi_h=None,
+            label_end_frame=end_frame,
+            label_end_timestamp_unix=end_ts,
         )
 
     def _read_events_from_metadata_file(
@@ -1963,7 +2239,7 @@ class MainWindow(QMainWindow):
             return
 
     def _delete_selected_event(self) -> None:
-        if not self._can_manage_events():
+        if self.analysis_worker is not None:
             return
         item = self.event_list.currentItem()
         if item is None:
@@ -1978,7 +2254,8 @@ class MainWindow(QMainWindow):
         if index < 0 or index >= len(self.events):
             return
 
-        self._push_undo_snapshot()
+        if self._can_manage_events():
+            self._push_undo_snapshot()
         self.events.pop(index)
         self._rebuild_event_list(preferred_index=index)
         self._write_metadata()
@@ -2091,7 +2368,12 @@ class MainWindow(QMainWindow):
 
         self._write_metadata()
 
-    def _write_metadata(self, target_dir: Path | None = None) -> None:
+    def _write_metadata(
+        self,
+        target_dir: Path | None = None,
+        *,
+        resolve_missing_timestamps: bool = False,
+    ) -> None:
         video_path = self.metadata_video_path or self.video_path
         if not video_path:
             return
@@ -2114,6 +2396,7 @@ class MainWindow(QMainWindow):
             events=self.events,
             session=session,
             max_frame_index=max_frame_index,
+            resolve_missing_timestamps=bool(resolve_missing_timestamps),
         )
 
         if target_dir is None:
@@ -2232,6 +2515,8 @@ class MainWindow(QMainWindow):
             roi_y=self._to_int_opt(row.get("roi_y")),
             roi_w=self._to_int_opt(row.get("roi_w")),
             roi_h=self._to_int_opt(row.get("roi_h")),
+            label_end_frame=self._to_int_opt(row.get("label_end_frame")),
+            label_end_timestamp_unix=self._to_int_opt(row.get("label_end_timestamp_unix")),
         )
 
     def _refresh_next_roi_num(self) -> None:
@@ -2428,6 +2713,8 @@ class MainWindow(QMainWindow):
         self.full_checkbox.setChecked(config.analyze_full)
         self.start_ms_spin.setValue(config.start_ms)
         self.duration_ms_spin.setValue(config.duration_ms or self.duration_ms_spin.value())
+        self.enter_debounce_spin.setValue(max(1, int(config.enter_debounce_frames)))
+        self.exit_debounce_spin.setValue(max(1, int(config.exit_debounce_frames)))
         self.correction_edit.setText(str(config.timestamp_correction_ms))
         self._apply_scene_context(
             rotation_deg=config.rotation_deg,
@@ -2458,6 +2745,8 @@ class MainWindow(QMainWindow):
             duration_ms=None if self.full_checkbox.isChecked() else int(self.duration_ms_spin.value()),
             timestamp_correction_ms=int(self.correction_edit.text() or 0),
             ocr_manual_roi=self.ocr_manual_roi,
+            enter_debounce_frames=int(self.enter_debounce_spin.value()),
+            exit_debounce_frames=int(self.exit_debounce_spin.value()),
         )
 
     def _refresh_recent_menu(self) -> None:

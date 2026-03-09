@@ -119,3 +119,20 @@ def test_store_save_all_writes_primary_and_debug(monkeypatch, tmp_path: Path) ->
     assert debug_payload["version"] == 1
     assert isinstance(debug_payload["events"], list)
     assert len(debug_payload["events"]) == 2
+
+
+def test_manual_label_zero_with_end_frame_is_preserved() -> None:
+    manual = _event("manual", "0", 123, 1772526273123)
+    manual.event_type = "label"
+    manual.label_end_frame = 222
+    manual.label_end_timestamp_unix = 1772526273999
+
+    resolver = _FakeResolver()
+    labels = build_label_records([manual], resolver=resolver, max_frame_index=999)
+    assert len(labels) == 1
+    row = labels[0].to_dict()
+    assert row["label_id"] == 0
+    assert row["start_frame"] == 123
+    assert row["end_frame"] == 222
+    assert row["start_timestamp_unix"] == 1772526273123
+    assert row["end_timestamp_unix"] == 1772526273999

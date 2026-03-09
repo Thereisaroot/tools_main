@@ -200,6 +200,11 @@ class VideoStream:
         chunk_seconds: int,
         on_chunk: Callable[[int, int], None] | None,
     ) -> Iterator[FramePacket]:
+        reopen_every_chunks = max(
+            0,
+            int(os.getenv("ISAC_CV2_REOPEN_EVERY_CHUNKS", "0")),
+        )
+
         def open_cap() -> cv2.VideoCapture:
             c = cv2.VideoCapture(str(self.video_path))
             if not c.isOpened():
@@ -240,15 +245,20 @@ class VideoStream:
                 rotated = rotate_bgr(image, rotation_deg)
                 yield FramePacket(frame_index=frame_index, time_ms=time_ms, image_bgr=rotated)
 
-                if on_chunk and (time_ms - last_chunk_tick) >= chunk_ms:
-                    # Periodically refresh VideoCapture to avoid long-run decoder memory growth.
+                if (time_ms - last_chunk_tick) >= chunk_ms:
                     next_frame_pos = int(current_frame_index)
                     chunk_idx += 1
                     last_chunk_tick = time_ms
-                    on_chunk(chunk_idx, time_ms)
-                    cap.release()
-                    cap = open_cap()
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, float(max(0, next_frame_pos)))
-                    current_frame_index = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or next_frame_pos)
+                    if on_chunk is not None:
+                        on_chunk(chunk_idx, time_ms)
+                    # Keep capture reopen opt-in. Repeated open/close can increase
+                    # process footprint on some macOS backends.
+                    if reopen_every_chunks > 0 and (chunk_idx % reopen_every_chunks == 0):
+                        cap.release()
+                        cap = open_cap()
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, float(max(0, next_frame_pos)))
+                        current_frame_index = int(
+                            cap.get(cv2.CAP_PROP_POS_FRAMES) or next_frame_pos
+                        )
         finally:
             cap.release()

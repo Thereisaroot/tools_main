@@ -215,6 +215,15 @@ class OnnxYoloPersonDetector:
             )
         return detections
 
+    def close(self) -> None:
+        # Release runtime objects explicitly to reduce long-run footprint growth.
+        self._input_buffer = None
+        self.input_name = ""
+        self.output_name = ""
+        self.providers = []
+        self.session = None
+        self.net = None
+
     def _decode(self, output: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
         Supports common YOLO ONNX outputs:
