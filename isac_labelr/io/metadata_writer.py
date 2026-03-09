@@ -8,14 +8,14 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
-from zoneinfo import ZoneInfo
 
 import cv2
 
 from isac_labelr.models import EventRecord, ROI
+from isac_labelr.timezone_utils import get_kst_tz
 from isac_labelr.vision.ocr import TimestampOCR
 
-KST = ZoneInfo("Asia/Seoul")
+KST = get_kst_tz()
 ROI_ID_DIGITS = re.compile(r"(\d+)$")
 
 

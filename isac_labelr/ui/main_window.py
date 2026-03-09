@@ -8,7 +8,6 @@ from datetime import datetime
 from collections import OrderedDict
 from pathlib import Path
 import uuid
-from zoneinfo import ZoneInfo
 
 import cv2
 from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
@@ -60,6 +59,7 @@ from isac_labelr.models import (
     Vector2,
 )
 from isac_labelr.monitor.memory import get_memory_snapshot
+from isac_labelr.timezone_utils import get_kst_tz
 from isac_labelr.settings import (
     load_preferences,
     load_recent_videos,
@@ -75,7 +75,7 @@ from isac_labelr.vision.detector import (
 from isac_labelr.vision.ocr import TimestampOCR
 from isac_labelr.vision.tracker import ByteTrackLite
 
-KST = ZoneInfo("Asia/Seoul")
+KST = get_kst_tz()
 
 
 class PreferencesDialog(QDialog):
