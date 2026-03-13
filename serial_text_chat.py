@@ -30,6 +30,7 @@ OBFUSCATION_MARKERS = "ABC"
 FILE_CHUNK_SIZE = 1024
 HIGH_SPEED_FRAME_DELAY_SECONDS = 0.002
 HIGH_SPEED_BAUD_THRESHOLD = 460800
+FILE_ACK_TIMEOUT_SECONDS = 5.0
 RECEIVED_FILES_DIR = Path(__file__).resolve().parent / "received_files"
 BAUD_RATE_OPTIONS = [
     "9600",
@@ -124,6 +125,7 @@ class ReceiveFileState:
     expected_size: int
     file_handle: BinaryIO
     received_size: int = 0
+    next_chunk_index: int = 0
 
 
 class SerialChatApp:
@@ -137,6 +139,7 @@ class SerialChatApp:
         self.file_send_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.ui_events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.transfer_ack_queue: queue.Queue[tuple[str, list[str]]] = queue.Queue()
         self.receive_buffer = bytearray()
         self.receive_transfers: dict[str, ReceiveFileState] = {}
         self.last_received_raw = ""
@@ -443,6 +446,10 @@ class SerialChatApp:
 
         command, parts = control_message
 
+        if command in {"ACK_START", "ACK_CHUNK", "ACK_END"}:
+            self.transfer_ack_queue.put((command, parts))
+            return
+
         try:
             if command == "START":
                 self.handle_file_start(parts)
@@ -475,16 +482,21 @@ class SerialChatApp:
             expected_size=expected_size,
             file_handle=file_handle,
         )
+        self.send_control_message("ACK_START", transfer_id)
         self.ui_events.put(("log", f"[receiving file] {filename} ({expected_size} bytes)"))
 
     def handle_file_chunk(self, parts: list[str]) -> None:
-        if len(parts) != 2:
+        if len(parts) != 3:
             raise ValueError("FILE CHUNK message is malformed.")
 
-        transfer_id, chunk_b64 = parts
+        transfer_id, chunk_index_text, chunk_b64 = parts
         state = self.receive_transfers.get(transfer_id)
         if state is None:
             raise ValueError("Received a file chunk without a matching transfer.")
+
+        chunk_index = int(chunk_index_text)
+        if chunk_index != state.next_chunk_index:
+            raise ValueError(f"Unexpected file chunk index: expected {state.next_chunk_index}, got {chunk_index}.")
 
         try:
             chunk = base64.urlsafe_b64decode(chunk_b64.encode("ascii"))
@@ -493,6 +505,8 @@ class SerialChatApp:
 
         state.file_handle.write(chunk)
         state.received_size += len(chunk)
+        state.next_chunk_index += 1
+        self.send_control_message("ACK_CHUNK", transfer_id, str(chunk_index))
 
     def handle_file_end(self, parts: list[str]) -> None:
         if len(parts) != 1:
@@ -511,6 +525,7 @@ class SerialChatApp:
             )
             return
 
+        self.send_control_message("ACK_END", transfer_id)
         self.ui_events.put(("log", f"[received file] {state.original_name} -> {state.path}"))
 
     def handle_file_abort(self, parts: list[str]) -> None:
@@ -699,8 +714,10 @@ class SerialChatApp:
 
         try:
             self.send_control_message("START", transfer_id, encode_control_text(path.name), str(file_size))
+            self.wait_for_file_ack("ACK_START", transfer_id)
 
             with path.open("rb") as file_handle:
+                chunk_index = 0
                 while True:
                     if self.stop_event.is_set():
                         raise RuntimeError("Connection closed.")
@@ -710,9 +727,12 @@ class SerialChatApp:
                         break
 
                     chunk_b64 = base64.urlsafe_b64encode(chunk).decode("ascii")
-                    self.send_control_message("CHUNK", transfer_id, chunk_b64)
+                    self.send_control_message("CHUNK", transfer_id, str(chunk_index), chunk_b64)
+                    self.wait_for_file_ack("ACK_CHUNK", transfer_id, str(chunk_index))
+                    chunk_index += 1
 
             self.send_control_message("END", transfer_id)
+            self.wait_for_file_ack("ACK_END", transfer_id)
             self.ui_events.put(("log", f"[sent file] {path.name}"))
         except Exception as exc:
             try:
@@ -723,6 +743,31 @@ class SerialChatApp:
 
     def send_control_message(self, command: str, *parts: str) -> None:
         self.send_serial_text(build_control_message(command, *parts))
+
+    def wait_for_file_ack(self, expected_command: str, transfer_id: str, expected_value: str | None = None) -> None:
+        deadline = time.monotonic() + FILE_ACK_TIMEOUT_SECONDS
+
+        while True:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise TimeoutError(f"Timed out waiting for {expected_command}.")
+
+            try:
+                command, parts = self.transfer_ack_queue.get(timeout=timeout)
+            except queue.Empty as exc:
+                raise TimeoutError(f"Timed out waiting for {expected_command}.") from exc
+
+            if command != expected_command:
+                continue
+
+            if not parts or parts[0] != transfer_id:
+                continue
+
+            if expected_value is not None:
+                if len(parts) < 2 or parts[1] != expected_value:
+                    continue
+
+            return
 
     def bind_editor_shortcuts(self) -> None:
         control_shortcuts = {

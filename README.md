@@ -102,6 +102,7 @@ sudo usermod -a -G dialout "$USER"
 
 - Messages are framed with a `NUL` terminator so the full body can be received as one unit.
 - File transfers are sent as chunked control frames over the same serial link.
+- File transfers now wait for per-chunk acknowledgements, so they are slower but more reliable across mixed macOS/Windows links.
 - You can type a port manually if it does not appear in the list.
 - `loop://` also works for a local self-test on one machine.
 - Plain messages send only the original body. Encoded messages send only the obfuscated body.
