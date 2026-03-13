@@ -133,12 +133,13 @@ class SerialChatApp:
         text_frame = ttk.Frame(input_frame)
         text_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-        self.message_text = tk.Text(text_frame, wrap="word", height=10)
+        self.message_text = tk.Text(text_frame, wrap="word", height=10, undo=True, autoseparators=True, maxundo=-1)
         self.message_text.pack(side="left", fill="both", expand=True)
 
         input_scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.message_text.yview)
         input_scrollbar.pack(side="right", fill="y")
         self.message_text.configure(yscrollcommand=input_scrollbar.set)
+        self.bind_editor_shortcuts()
         self.message_text.bind("<Control-Return>", self.send_plain_shortcut)
         self.message_text.bind("<Control-Shift-Return>", self.send_encoded_shortcut)
 
@@ -327,6 +328,139 @@ class SerialChatApp:
         self.append_log(payload)
         self.message_text.delete("1.0", "end")
         self.message_text.focus_set()
+
+    def bind_editor_shortcuts(self) -> None:
+        shortcuts = {
+            "<Command-a>": self.select_all_message,
+            "<Command-A>": self.select_all_message,
+            "<Control-a>": self.select_all_message,
+            "<Control-A>": self.select_all_message,
+            "<Command-c>": self.copy_message_selection,
+            "<Command-C>": self.copy_message_selection,
+            "<Control-c>": self.copy_message_selection,
+            "<Control-C>": self.copy_message_selection,
+            "<Command-x>": self.cut_message_selection,
+            "<Command-X>": self.cut_message_selection,
+            "<Control-x>": self.cut_message_selection,
+            "<Control-X>": self.cut_message_selection,
+            "<Command-v>": self.paste_into_message,
+            "<Command-V>": self.paste_into_message,
+            "<Control-v>": self.paste_into_message,
+            "<Control-V>": self.paste_into_message,
+            "<Shift-Insert>": self.paste_into_message,
+            "<Command-z>": self.undo_message_edit,
+            "<Command-Z>": self.redo_message_edit,
+            "<Control-z>": self.undo_message_edit,
+            "<Control-Z>": self.redo_message_edit,
+            "<Command-y>": self.redo_message_edit,
+            "<Command-Y>": self.redo_message_edit,
+            "<Control-y>": self.redo_message_edit,
+            "<Control-Y>": self.redo_message_edit,
+        }
+
+        for sequence, handler in shortcuts.items():
+            self.message_text.bind(sequence, handler)
+            self.root.bind_all(sequence, handler, add="+")
+
+    def message_editor_has_focus(self) -> bool:
+        return self.root.focus_get() is self.message_text
+
+    def select_all_message(self, event: tk.Event) -> str | None:
+        del event
+
+        if not self.message_editor_has_focus():
+            return None
+
+        self.message_text.tag_add("sel", "1.0", "end-1c")
+        self.message_text.mark_set("insert", "1.0")
+        self.message_text.see("insert")
+        return "break"
+
+    def copy_message_selection(self, event: tk.Event) -> str | None:
+        del event
+
+        if not self.message_editor_has_focus():
+            return None
+
+        try:
+            text = self.message_text.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+
+        self.copy_text(text)
+        return "break"
+
+    def cut_message_selection(self, event: tk.Event) -> str | None:
+        del event
+
+        if not self.message_editor_has_focus():
+            return None
+
+        try:
+            text = self.message_text.get("sel.first", "sel.last")
+            self.message_text.delete("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+
+        self.copy_text(text)
+        return "break"
+
+    def paste_into_message(self, event: tk.Event) -> str | None:
+        del event
+
+        if not self.message_editor_has_focus():
+            return None
+
+        try:
+            clipboard_text = self.get_clipboard_text()
+        except tk.TclError:
+            return "break"
+
+        try:
+            self.message_text.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+
+        self.message_text.edit_separator()
+        self.message_text.insert("insert", clipboard_text)
+        self.message_text.see("insert")
+        self.message_text.edit_separator()
+        return "break"
+
+    def undo_message_edit(self, event: tk.Event) -> str | None:
+        del event
+
+        if not self.message_editor_has_focus():
+            return None
+
+        try:
+            self.message_text.edit_undo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def redo_message_edit(self, event: tk.Event) -> str | None:
+        del event
+
+        if not self.message_editor_has_focus():
+            return None
+
+        try:
+            self.message_text.edit_redo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def get_clipboard_text(self) -> str:
+        try:
+            return self.root.clipboard_get(type="UTF8_STRING")
+        except (tk.TclError, TypeError):
+            pass
+
+        try:
+            return self.root.clipboard_get()
+        except tk.TclError:
+            return self.root.selection_get(selection="CLIPBOARD")
 
     def copy_last_received(self) -> None:
         if not self.last_received_raw:
