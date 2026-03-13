@@ -5,8 +5,11 @@ Simple desktop chat for two machines connected through a null modem serial cable
 ## Features
 
 - Connect to a serial port with a selectable baud rate
-- Send and receive UTF-8 text messages
-- Show a local chat log with timestamps
+- Send and receive multiline UTF-8 text messages
+- Use a tall editor-style input box with its own scrollbar
+- Send plain text or obfuscated text without JSON or sender metadata
+- Copy the last received raw data or the decoded version to the clipboard
+- Show the raw sent and received data in the log
 - Refresh the available serial port list
 
 ## Requirements
@@ -50,9 +53,18 @@ run_serial_text_chat.bat
 1. Connect the two machines with a null modem serial cable.
 2. Start the program on both machines.
 3. Select the correct serial port on each machine.
-4. Set the same baud rate on both PCs.
+4. Set the same baud rate on both machines.
 5. Click `Connect`.
-6. Type a message and press `Enter` or `Send`.
+6. Type your message in the large input box.
+7. Click `Send Plain` to transmit the message body as-is.
+8. Click `Send Encoded` to transmit the message body after custom base64-plus-marker obfuscation.
+9. Use `Copy to Clipboard` to copy the last received raw data.
+10. Use `Copy to Clipboard After Decode` to decode the last received data and copy the result.
+
+Keyboard shortcuts:
+
+- `Ctrl+Enter`: send plain
+- `Ctrl+Shift+Enter`: send encoded
 
 ## Port examples
 
@@ -83,7 +95,9 @@ sudo usermod -a -G dialout "$USER"
 
 ## Notes
 
-- Messages are sent one line at a time.
+- Messages are framed with a `NUL` terminator so the full body can be received as one unit.
 - You can type a port manually if it does not appear in the list.
 - `loop://` also works for a local self-test on one machine.
+- Plain messages send only the original body. Encoded messages send only the obfuscated body.
+- Encoded messages insert `A`, `B`, `C` markers after each 4-character base64 block.
 - This is a v1 text-only build. File transfer and binary packet support are not included yet.
