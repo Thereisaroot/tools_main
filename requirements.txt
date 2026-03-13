@@ -1,1 +1,2 @@
 pyserial>=3.5,<4.0
+tkinterdnd2>=0.4.2,<0.5
