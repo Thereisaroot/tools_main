@@ -21,6 +21,7 @@ pip-wheel-metadata/
 # Tool caches
 .pytest_cache/
 .mypy_cache/
+received_files/
 
 # Editor settings
 .idea/

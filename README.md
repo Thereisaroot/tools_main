@@ -107,4 +107,5 @@ sudo usermod -a -G dialout "$USER"
 - Plain messages send only the original body. Encoded messages send only the obfuscated body.
 - Encoded messages insert `A`, `B`, `C` markers after each 4-character base64 block.
 - Received files are saved under `received_files/` next to the program.
-- Common higher baud rates like `230400`, `460800`, and `921600` are listed, and you can type other values manually.
+- Common higher baud rates like `230400`, `460800`, `921600`, and `1000000` are listed, and you can type other values manually.
+- If one direction starts corrupting at very high baud rates, try `460800` or `921600` first. This build adds a small send delay above `460800` to improve stability.

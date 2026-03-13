@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import binascii
 import queue
+import sys
 import threading
+import time
 import tkinter as tk
 import uuid
 from dataclasses import dataclass
@@ -25,7 +27,9 @@ MESSAGE_TERMINATOR = b"\0"
 CONTROL_PREFIX = "\x1eSTCFILE"
 CONTROL_SEPARATOR = "\x1f"
 OBFUSCATION_MARKERS = "ABC"
-FILE_CHUNK_SIZE = 3072
+FILE_CHUNK_SIZE = 1024
+HIGH_SPEED_FRAME_DELAY_SECONDS = 0.002
+HIGH_SPEED_BAUD_THRESHOLD = 460800
 RECEIVED_FILES_DIR = Path(__file__).resolve().parent / "received_files"
 BAUD_RATE_OPTIONS = [
     "9600",
@@ -36,6 +40,9 @@ BAUD_RATE_OPTIONS = [
     "230400",
     "460800",
     "921600",
+    "1000000",
+    "1500000",
+    "2000000",
 ]
 
 
@@ -283,10 +290,13 @@ class SerialChatApp:
             self.drop_zone.configure(text="Drag and drop unavailable. Install tkinterdnd2 or use Select Files.")
             return
 
-        self.drop_zone.drop_target_register(DND_FILES)
-        self.drop_zone.dnd_bind("<<Drop>>", self.handle_file_drop)
-        self.drop_zone.dnd_bind("<<DragEnter>>", self.handle_drag_enter)
-        self.drop_zone.dnd_bind("<<DragLeave>>", self.handle_drag_leave)
+        try:
+            self.drop_zone.drop_target_register(DND_FILES)
+            self.drop_zone.dnd_bind("<<Drop>>", self.handle_file_drop)
+            self.drop_zone.dnd_bind("<<DragEnter>>", self.handle_drag_enter)
+            self.drop_zone.dnd_bind("<<DragLeave>>", self.handle_drag_leave)
+        except tk.TclError:
+            self.drop_zone.configure(text="Drag and drop unavailable in this Tk build. Use Select Files.")
 
     def refresh_ports(self) -> None:
         ports = [port.device for port in list_ports.comports()]
@@ -614,6 +624,9 @@ class SerialChatApp:
             port.write(payload)
             port.flush()
 
+        if self.connected_baudrate >= HIGH_SPEED_BAUD_THRESHOLD:
+            time.sleep(HIGH_SPEED_FRAME_DELAY_SECONDS)
+
     def select_files_for_send(self) -> None:
         file_paths = filedialog.askopenfilenames(parent=self.root, title="Select files to send")
         if not file_paths:
@@ -712,37 +725,43 @@ class SerialChatApp:
         self.send_serial_text(build_control_message(command, *parts))
 
     def bind_editor_shortcuts(self) -> None:
-        shortcuts = {
-            "<Command-a>": self.select_all_message,
-            "<Command-A>": self.select_all_message,
+        control_shortcuts = {
             "<Control-a>": self.select_all_message,
             "<Control-A>": self.select_all_message,
-            "<Command-c>": self.copy_message_selection,
-            "<Command-C>": self.copy_message_selection,
             "<Control-c>": self.copy_message_selection,
             "<Control-C>": self.copy_message_selection,
-            "<Command-x>": self.cut_message_selection,
-            "<Command-X>": self.cut_message_selection,
             "<Control-x>": self.cut_message_selection,
             "<Control-X>": self.cut_message_selection,
-            "<Command-v>": self.paste_into_message,
-            "<Command-V>": self.paste_into_message,
             "<Control-v>": self.paste_into_message,
             "<Control-V>": self.paste_into_message,
             "<Shift-Insert>": self.paste_into_message,
-            "<Command-z>": self.undo_message_edit,
-            "<Command-Z>": self.redo_message_edit,
             "<Control-z>": self.undo_message_edit,
             "<Control-Z>": self.redo_message_edit,
-            "<Command-y>": self.redo_message_edit,
-            "<Command-Y>": self.redo_message_edit,
             "<Control-y>": self.redo_message_edit,
             "<Control-Y>": self.redo_message_edit,
         }
+        command_shortcuts = {
+            "<Command-a>": self.select_all_message,
+            "<Command-A>": self.select_all_message,
+            "<Command-c>": self.copy_message_selection,
+            "<Command-C>": self.copy_message_selection,
+            "<Command-x>": self.cut_message_selection,
+            "<Command-X>": self.cut_message_selection,
+            "<Command-v>": self.paste_into_message,
+            "<Command-V>": self.paste_into_message,
+            "<Command-z>": self.undo_message_edit,
+            "<Command-Z>": self.redo_message_edit,
+            "<Command-y>": self.redo_message_edit,
+            "<Command-Y>": self.redo_message_edit,
+        }
 
-        for sequence, handler in shortcuts.items():
+        for sequence, handler in control_shortcuts.items():
             self.message_text.bind(sequence, handler)
-            self.root.bind_all(sequence, handler, add="+")
+
+        if sys.platform == "darwin":
+            for sequence, handler in command_shortcuts.items():
+                self.message_text.bind(sequence, handler)
+                self.root.bind_all(sequence, handler, add="+")
 
     def message_editor_has_focus(self) -> bool:
         return self.root.focus_get() is self.message_text
