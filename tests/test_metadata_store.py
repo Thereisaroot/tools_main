@@ -52,6 +52,54 @@ class _FakeResolver:
         return
 
 
+def test_frame_timestamp_resolver_uses_only_requested_frame(monkeypatch, tmp_path: Path) -> None:
+    class FakeOCR:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, bool]] = []
+
+        def set_manual_roi(self, _roi) -> None:
+            return
+
+        def _extract_timestamp_for_video_frame(self, *, video_path: str, frame_index: int, rotation_deg: int, fast: bool):
+            self.calls.append((int(frame_index), bool(fast)))
+            return type(
+                "FakeResult",
+                (),
+                {
+                    "timestamp_ms": None,
+                    "raw_text": "",
+                    "confidence": 0.0,
+                },
+            )()
+
+        def is_valid_timestamp(self, value) -> bool:
+            return value is not None and str(value).startswith("177") and len(str(value)) == 13
+
+        def extract_timestamp_candidates(self, raw_text: str) -> list[int]:
+            return []
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr(metadata_writer, "TimestampOCR", FakeOCR)
+    monkeypatch.setattr(metadata_writer.FrameTimestampResolver, "_read_fps", staticmethod(lambda _path: 30.0))
+
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"")
+
+    resolver = metadata_writer.FrameTimestampResolver(
+        video_path=str(video_path),
+        rotation_deg=0,
+        ocr_manual_roi=None,
+    )
+    try:
+        resolved = resolver.resolve(124)
+        assert resolved is None
+        assert resolver.ocr.calls == [(124, True), (124, False)]
+    finally:
+        resolver.close()
+
+
 def test_build_labels_creates_non_overlapping_zero_gap() -> None:
     events = [
         _event("e1", "roi_1", 10, 1772526273000),
@@ -90,6 +138,13 @@ def test_store_save_all_writes_primary_and_debug(monkeypatch, tmp_path: Path) ->
             self.rotation_deg = rotation_deg
             self.ocr_manual_roi = ocr_manual_roi
 
+        def resolve_exact(self, frame_index: int):
+            return metadata_writer.FrameTimestampPick(
+                timestamp_ms=1770000000000 + int(frame_index),
+                confidence=0.95,
+                raw_text=str(1770000000000 + int(frame_index)),
+            )
+
     monkeypatch.setattr(metadata_writer, "FrameTimestampResolver", FakeFrameTimestampResolver)
 
     video_path = tmp_path / "sample.mp4"
@@ -121,6 +176,11 @@ def test_store_save_all_writes_primary_and_debug(monkeypatch, tmp_path: Path) ->
     assert debug_payload["version"] == 1
     assert isinstance(debug_payload["events"], list)
     assert len(debug_payload["events"]) == 2
+    assert debug_payload["events"][0]["overlay_ts_ms"] == 1770000000100
+    assert debug_payload["events"][0]["ocr_frame_index"] == 100
+    assert debug_payload["events"][0]["label_end_timestamp_unix"] == 1770000000200
+    assert debug_payload["events"][1]["overlay_ts_ms"] == 1770000000300
+    assert debug_payload["events"][1]["label_end_timestamp_unix"] == 1770000000400
 
 
 def test_manual_label_zero_with_end_frame_is_preserved() -> None:

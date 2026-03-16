@@ -33,6 +33,7 @@ class AppCommand(Enum):
     MANUAL_OCR_ROI = "manual_ocr_roi"
     SET_CORRECTION_MS = "set_correction_ms"
     RERUN_OCR_SELECTED_EVENT = "rerun_ocr_selected_event"
+    RERUN_OCR_ALL_EVENTS = "rerun_ocr_all_events"
 
     RESET_LAYOUT = "reset_layout"
 
@@ -101,6 +102,10 @@ def build_menu_action_map() -> MenuActionMap:
                 AppCommand.RERUN_OCR_SELECTED_EVENT,
                 "Re-run OCR on Selected Event",
                 "Ctrl+R",
+            ),
+            MenuActionSpec(
+                AppCommand.RERUN_OCR_ALL_EVENTS,
+                "Re-run OCR on All Events",
             ),
         ],
         "Window": [

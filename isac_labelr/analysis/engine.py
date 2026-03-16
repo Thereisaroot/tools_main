@@ -94,11 +94,6 @@ class AnalysisEngine:
             0,
             int(os.getenv("ISAC_OCR_RESET_INTERVAL", "20")),
         )
-        ocr_sample_frames = max(
-            1,
-            int(os.getenv("ISAC_OCR_SAMPLE_FRAMES", "1")),
-        )
-
         detector = OnnxYoloPersonDetector(detector_cfg)
         if detector.backend == "onnxruntime" and detector.providers:
             logger.info("detector_provider providers=%s", ",".join(detector.providers))
@@ -115,8 +110,6 @@ class AnalysisEngine:
                 )
             detector_reset_interval = 0
         tracker = ByteTrackLite(iou_threshold=request.detector_iou)
-        ocr = TimestampOCR()
-        ocr.set_manual_roi(request.ocr_manual_roi)
 
         processed_events = 0
         ocr_uses = 0
@@ -199,8 +192,6 @@ class AnalysisEngine:
 
                 if events:
                     for event in events:
-                        anchor_frame_index = int(event.frame_index)
-                        anchor_video_time_ms = int(event.video_time_ms)
                         confirmed_frame_index = int(
                             event.confirmed_frame_index
                             if event.confirmed_frame_index is not None
@@ -211,80 +202,20 @@ class AnalysisEngine:
                             if event.confirmed_video_time_ms is not None
                             else packet.time_ms
                         )
-
-                        can_sample = (
-                            ocr_sample_frames > 1
-                            and self._last_overlay_ts is not None
-                            and self._last_overlay_video_time_ms is not None
-                            and self._last_ocr_frame_index is not None
-                            and anchor_frame_index >= self._last_ocr_frame_index
-                            and (anchor_frame_index - self._last_ocr_frame_index) < ocr_sample_frames
-                        )
-                        if can_sample:
-                            delta = max(
-                                0,
-                                int(anchor_video_time_ms) - int(self._last_overlay_video_time_ms),
-                            )
-                            overlay_ts_ms = int(self._last_overlay_ts) + delta
-                            overlay_status = OverlayTSStatus.INTERPOLATED_PREV
-                            ocr_conf = None
-                            ocr_raw_text = self._last_overlay_raw_text
-                            ocr_frame_index = anchor_frame_index
-                            self._last_overlay_ts = overlay_ts_ms
-                            self._last_overlay_video_time_ms = anchor_video_time_ms
-                        else:
-                            anchor_frame_bgr = frame_cache.get(anchor_frame_index)
-                            confirmed_frame_bgr = (
-                                packet.image_bgr
-                                if confirmed_frame_index == int(packet.frame_index)
-                                else frame_cache.get(confirmed_frame_index)
-                            )
-                            (
-                                overlay_ts_ms,
-                                overlay_status,
-                                ocr_conf,
-                                ocr_raw_text,
-                                ocr_frame_index,
-                            ) = self._resolve_event_overlay_timestamp(
-                                ocr=ocr,
-                                video_path=request.video_path,
-                                rotation_deg=request.rotation_deg,
-                                anchor_frame_index=anchor_frame_index,
-                                anchor_video_time_ms=anchor_video_time_ms,
-                                anchor_frame_bgr=anchor_frame_bgr,
-                                fallback_frame_index=confirmed_frame_index,
-                                fallback_video_time_ms=confirmed_video_time_ms,
-                                fallback_frame_bgr=confirmed_frame_bgr,
-                                logger=logger,
-                            )
-                            ocr_uses += 1
-                            if ocr_frame_index is not None:
-                                self._last_ocr_frame_index = int(ocr_frame_index)
-                        if ocr_raw_text:
-                            self._last_overlay_raw_text = ocr_raw_text
-
-                        corrected_ts = (
-                            overlay_ts_ms + request.timestamp_correction_ms
-                            if overlay_ts_ms is not None
-                            else None
-                        )
-                        event.overlay_ts_ms = overlay_ts_ms
-                        event.overlay_ts_status = overlay_status
-                        event.corrected_ts_ms = corrected_ts
+                        event.overlay_ts_ms = None
+                        event.overlay_ts_status = OverlayTSStatus.FAILED
+                        event.corrected_ts_ms = None
                         event.correction_ms = request.timestamp_correction_ms
-                        event.ocr_conf = ocr_conf
-                        event.ocr_raw_text = ocr_raw_text
-                        event.ocr_frame_index = int(ocr_frame_index) if ocr_frame_index is not None else None
+                        event.ocr_conf = None
+                        event.ocr_raw_text = ""
+                        event.ocr_frame_index = int(event.frame_index)
                         event.confirmed_frame_index = confirmed_frame_index
                         event.confirmed_video_time_ms = confirmed_video_time_ms
                         end_frame = int(event.frame_index) + 100
                         if int(info.total_frames) > 0:
                             end_frame = min(end_frame, int(info.total_frames) - 1)
                         event.label_end_frame = max(int(event.frame_index), int(end_frame))
-                        if event.overlay_ts_ms is not None:
-                            delta_frames = max(0, int(event.label_end_frame) - int(event.frame_index))
-                            delta_ms = int(round((delta_frames / max(float(info.fps), 1.0)) * 1000.0))
-                            event.label_end_timestamp_unix = int(event.overlay_ts_ms) + delta_ms
+                        event.label_end_timestamp_unix = None
                         if self._ts_diag_enabled:
                             logger.info(
                                 (
@@ -308,17 +239,6 @@ class AnalysisEngine:
 
                         on_event(event)
                         processed_events += 1
-                    if ocr_reset_interval > 0 and ocr_uses > 0 and ocr_uses % ocr_reset_interval == 0:
-                        ocr.reset()
-                        ocr_resets += 1
-                        gc.collect()
-                        logger.info(
-                            "ocr_reset frame=%s interval=%s ocr_calls=%s ocr_resets=%s",
-                            packet.frame_index,
-                            ocr_reset_interval,
-                            ocr_uses,
-                            ocr_resets,
-                        )
 
                 if processed_frames % 600 == 0:
                     gc.collect()
@@ -358,7 +278,6 @@ class AnalysisEngine:
                 detector.close()
             except Exception:
                 pass
-            ocr.close()
 
         logger.info(
             "analysis_complete events=%s ocr_calls=%s ocr_resets=%s",
@@ -626,35 +545,6 @@ class AnalysisEngine:
             self._last_overlay_ts = int(anchor_overlay)
             self._last_overlay_video_time_ms = int(anchor_video_time_ms)
             return anchor_overlay, anchor_status, anchor_conf, anchor_raw, int(anchor_frame_index)
-
-        if int(fallback_frame_index) == int(anchor_frame_index):
-            return anchor_overlay, anchor_status, anchor_conf, anchor_raw, int(anchor_frame_index)
-
-        fallback_overlay, fallback_status, fallback_conf, fallback_raw = self._resolve_overlay_timestamp(
-            ocr=ocr,
-            frame_bgr=fallback_frame_bgr,
-            video_path=video_path,
-            frame_index=fallback_frame_index,
-            video_time_ms=fallback_video_time_ms,
-            rotation_deg=rotation_deg,
-            logger=logger,
-            allow_interpolation=True,
-        )
-        if fallback_overlay is not None:
-            adjusted_overlay = int(fallback_overlay)
-            delta_ms = int(fallback_video_time_ms) - int(anchor_video_time_ms)
-            if delta_ms > 0:
-                # Keep overlay timestamp anchored to event first-frame time.
-                adjusted_overlay = int(fallback_overlay) - int(delta_ms)
-            self._last_overlay_ts = int(adjusted_overlay)
-            self._last_overlay_video_time_ms = int(anchor_video_time_ms)
-            return (
-                adjusted_overlay,
-                fallback_status,
-                fallback_conf,
-                fallback_raw,
-                int(fallback_frame_index),
-            )
         return anchor_overlay, anchor_status, anchor_conf, anchor_raw, int(anchor_frame_index)
 
     def _resolve_overlay_timestamp(
@@ -688,7 +578,6 @@ class AnalysisEngine:
             return result
 
         ocr_result = run_ocr_once(True)
-        expected_ts, _tolerance = self._expected_overlay_ts(video_time_ms)
         candidates = [
             ts
             for ts in ocr.extract_timestamp_candidates(ocr_result.raw_text)
@@ -732,53 +621,6 @@ class AnalysisEngine:
         if (not ocr_result.raw_text) and ocr_result_slow.raw_text:
             ocr_result = ocr_result_slow
 
-        if allow_interpolation and self._allow_neighbor_interp:
-            neighbor_ts, neighbor_conf = ocr.interpolate_timestamp_from_neighbors(
-                video_path=video_path,
-                frame_index=frame_index,
-                rotation_deg=rotation_deg,
-                fast=True,
-            )
-            if neighbor_ts is not None:
-                if expected_ts is None:
-                    picked = int(neighbor_ts)
-                    self._last_overlay_ts = picked
-                    self._last_overlay_video_time_ms = video_time_ms
-                    conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
-                    return picked, OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf, ocr_result.raw_text
-                if self._is_plausible_timestamp(neighbor_ts, video_time_ms):
-                    picked = int(neighbor_ts)
-                    if picked > int(expected_ts):
-                        logger.info(
-                            "neighbor_future_clamped frame=%s video_time_ms=%s expected=%s picked=%s",
-                            frame_index,
-                            video_time_ms,
-                            expected_ts,
-                            picked,
-                        )
-                        picked = int(expected_ts)
-                        self._last_overlay_ts = picked
-                        self._last_overlay_video_time_ms = video_time_ms
-                        conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
-                        return picked, OverlayTSStatus.INTERPOLATED_PREV, conf, ocr_result.raw_text
-                    self._last_overlay_ts = int(neighbor_ts)
-                    self._last_overlay_video_time_ms = video_time_ms
-                    conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
-                    return int(neighbor_ts), OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf, ocr_result.raw_text
-
-        if not allow_interpolation:
-            return None, OverlayTSStatus.FAILED, ocr_result.confidence, ocr_result.raw_text
-
-        if self._last_overlay_ts is not None:
-            prev_video_time_ms = self._last_overlay_video_time_ms
-            if prev_video_time_ms is not None:
-                delta = max(0, int(video_time_ms) - int(prev_video_time_ms))
-                estimated = int(self._last_overlay_ts) + delta
-            else:
-                estimated = int(self._last_overlay_ts)
-            self._last_overlay_ts = estimated
-            self._last_overlay_video_time_ms = video_time_ms
-            return estimated, OverlayTSStatus.INTERPOLATED_PREV, ocr_result.confidence, ocr_result.raw_text
         return None, OverlayTSStatus.FAILED, ocr_result.confidence, ocr_result.raw_text
 
     def _expected_overlay_ts(self, video_time_ms: int) -> tuple[int | None, int]:

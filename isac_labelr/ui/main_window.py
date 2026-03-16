@@ -284,6 +284,14 @@ class MainWindow(QMainWindow):
         self.load_metadata_button.setToolTip("Load metadata from .json / _debug.json (legacy jsonl/csv supported)")
         self.manual_add_event_button = QPushButton("Manual Add")
         self.manual_add_event_button.setToolTip("Add one event at current frame using OCR timestamp")
+        self.rerun_ocr_button = QPushButton("Re-run OCR")
+        self.rerun_ocr_button.setToolTip(
+            "Re-run OCR on selected event start/end frame and update metadata"
+        )
+        self.rerun_all_ocr_button = QPushButton("Re-run All OCR")
+        self.rerun_all_ocr_button.setToolTip(
+            "Re-run OCR on all current events and update metadata"
+        )
         self.edit_event_json_button = QPushButton("Edit JSON")
         self.edit_event_json_button.setToolTip("Edit selected event metadata as raw JSON")
         self.fix_timestamp_button = QPushButton("Fix Timestamp")
@@ -316,6 +324,8 @@ class MainWindow(QMainWindow):
             AppCommand.RUN_PARTIAL: self.start_partial_button,
             AppCommand.STOP_ANALYSIS: self.stop_analysis_button,
             AppCommand.OPEN_OUTPUT_FOLDER: self.open_metadata_button,
+            AppCommand.RERUN_OCR_SELECTED_EVENT: self.rerun_ocr_button,
+            AppCommand.RERUN_OCR_ALL_EVENTS: self.rerun_all_ocr_button,
         }
 
         for button in [
@@ -446,6 +456,8 @@ class MainWindow(QMainWindow):
         event_buttons_layout.addWidget(self.open_metadata_button)
         event_buttons_layout.addWidget(self.load_metadata_button)
         event_buttons_layout.addWidget(self.manual_add_event_button)
+        event_buttons_layout.addWidget(self.rerun_ocr_button)
+        event_buttons_layout.addWidget(self.rerun_all_ocr_button)
         event_buttons_layout.addWidget(self.edit_event_json_button)
         event_buttons_layout.addWidget(self.fix_timestamp_button)
         event_buttons_layout.addWidget(self.recalc_label0_button)
@@ -538,6 +550,12 @@ class MainWindow(QMainWindow):
         )
         self.load_metadata_button.clicked.connect(self._load_metadata_dialog)
         self.manual_add_event_button.clicked.connect(self._add_manual_event)
+        self.rerun_ocr_button.clicked.connect(
+            lambda: self._dispatch_command(AppCommand.RERUN_OCR_SELECTED_EVENT)
+        )
+        self.rerun_all_ocr_button.clicked.connect(
+            lambda: self._dispatch_command(AppCommand.RERUN_OCR_ALL_EVENTS)
+        )
         self.edit_event_json_button.clicked.connect(self._edit_selected_event_json)
         self.fix_timestamp_button.clicked.connect(self._fix_selected_event_timestamp)
         self.recalc_label0_button.clicked.connect(self._recalculate_label_zero_manual)
@@ -663,6 +681,8 @@ class MainWindow(QMainWindow):
             self._set_correction_dialog()
         elif command == AppCommand.RERUN_OCR_SELECTED_EVENT:
             self._rerun_ocr_on_selected_event()
+        elif command == AppCommand.RERUN_OCR_ALL_EVENTS:
+            self._rerun_ocr_on_all_events()
         elif command == AppCommand.RESET_LAYOUT:
             self._reset_layout()
         elif command == AppCommand.OPEN_OUTPUT_FOLDER:
@@ -1028,50 +1048,28 @@ class MainWindow(QMainWindow):
                 if event.confirmed_video_time_ms is not None
                 else self.current_video_time_ms
             )
-            can_sample = (
-                self.preview_ocr_sample_frames > 1
-                and self.preview_last_overlay_ts is not None
-                and self.preview_last_overlay_video_time_ms is not None
-                and self.preview_last_ocr_frame_index is not None
-                and anchor_frame_index >= self.preview_last_ocr_frame_index
-                and (anchor_frame_index - self.preview_last_ocr_frame_index)
-                < self.preview_ocr_sample_frames
+            anchor_frame_bgr = self._preview_frame_cache.get(anchor_frame_index)
+            confirmed_frame_bgr = (
+                self.current_frame_rotated
+                if confirmed_frame_index == int(self.current_frame_index)
+                else self._preview_frame_cache.get(confirmed_frame_index)
             )
-            if can_sample:
-                delta = max(
-                    0,
-                    int(anchor_video_time_ms) - int(self.preview_last_overlay_video_time_ms),
-                )
-                overlay_ts_ms = int(self.preview_last_overlay_ts) + delta
-                overlay_status = OverlayTSStatus.INTERPOLATED_PREV
-                ocr_conf = None
-                ocr_raw_text = self.preview_last_ocr_raw_text
-                ocr_frame_index = anchor_frame_index
-                self.preview_last_overlay_ts = overlay_ts_ms
-                self.preview_last_overlay_video_time_ms = anchor_video_time_ms
-            else:
-                anchor_frame_bgr = self._preview_frame_cache.get(anchor_frame_index)
-                confirmed_frame_bgr = (
-                    self.current_frame_rotated
-                    if confirmed_frame_index == int(self.current_frame_index)
-                    else self._preview_frame_cache.get(confirmed_frame_index)
-                )
-                (
-                    overlay_ts_ms,
-                    overlay_status,
-                    ocr_conf,
-                    ocr_raw_text,
-                    ocr_frame_index,
-                ) = self._resolve_overlay_timestamp_for_event(
-                    anchor_frame_bgr=anchor_frame_bgr,
-                    anchor_frame_index=anchor_frame_index,
-                    anchor_video_time_ms=anchor_video_time_ms,
-                    fallback_frame_bgr=confirmed_frame_bgr,
-                    fallback_frame_index=confirmed_frame_index,
-                    fallback_video_time_ms=confirmed_video_time_ms,
-                )
-                self.preview_ocr_use_count += 1
-                self.preview_last_ocr_frame_index = int(ocr_frame_index)
+            (
+                overlay_ts_ms,
+                overlay_status,
+                ocr_conf,
+                ocr_raw_text,
+                ocr_frame_index,
+            ) = self._resolve_overlay_timestamp_for_event(
+                anchor_frame_bgr=anchor_frame_bgr,
+                anchor_frame_index=anchor_frame_index,
+                anchor_video_time_ms=anchor_video_time_ms,
+                fallback_frame_bgr=confirmed_frame_bgr,
+                fallback_frame_index=confirmed_frame_index,
+                fallback_video_time_ms=confirmed_video_time_ms,
+            )
+            self.preview_ocr_use_count += 1
+            self.preview_last_ocr_frame_index = int(ocr_frame_index)
             if ocr_raw_text:
                 self.preview_last_ocr_raw_text = ocr_raw_text
 
@@ -1123,31 +1121,6 @@ class MainWindow(QMainWindow):
         )
         if anchor_status == OverlayTSStatus.OK and anchor_overlay is not None:
             return anchor_overlay, anchor_status, anchor_conf, anchor_raw, int(anchor_frame_index)
-
-        if int(fallback_frame_index) == int(anchor_frame_index):
-            return anchor_overlay, anchor_status, anchor_conf, anchor_raw, int(anchor_frame_index)
-
-        fallback_overlay, fallback_status, fallback_conf, fallback_raw = self._resolve_overlay_timestamp_for_frame(
-            frame_bgr=fallback_frame_bgr,
-            frame_index=fallback_frame_index,
-            video_time_ms=fallback_video_time_ms,
-            last_valid_ts=self.preview_last_overlay_ts,
-            last_valid_video_time_ms=self.preview_last_overlay_video_time_ms,
-            allow_interpolation=True,
-        )
-        if fallback_overlay is not None:
-            adjusted_overlay = int(fallback_overlay)
-            delta_ms = int(fallback_video_time_ms) - int(anchor_video_time_ms)
-            if delta_ms > 0:
-                # Keep overlay timestamp anchored to event first-frame time.
-                adjusted_overlay = int(fallback_overlay) - int(delta_ms)
-            return (
-                adjusted_overlay,
-                fallback_status,
-                fallback_conf,
-                fallback_raw,
-                int(fallback_frame_index),
-            )
         return anchor_overlay, anchor_status, anchor_conf, anchor_raw, int(anchor_frame_index)
 
     def _resolve_overlay_timestamp_for_frame(
@@ -1194,17 +1167,6 @@ class MainWindow(QMainWindow):
             if self.timestamp_ocr.is_valid_timestamp(ocr_result.timestamp_ms)
             else None
         )
-        expected_ts = None
-        _tolerance = 0
-        if last_valid_ts is not None and last_valid_video_time_ms is not None:
-            delta_video = int(video_time_ms) - int(last_valid_video_time_ms)
-            if delta_video >= 0:
-                expected_ts = int(last_valid_ts) + delta_video
-                _tolerance = max(1500, int(delta_video * 4 + 500))
-            else:
-                expected_ts = int(last_valid_ts)
-                _tolerance = 1500
-
         if primary is not None:
             return int(primary), OverlayTSStatus.OK, ocr_result.confidence, ocr_result.raw_text
 
@@ -1241,44 +1203,6 @@ class MainWindow(QMainWindow):
             if (not ocr_result.raw_text) and ocr_result_slow.raw_text:
                 ocr_result = ocr_result_slow
 
-        if allow_interpolation and self._allow_neighbor_interp and self.video_path is not None:
-            neighbor_ts, neighbor_conf = self.timestamp_ocr.interpolate_timestamp_from_neighbors(
-                video_path=self.video_path,
-                frame_index=frame_index,
-                rotation_deg=self.rotation_deg,
-                fast=True,
-            )
-            if neighbor_ts is not None:
-                if expected_ts is None:
-                    picked = int(neighbor_ts)
-                    conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
-                    return picked, OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf, ocr_result.raw_text
-                if self._is_plausible_preview_timestamp(
-                    neighbor_ts,
-                    video_time_ms,
-                    last_valid_ts,
-                    last_valid_video_time_ms,
-                ):
-                    picked = int(neighbor_ts)
-                    if picked > int(expected_ts):
-                        conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
-                        return int(expected_ts), OverlayTSStatus.INTERPOLATED_PREV, conf, ocr_result.raw_text
-                    conf = neighbor_conf if neighbor_conf is not None else ocr_result.confidence
-                    return picked, OverlayTSStatus.INTERPOLATED_NEIGHBOR, conf, ocr_result.raw_text
-
-        if not allow_interpolation:
-            return None, OverlayTSStatus.FAILED, ocr_result.confidence, ocr_result.raw_text
-
-        if last_valid_ts is not None and self.timestamp_ocr.is_valid_timestamp(last_valid_ts):
-            if last_valid_video_time_ms is not None:
-                delta = max(0, int(video_time_ms) - int(last_valid_video_time_ms))
-                return (
-                    int(last_valid_ts) + delta,
-                    OverlayTSStatus.INTERPOLATED_PREV,
-                    ocr_result.confidence,
-                    ocr_result.raw_text,
-                )
-            return last_valid_ts, OverlayTSStatus.INTERPOLATED_PREV, ocr_result.confidence, ocr_result.raw_text
         return None, OverlayTSStatus.FAILED, ocr_result.confidence, ocr_result.raw_text
 
     @staticmethod
@@ -1699,10 +1623,11 @@ class MainWindow(QMainWindow):
             persist=True,
             show_popup=True,
             popup_title="Label 0 Post-Process",
+            resolve_missing_timestamps_on_persist=False,
         )
         if added_zero > 0:
             self._set_notice(
-                f"Analysis finished: added {added_zero} label_id=0 segments after final OCR pass."
+                f"Analysis finished: added {added_zero} label_id=0 segments. Run Re-run All OCR later if needed."
             )
         self._set_events_edit_context(enabled=True, source="analysis_finished")
         self._refresh_action_states()
@@ -2416,21 +2341,38 @@ class MainWindow(QMainWindow):
                 "Only first entries are shown in Detected Events."
             )
 
-    def _open_loading_popup(self, *, title: str, message: str) -> QProgressDialog:
-        dialog = QProgressDialog(message, None, 0, 0, self)
+    def _open_loading_popup(
+        self,
+        *,
+        title: str,
+        message: str,
+        minimum: int = 0,
+        maximum: int = 0,
+        value: int | None = None,
+    ) -> QProgressDialog:
+        dialog = QProgressDialog(message, None, int(minimum), int(maximum), self)
         dialog.setWindowTitle(title)
         dialog.setWindowModality(Qt.ApplicationModal)
         dialog.setCancelButton(None)
         dialog.setMinimumDuration(0)
         dialog.setAutoClose(False)
         dialog.setAutoReset(False)
+        if value is not None:
+            dialog.setValue(int(value))
         dialog.show()
         QApplication.processEvents()
         return dialog
 
     @staticmethod
-    def _update_loading_popup(dialog: QProgressDialog, message: str) -> None:
+    def _update_loading_popup(
+        dialog: QProgressDialog,
+        message: str,
+        *,
+        value: int | None = None,
+    ) -> None:
         dialog.setLabelText(message)
+        if value is not None:
+            dialog.setValue(int(value))
         QApplication.processEvents()
 
     def _merge_zero_labels_from_primary_into_events(
@@ -2439,6 +2381,7 @@ class MainWindow(QMainWindow):
         persist: bool,
         show_popup: bool = False,
         popup_title: str = "Label 0",
+        resolve_missing_timestamps_on_persist: bool = True,
     ) -> int:
         loading_dialog: QProgressDialog | None = None
         if show_popup:
@@ -2504,8 +2447,17 @@ class MainWindow(QMainWindow):
         self._rebuild_event_list(preferred_event_id=preferred_event_id, preferred_index=0)
         if persist:
             if loading_dialog is not None:
-                self._update_loading_popup(loading_dialog, "3/3 메타데이터 저장 중(OCR 포함)...")
-            self._write_metadata(resolve_missing_timestamps=True)
+                self._update_loading_popup(
+                    loading_dialog,
+                    (
+                        "3/3 메타데이터 저장 중(OCR 포함)..."
+                        if resolve_missing_timestamps_on_persist
+                        else "3/3 메타데이터 저장 중..."
+                    ),
+                )
+            self._write_metadata(
+                resolve_missing_timestamps=bool(resolve_missing_timestamps_on_persist)
+            )
         if loading_dialog is not None:
             loading_dialog.close()
         return len(added)
@@ -2739,35 +2691,56 @@ class MainWindow(QMainWindow):
             return
         if self.video_path is None:
             return
-
-        idx = int(item.data(Qt.UserRole))
-        event = self.events[idx]
-
-        cap = cv2.VideoCapture(self.video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, event.frame_index)
-        ok, frame = cap.read()
-        cap.release()
-
-        if not ok or frame is None:
-            QMessageBox.warning(self, "OCR", "Unable to read target frame")
+        if self.analysis_worker is not None:
+            QMessageBox.information(self, "Re-run OCR", "Stop analysis before re-running OCR.")
             return
 
-        rotated = rotate_bgr(frame, self.rotation_deg)
+        idx_raw = item.data(Qt.UserRole)
+        if idx_raw is None:
+            return
+        try:
+            idx = int(idx_raw)
+        except Exception:
+            return
+        if idx < 0 or idx >= len(self.events):
+            return
+
+        if self._can_manage_events():
+            self._push_undo_snapshot()
+
+        event = self.events[idx]
+        end_frame = self._rerun_ocr_for_event(event)
+        item.setText(self._event_text(event))
+
+        self._write_metadata()
+        self._refresh_action_states()
+        self.status_label.setText(
+            f"Re-ran OCR: start={event.frame_index}, end={end_frame}"
+        )
+
+    def _rerun_ocr_for_event(self, event: EventRecord) -> int:
         overlay, status, ocr_conf, ocr_raw_text = self._resolve_overlay_timestamp_for_frame(
-            frame_bgr=rotated,
-            frame_index=event.frame_index,
-            video_time_ms=event.video_time_ms,
-            last_valid_ts=event.overlay_ts_ms,
+            frame_bgr=None,
+            frame_index=int(event.frame_index),
+            video_time_ms=int(event.video_time_ms),
+            last_valid_ts=None,
+            last_valid_video_time_ms=None,
+        )
+        end_frame = int(self._event_end_frame(event))
+        end_video_time_ms = self._frame_to_video_time_ms(end_frame)
+        end_ts, _end_status, _end_conf, _end_raw = self._resolve_overlay_timestamp_for_frame(
+            frame_bgr=None,
+            frame_index=end_frame,
+            video_time_ms=end_video_time_ms,
+            last_valid_ts=None,
             last_valid_video_time_ms=None,
         )
 
         correction = int(self.correction_edit.text() or 0)
-        corrected = overlay + correction if overlay is not None else None
-
         event.overlay_ts_ms = overlay
         event.overlay_ts_status = status
         event.correction_ms = correction
-        event.corrected_ts_ms = corrected
+        event.corrected_ts_ms = overlay + correction if overlay is not None else None
         event.ocr_conf = ocr_conf
         event.ocr_raw_text = ocr_raw_text
         event.ocr_frame_index = int(event.frame_index)
@@ -2781,9 +2754,54 @@ class MainWindow(QMainWindow):
             if event.confirmed_video_time_ms is not None
             else int(event.video_time_ms)
         )
-        item.setText(self._event_text(event))
+        event.label_end_frame = end_frame
+        event.label_end_timestamp_unix = int(end_ts) if end_ts is not None else None
+        return end_frame
 
-        self._write_metadata()
+    def _rerun_ocr_on_all_events(self) -> None:
+        if self.video_path is None or not self.events:
+            return
+        if self.analysis_worker is not None:
+            QMessageBox.information(self, "Re-run All OCR", "Stop analysis before re-running OCR.")
+            return
+
+        if self._can_manage_events():
+            self._push_undo_snapshot()
+
+        preferred_event_id = self._selected_event_id()
+        total = len(self.events)
+        loading_dialog = self._open_loading_popup(
+            title="Re-run All OCR",
+            message=f"0/{total} OCR 재수행 중...",
+            minimum=0,
+            maximum=total,
+            value=0,
+        )
+        try:
+            for index, event in enumerate(self.events, start=1):
+                self._update_loading_popup(
+                    loading_dialog,
+                    f"{index}/{total} OCR 재수행 중...",
+                    value=index - 1,
+                )
+                self._rerun_ocr_for_event(event)
+                self._update_loading_popup(
+                    loading_dialog,
+                    f"{index}/{total} OCR 재수행 중...",
+                    value=index,
+                )
+            self._rebuild_event_list(preferred_event_id=preferred_event_id, preferred_index=0)
+            self._update_loading_popup(
+                loading_dialog,
+                "메타데이터 저장 중...",
+                value=total,
+            )
+            self._write_metadata()
+        finally:
+            loading_dialog.close()
+
+        self._refresh_action_states()
+        self.status_label.setText(f"Re-ran OCR for all events: {total}")
 
     def _write_metadata(
         self,
@@ -3265,6 +3283,7 @@ class MainWindow(QMainWindow):
             AppCommand.MANUAL_OCR_ROI: has_video,
             AppCommand.SET_CORRECTION_MS: True,
             AppCommand.RERUN_OCR_SELECTED_EVENT: has_selected_event and has_video,
+            AppCommand.RERUN_OCR_ALL_EVENTS: has_events and has_video,
             AppCommand.OPEN_OUTPUT_FOLDER: (self.primary_metadata_path is not None) or (self.output_dir is not None),
             AppCommand.VIEW_LOGS: (self.log_path is not None) or (self.metadata_video_path is not None),
             AppCommand.RESET_LAYOUT: True,

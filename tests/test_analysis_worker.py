@@ -85,7 +85,7 @@ def test_worker_saves_buffer_on_abort_without_stop_short_circuit(monkeypatch, tm
     assert len(captured["events"]) == 1
 
 
-def test_worker_uses_full_resolve_on_normal_finish(monkeypatch, tmp_path: Path) -> None:
+def test_worker_skips_ocr_resolve_on_normal_finish(monkeypatch, tmp_path: Path) -> None:
     captured: dict = {}
 
     class FakeStore:
@@ -110,5 +110,5 @@ def test_worker_uses_full_resolve_on_normal_finish(monkeypatch, tmp_path: Path) 
     worker.run()
 
     assert captured["stop_event"] is None
-    assert captured["resolve_missing_timestamps"] is True
+    assert captured["resolve_missing_timestamps"] is False
     assert len(captured["events"]) == 1

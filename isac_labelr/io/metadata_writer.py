@@ -4,14 +4,14 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
 import cv2
 
-from isac_labelr.models import EventRecord, ROI
+from isac_labelr.models import EventRecord, OverlayTSStatus, ROI
 from isac_labelr.timezone_utils import get_kst_tz
 from isac_labelr.vision.ocr import TimestampOCR
 
@@ -40,6 +40,13 @@ class _LabelWindow:
     end_frame: int
     start_ts_hint: int | None = None
     end_ts_hint: int | None = None
+
+
+@dataclass(slots=True)
+class FrameTimestampPick:
+    timestamp_ms: int | None
+    confidence: float | None
+    raw_text: str
 
 
 def _parse_label_id(roi_id: str) -> int:
@@ -226,7 +233,7 @@ class FrameTimestampResolver:
         delta_ms = int(round((delta_frames / max(self._fps, 1.0)) * 1000.0))
         return int(self._last_valid_ts) + delta_ms
 
-    def _pick_timestamp(self, frame_index: int) -> int | None:
+    def resolve_exact(self, frame_index: int) -> FrameTimestampPick:
         result = self.ocr._extract_timestamp_for_video_frame(
             video_path=self.video_path,
             frame_index=int(frame_index),
@@ -234,21 +241,30 @@ class FrameTimestampResolver:
             fast=True,
         )
         if self.ocr.is_valid_timestamp(result.timestamp_ms):
-            return int(result.timestamp_ms)
+            return FrameTimestampPick(int(result.timestamp_ms), result.confidence, result.raw_text)
         candidates = self.ocr.extract_timestamp_candidates(result.raw_text)
         for candidate in candidates:
             if self.ocr.is_valid_timestamp(candidate):
-                return int(candidate)
-
-        neighbor_ts, _neighbor_conf = self.ocr.interpolate_timestamp_from_neighbors(
+                return FrameTimestampPick(int(candidate), result.confidence, result.raw_text)
+        slow_result = self.ocr._extract_timestamp_for_video_frame(
             video_path=self.video_path,
             frame_index=int(frame_index),
             rotation_deg=self.rotation_deg,
-            fast=True,
+            fast=False,
         )
-        if self.ocr.is_valid_timestamp(neighbor_ts):
-            return int(neighbor_ts)
-        return None
+        if self.ocr.is_valid_timestamp(slow_result.timestamp_ms):
+            return FrameTimestampPick(
+                int(slow_result.timestamp_ms),
+                slow_result.confidence,
+                slow_result.raw_text,
+            )
+        slow_candidates = self.ocr.extract_timestamp_candidates(slow_result.raw_text)
+        for candidate in slow_candidates:
+            if self.ocr.is_valid_timestamp(candidate):
+                return FrameTimestampPick(int(candidate), slow_result.confidence, slow_result.raw_text)
+        raw_text = slow_result.raw_text if slow_result.raw_text else result.raw_text
+        confidence = slow_result.confidence if slow_result.raw_text else result.confidence
+        return FrameTimestampPick(None, confidence, raw_text)
 
     def resolve(self, frame_index: int, *, preferred_ts: int | None = None) -> int | None:
         frame_index = int(frame_index)
@@ -258,17 +274,11 @@ class FrameTimestampResolver:
             self._last_valid_frame = frame_index
             return picked
 
-        picked = self._pick_timestamp(frame_index)
-        if picked is not None:
-            self._last_valid_ts = int(picked)
+        picked = self.resolve_exact(frame_index)
+        if picked.timestamp_ms is not None:
+            self._last_valid_ts = int(picked.timestamp_ms)
             self._last_valid_frame = frame_index
-            return int(picked)
-
-        estimated = self._estimate_from_last(frame_index)
-        if estimated is not None:
-            self._last_valid_ts = int(estimated)
-            self._last_valid_frame = frame_index
-            return int(estimated)
+            return int(picked.timestamp_ms)
         return None
 
     def close(self) -> None:
@@ -410,6 +420,65 @@ def build_label_records(
     return rows
 
 
+def refresh_events_from_frames(
+    events: Iterable[EventRecord],
+    *,
+    video_path: str,
+    rotation_deg: int,
+    ocr_manual_roi: ROI | None,
+    max_frame_index: int | None,
+) -> list[EventRecord]:
+    max_index = max_frame_index
+    if max_index is None:
+        max_index = FrameTimestampResolver.read_max_frame_index(video_path)
+
+    resolver = FrameTimestampResolver(
+        video_path=video_path,
+        rotation_deg=rotation_deg,
+        ocr_manual_roi=ocr_manual_roi,
+    )
+    refreshed: list[EventRecord] = []
+    try:
+        for event in events:
+            updated = replace(event)
+            start_frame = max(0, int(updated.frame_index))
+            start_pick = resolver.resolve_exact(start_frame)
+            start_ts = start_pick.timestamp_ms
+            updated.overlay_ts_ms = int(start_ts) if start_ts is not None else None
+            updated.overlay_ts_status = (
+                OverlayTSStatus.OK if start_ts is not None else OverlayTSStatus.FAILED
+            )
+            updated.corrected_ts_ms = (
+                int(start_ts) + int(updated.correction_ms)
+                if start_ts is not None
+                else None
+            )
+            updated.ocr_conf = start_pick.confidence
+            updated.ocr_raw_text = start_pick.raw_text
+            updated.ocr_frame_index = start_frame
+
+            end_frame = (
+                int(updated.label_end_frame)
+                if updated.label_end_frame is not None
+                else int(start_frame + 100)
+            )
+            if max_index is not None:
+                end_frame = min(end_frame, int(max_index))
+            end_frame = max(start_frame, end_frame)
+            updated.label_end_frame = int(end_frame)
+
+            end_pick = resolver.resolve_exact(end_frame)
+            updated.label_end_timestamp_unix = (
+                int(end_pick.timestamp_ms)
+                if end_pick.timestamp_ms is not None
+                else None
+            )
+            refreshed.append(updated)
+    finally:
+        resolver.close()
+    return refreshed
+
+
 class MetadataStore:
     def __init__(self, video_path: str) -> None:
         self.video_path = str(video_path)
@@ -463,6 +532,13 @@ class MetadataStore:
 
         if resolve_missing_timestamps:
             rotation_deg = int(session_dict.get("rotation_deg", 0))
+            events_list = refresh_events_from_frames(
+                events_list,
+                video_path=self.video_path,
+                rotation_deg=rotation_deg,
+                ocr_manual_roi=manual_roi,
+                max_frame_index=max_frame_index,
+            )
             resolver = FrameTimestampResolver(
                 video_path=self.video_path,
                 rotation_deg=rotation_deg,

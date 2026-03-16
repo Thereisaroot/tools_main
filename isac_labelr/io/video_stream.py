@@ -67,6 +67,13 @@ def rotate_bgr(image, rotation_deg: int):
     raise ValueError(f"Unsupported rotation: {rotation_deg}")
 
 
+def _time_ms_to_frame_index(time_ms: int, fps: float, prev_frame_index: int | None = None) -> int:
+    estimated = max(0, int(round((float(time_ms) / 1000.0) * max(float(fps), 1.0))))
+    if prev_frame_index is None:
+        return estimated
+    return max(int(prev_frame_index) + 1, estimated)
+
+
 class VideoStream:
     def __init__(self, video_path: str) -> None:
         self.video_path = Path(video_path)
@@ -161,6 +168,7 @@ class VideoStream:
 
         with self._av.open(str(self.video_path)) as container:  # type: ignore[union-attr]
             stream = container.streams.video[0]
+            prev_frame_index: int | None = None
 
             if start_ms > 0:
                 container.seek(start_ms * 1000, backward=True, any_frame=False)
@@ -183,7 +191,8 @@ class VideoStream:
                 image = frame.to_ndarray(format="bgr24")
                 image = rotate_bgr(image, rotation_deg)
 
-                frame_index = int((time_ms / 1000.0) * self._info.fps)
+                frame_index = _time_ms_to_frame_index(time_ms, self._info.fps, prev_frame_index)
+                prev_frame_index = frame_index
                 yield FramePacket(frame_index=frame_index, time_ms=time_ms, image_bgr=image)
 
                 if on_chunk and (time_ms - last_chunk_tick) >= chunk_ms:
