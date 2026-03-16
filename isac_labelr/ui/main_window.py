@@ -1693,6 +1693,17 @@ class MainWindow(QMainWindow):
             end = min(end, self.total_frames - 1)
         return end
 
+    def _event_sort_key(self, event: EventRecord) -> tuple[int, int, int, str]:
+        return (
+            int(event.frame_index),
+            int(self._event_end_frame(event)),
+            self._label_id_from_roi_id(event.roi_id),
+            str(event.event_id),
+        )
+
+    def _sort_events_in_place(self) -> None:
+        self.events.sort(key=self._event_sort_key)
+
     def _populate_event_label_window(
         self,
         event: EventRecord,
@@ -1965,10 +1976,9 @@ class MainWindow(QMainWindow):
             start_ts=manual_event.overlay_ts_ms,
             start_video_time_ms=manual_event.video_time_ms,
         )
-        self._append_event_to_ui(manual_event)
-        new_index = len(self.events) - 1
-        if new_index >= 0:
-            self.event_list.setCurrentRow(new_index)
+        self.events.append(manual_event)
+        self._sort_events_in_place()
+        self._rebuild_event_list(preferred_event_id=manual_event.event_id, preferred_index=0)
         self._write_metadata()
         self.status_label.setText(
             f"Manual event added with OCR timestamp (end_frame={int(end_frame)})"
