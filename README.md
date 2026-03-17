@@ -63,8 +63,9 @@ run_serial_text_chat.bat
 8. Click `Send Encoded` to transmit the message body after custom base64-plus-marker obfuscation.
 9. Click `Select Files` to choose files and send them.
 10. Or drag files into the drop area to send them.
-11. Use `Copy to Clipboard` to copy the last received raw data.
-12. Use `Copy to Clipboard After Decode` to decode the last received data and copy the result.
+11. Click `Open Download Folder` to open the folder where received files are saved.
+12. Use `Copy to Clipboard` to copy the last received raw data.
+13. Use `Copy to Clipboard After Decode` to decode the last received data and copy the result.
 
 Keyboard shortcuts:
 

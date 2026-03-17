@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -228,6 +230,13 @@ class SerialChatApp:
             state="disabled",
         )
         self.select_file_button.pack(side="left", padx=(0, 8))
+
+        self.open_download_folder_button = ttk.Button(
+            file_actions,
+            text="Open Download Folder",
+            command=self.open_received_files_folder,
+        )
+        self.open_download_folder_button.pack(side="left", padx=(0, 8))
 
         self.drop_zone = tk.Label(
             file_actions,
@@ -648,6 +657,19 @@ class SerialChatApp:
             return
 
         self.start_file_send([Path(path) for path in file_paths])
+
+    def open_received_files_folder(self) -> None:
+        RECEIVED_FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(RECEIVED_FILES_DIR))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(RECEIVED_FILES_DIR)])
+            else:
+                subprocess.Popen(["xdg-open", str(RECEIVED_FILES_DIR)])
+        except Exception as exc:
+            messagebox.showerror("Open Folder Error", str(exc))
 
     def handle_drag_enter(self, event: tk.Event) -> str:
         del event
