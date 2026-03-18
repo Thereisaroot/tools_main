@@ -25,6 +25,24 @@ except ImportError:
     DND_FILES = None
     TkinterDnD = None
 
+try:
+    from pynput import keyboard as pynput_keyboard
+    from pynput import mouse as pynput_mouse
+
+    PYNPUT_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - environment dependent
+    pynput_keyboard = None
+    pynput_mouse = None
+    PYNPUT_IMPORT_ERROR = exc
+
+if sys.platform == "darwin":
+    try:
+        import Quartz
+    except Exception:  # pragma: no cover - environment dependent
+        Quartz = None
+else:
+    Quartz = None
+
 MESSAGE_TERMINATOR = b"\0"
 CONTROL_PREFIX = "\x1eSTCFILE"
 CONTROL_SEPARATOR = "\x1f"
@@ -33,6 +51,10 @@ FILE_CHUNK_SIZE = 1024
 HIGH_SPEED_FRAME_DELAY_SECONDS = 0.002
 HIGH_SPEED_BAUD_THRESHOLD = 460800
 FILE_ACK_TIMEOUT_SECONDS = 5.0
+INPUT_REQUEST_TIMEOUT_SECONDS = 3.0
+INPUT_NOTICE_SECONDS = 2.5
+INPUT_SENDER_POLL_SECONDS = 0.01
+INPUT_WARP_IGNORE_EVENTS = 4
 RECEIVED_FILES_DIR = Path(__file__).resolve().parent / "received_files"
 BAUD_RATE_OPTIONS = [
     "9600",
@@ -47,6 +69,14 @@ BAUD_RATE_OPTIONS = [
     "1500000",
     "2000000",
 ]
+INPUT_STATE_IDLE = "idle"
+INPUT_STATE_REQUESTING = "requesting_remote_control"
+INPUT_STATE_CONTROLLING = "controlling_remote"
+INPUT_STATE_CONTROLLED = "being_controlled"
+WINDOWS_SCROLL_LOCK_VK = 145
+WINDOWS_KEY_FLAG_INJECTED = 0x10
+WINDOWS_MOUSE_FLAG_INJECTED = 0x01
+DARWIN_F8_KEYCODE = 100
 
 
 def obfuscate_text(text: str) -> str:
@@ -119,6 +149,69 @@ def normalize_dropped_path(raw_path: str) -> Path:
     return Path(raw_path)
 
 
+def supported_input_platform() -> bool:
+    return sys.platform in {"darwin", "win32"}
+
+
+def encode_key_token(key: object) -> str:
+    if pynput_keyboard is None:
+        raise RuntimeError("pynput keyboard support is unavailable.")
+
+    if isinstance(key, pynput_keyboard.Key):
+        return f"special:{key.name}"
+
+    if isinstance(key, pynput_keyboard.KeyCode):
+        if key.char is not None:
+            return f"char:{encode_control_text(key.char)}"
+        if key.vk is not None:
+            return f"vk:{key.vk}"
+
+    raise ValueError("Unsupported key event.")
+
+
+def decode_key_token(token: str) -> object:
+    if pynput_keyboard is None:
+        raise RuntimeError("pynput keyboard support is unavailable.")
+
+    kind, separator, value = token.partition(":")
+    if not separator or not value:
+        raise ValueError("Key token is malformed.")
+
+    if kind == "special":
+        key = getattr(pynput_keyboard.Key, value, None)
+        if key is None:
+            raise ValueError(f"Unknown special key: {value}")
+        return key
+
+    if kind == "char":
+        return decode_control_text(value)
+
+    if kind == "vk":
+        return pynput_keyboard.KeyCode.from_vk(int(value))
+
+    raise ValueError(f"Unknown key token type: {kind}")
+
+
+def encode_mouse_button_token(button: object) -> str:
+    if pynput_mouse is None:
+        raise RuntimeError("pynput mouse support is unavailable.")
+
+    if isinstance(button, pynput_mouse.Button):
+        return button.name
+
+    raise ValueError("Unsupported mouse button.")
+
+
+def decode_mouse_button_token(token: str) -> object:
+    if pynput_mouse is None:
+        raise RuntimeError("pynput mouse support is unavailable.")
+
+    button = getattr(pynput_mouse.Button, token, None)
+    if button is None:
+        raise ValueError(f"Unknown mouse button: {token}")
+    return button
+
+
 @dataclass
 class ReceiveFileState:
     transfer_id: str
@@ -134,14 +227,16 @@ class SerialChatApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Serial Text Chat v1")
-        self.root.geometry("840x680")
+        self.root.geometry("900x820")
 
         self.serial_port: serial.Serial | None = None
         self.reader_thread: threading.Thread | None = None
         self.file_send_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
+        self.shutdown_event = threading.Event()
         self.ui_events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.transfer_ack_queue: queue.Queue[tuple[str, list[str]]] = queue.Queue()
+        self.input_outbound_queue: queue.Queue[tuple[str, str, tuple[str, ...]] | None] = queue.Queue()
         self.receive_buffer = bytearray()
         self.receive_transfers: dict[str, ReceiveFileState] = {}
         self.last_received_raw = ""
@@ -149,14 +244,45 @@ class SerialChatApp:
         self.connected_baudrate = 0
         self.file_send_active = False
         self.write_lock = threading.Lock()
+        self.input_lock = threading.Lock()
+
+        self.keyboard_listener = None
+        self.mouse_listener = None
+        self.keyboard_controller = None
+        self.mouse_controller = None
+        self.input_backend_ready = False
+        self.input_permission_required = False
+        self.input_support_message = self.build_default_input_support_message()
+        self.input_state = INPUT_STATE_IDLE
+        self.local_input_session_id = ""
+        self.remote_input_session_id = ""
+        self.local_input_request_deadline = 0.0
+        self.input_notice_message = ""
+        self.input_notice_deadline = 0.0
+        self.local_pressed_key_tokens: set[str] = set()
+        self.local_pressed_mouse_tokens: set[str] = set()
+        self.remote_pressed_key_tokens: set[str] = set()
+        self.remote_pressed_mouse_tokens: set[str] = set()
+        self.pending_mouse_dx = 0
+        self.pending_mouse_dy = 0
+        self.mouse_anchor: tuple[int, int] | None = None
+        self.mouse_warp_events_to_ignore = 0
 
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="115200")
         self.status_var = tk.StringVar(value="Disconnected")
+        self.input_state_var = tk.StringVar(value="State: Idle")
+        self.input_hotkey_var = tk.StringVar(value=self.build_hotkey_hint())
+        self.input_support_var = tk.StringVar(value=self.input_support_message)
 
         self._build_ui()
         self.refresh_ports()
+        self.refresh_input_ui()
         self.update_controls()
+
+        self.input_sender_thread = threading.Thread(target=self.input_sender_loop, daemon=True)
+        self.input_sender_thread.start()
+
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self.process_ui_events)
 
@@ -214,6 +340,26 @@ class SerialChatApp:
             state="disabled",
         )
         self.copy_decoded_button.pack(side="left")
+
+        input_share_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
+        input_share_frame.pack(fill="x")
+
+        ttk.Label(input_share_frame, text="Input Share").pack(anchor="w")
+
+        input_actions = ttk.Frame(input_share_frame)
+        input_actions.pack(fill="x", pady=(6, 0))
+
+        self.toggle_remote_button = ttk.Button(
+            input_actions,
+            text="Toggle Remote Control",
+            command=self.toggle_remote_control,
+            state="disabled",
+        )
+        self.toggle_remote_button.pack(side="left", padx=(0, 12))
+
+        ttk.Label(input_actions, textvariable=self.input_state_var).pack(side="left", anchor="w")
+        ttk.Label(input_share_frame, textvariable=self.input_hotkey_var).pack(anchor="w", pady=(6, 0))
+        ttk.Label(input_share_frame, textvariable=self.input_support_var, wraplength=840, justify="left").pack(anchor="w", pady=(2, 0))
 
         file_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         file_frame.pack(fill="x")
@@ -295,6 +441,99 @@ class SerialChatApp:
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief="sunken", anchor="w", padding=(8, 4))
         status_bar.pack(fill="x", side="bottom")
 
+    def build_hotkey_hint(self) -> str:
+        if sys.platform == "win32":
+            return "Hotkey: Scroll Lock"
+        if sys.platform == "darwin":
+            return "Hotkey: F8 (Shift/Ctrl modifiers are also accepted)"
+        return "Hotkey: unsupported on this platform"
+
+    def build_default_input_support_message(self) -> str:
+        if not supported_input_platform():
+            return "Input sharing v1 supports macOS and Windows only."
+        if PYNPUT_IMPORT_ERROR is not None:
+            return "Input sharing unavailable: install pynput and restart the app."
+        if sys.platform == "darwin":
+            return "Connect to initialize global hooks. macOS also needs Accessibility and Input Monitoring."
+        return "Connect to initialize global hooks."
+
+    def build_input_backend_error_message(self, exc: Exception) -> str:
+        if not supported_input_platform():
+            return "Input sharing v1 supports macOS and Windows only."
+        if sys.platform == "darwin":
+            return "Permission required: enable Accessibility and Input Monitoring for the Python app running this program."
+        return f"Input sharing unavailable: {exc}"
+
+    def refresh_input_ui(self) -> None:
+        with self.input_lock:
+            state = self.input_state
+            permission_required = self.input_permission_required
+            support_message = self.input_support_message
+            notice_message = self.input_notice_message
+            notice_deadline = self.input_notice_deadline
+
+        state_text = {
+            INPUT_STATE_IDLE: "Idle",
+            INPUT_STATE_REQUESTING: "Requesting remote control",
+            INPUT_STATE_CONTROLLING: "Controlling remote",
+            INPUT_STATE_CONTROLLED: "Being controlled",
+        }.get(state, state)
+
+        now = time.monotonic()
+        if permission_required:
+            state_text = "Permission required"
+        elif notice_message and notice_deadline > now:
+            state_text = notice_message
+
+        self.input_state_var.set(f"State: {state_text}")
+        self.input_hotkey_var.set(self.build_hotkey_hint())
+        self.input_support_var.set(support_message)
+
+    def queue_refresh_input_ui(self) -> None:
+        self.ui_events.put(("refresh-input-ui", None))
+
+    def set_input_notice(self, message: str, duration: float = INPUT_NOTICE_SECONDS) -> None:
+        with self.input_lock:
+            self.input_notice_message = message
+            self.input_notice_deadline = time.monotonic() + duration
+        self.queue_refresh_input_ui()
+
+    def clear_input_notice_locked(self) -> None:
+        self.input_notice_message = ""
+        self.input_notice_deadline = 0.0
+
+    def serial_connected(self) -> bool:
+        return bool(self.serial_port and self.serial_port.is_open)
+
+    def input_state_snapshot(self) -> tuple[str, bool]:
+        with self.input_lock:
+            return self.input_state, self.input_backend_ready
+
+    def update_controls(self) -> None:
+        connected = self.serial_connected()
+        input_state, input_backend_ready = self.input_state_snapshot()
+        input_idle = input_state == INPUT_STATE_IDLE
+
+        self.connect_button.configure(text="Disconnect" if connected else "Connect")
+        self.send_plain_button.configure(state="normal" if connected and input_idle else "disabled")
+        self.send_encoded_button.configure(state="normal" if connected and input_idle else "disabled")
+        self.select_file_button.configure(state="normal" if connected and not self.file_send_active and input_idle else "disabled")
+
+        if not connected or self.file_send_active:
+            toggle_state = "disabled"
+        elif input_state in {INPUT_STATE_REQUESTING, INPUT_STATE_CONTROLLING}:
+            toggle_state = "normal"
+        elif input_state == INPUT_STATE_CONTROLLED:
+            toggle_state = "disabled"
+        elif input_backend_ready:
+            toggle_state = "normal"
+        else:
+            toggle_state = "disabled"
+
+        button_text = "Stop Remote Control" if input_state in {INPUT_STATE_REQUESTING, INPUT_STATE_CONTROLLING} else "Toggle Remote Control"
+        self.toggle_remote_button.configure(text=button_text, state=toggle_state)
+        self.update_drop_zone_state()
+
     def configure_drop_zone(self) -> None:
         self.drop_zone.configure(bg="#f7f7f7", fg="#222222")
 
@@ -310,6 +549,25 @@ class SerialChatApp:
         except tk.TclError:
             self.drop_zone.configure(text="Drag and drop unavailable in this Tk build. Use Select Files.")
 
+    def update_drop_zone_state(self) -> None:
+        connected = self.serial_connected()
+        input_state, _ = self.input_state_snapshot()
+
+        if DND_FILES is None:
+            self.drop_zone.configure(text="Drag and drop unavailable. Install tkinterdnd2 or use Select Files.")
+            return
+
+        if not connected:
+            self.drop_zone.configure(text="Connect first, then drop files here to send", bg="#f7f7f7")
+        elif input_state == INPUT_STATE_CONTROLLED:
+            self.drop_zone.configure(text="Peer is controlling this machine. File send is disabled.", bg="#fff1d6")
+        elif input_state in {INPUT_STATE_REQUESTING, INPUT_STATE_CONTROLLING}:
+            self.drop_zone.configure(text="Remote control is active. Stop it before sending files.", bg="#fff1d6")
+        elif self.file_send_active:
+            self.drop_zone.configure(text="Sending files...", bg="#e7f0ff")
+        else:
+            self.drop_zone.configure(text="Drop files here to send", bg="#f7f7f7")
+
     def refresh_ports(self) -> None:
         ports = [port.device for port in list_ports.comports()]
         self.port_combo["values"] = ports
@@ -318,7 +576,7 @@ class SerialChatApp:
             self.port_var.set(ports[0])
 
     def toggle_connection(self) -> None:
-        if self.serial_port and self.serial_port.is_open:
+        if self.serial_connected():
             self.disconnect()
         else:
             self.connect()
@@ -359,14 +617,17 @@ class SerialChatApp:
         self.receive_buffer.clear()
         self.connected_port_name = port_name
         self.connected_baudrate = baudrate
+        self.start_input_backend()
         self.reader_thread = threading.Thread(target=self.read_loop, daemon=True)
         self.reader_thread.start()
         self.refresh_connection_status()
+        self.refresh_input_ui()
         self.update_controls()
         self.message_text.focus_set()
 
     def disconnect(self) -> None:
         self.stop_event.set()
+        self.stop_input_sessions_for_disconnect()
 
         if self.serial_port:
             try:
@@ -377,44 +638,292 @@ class SerialChatApp:
 
             self.serial_port = None
 
+        self.close_receive_transfers(interrupted=True)
+        self.stop_input_backend()
         self.connected_port_name = ""
         self.connected_baudrate = 0
         self.file_send_active = False
         self.receive_buffer.clear()
         self.refresh_connection_status()
+        self.refresh_input_ui()
         self.update_controls()
 
     def refresh_connection_status(self) -> None:
-        if self.serial_port and self.serial_port.is_open and self.connected_port_name:
+        if self.serial_connected() and self.connected_port_name:
             self.status_var.set(f"Connected to {self.connected_port_name} @ {self.connected_baudrate}")
         else:
             self.status_var.set("Disconnected")
 
-    def update_controls(self) -> None:
-        connected = bool(self.serial_port and self.serial_port.is_open)
-        self.connect_button.configure(text="Disconnect" if connected else "Connect")
-        self.send_plain_button.configure(state="normal" if connected else "disabled")
-        self.send_encoded_button.configure(state="normal" if connected else "disabled")
-        self.select_file_button.configure(state="normal" if connected and not self.file_send_active else "disabled")
-        self.update_drop_zone_state()
+    def start_input_backend(self) -> None:
+        self.stop_input_backend()
 
-    def update_drop_zone_state(self) -> None:
-        connected = bool(self.serial_port and self.serial_port.is_open)
+        with self.input_lock:
+            self.input_backend_ready = False
+            self.input_permission_required = False
+            self.input_support_message = self.build_default_input_support_message()
 
-        if DND_FILES is None:
-            self.drop_zone.configure(text="Drag and drop unavailable. Install tkinterdnd2 or use Select Files.")
+        if not supported_input_platform() or PYNPUT_IMPORT_ERROR is not None or pynput_keyboard is None or pynput_mouse is None:
+            self.refresh_input_ui()
+            self.update_controls()
             return
 
-        if not connected:
-            self.drop_zone.configure(text="Connect first, then drop files here to send", bg="#f7f7f7")
-        elif self.file_send_active:
-            self.drop_zone.configure(text="Sending files...", bg="#e7f0ff")
-        else:
-            self.drop_zone.configure(text="Drop files here to send", bg="#f7f7f7")
+        try:
+            self.keyboard_controller = pynput_keyboard.Controller()
+            self.mouse_controller = pynput_mouse.Controller()
+
+            keyboard_options: dict[str, object] = {}
+            mouse_options: dict[str, object] = {}
+            if sys.platform == "darwin":
+                if Quartz is None:
+                    raise PermissionError("Quartz support is unavailable.")
+                keyboard_options["darwin_intercept"] = self.darwin_keyboard_intercept
+                mouse_options["darwin_intercept"] = self.darwin_mouse_intercept
+            elif sys.platform == "win32":
+                keyboard_options["win32_event_filter"] = self.win32_keyboard_filter
+                mouse_options["win32_event_filter"] = self.win32_mouse_filter
+
+            self.keyboard_listener = pynput_keyboard.Listener(
+                on_press=self.handle_global_key_press,
+                on_release=self.handle_global_key_release,
+                suppress=False,
+                **keyboard_options,
+            )
+            self.mouse_listener = pynput_mouse.Listener(
+                on_move=self.handle_global_mouse_move,
+                on_click=self.handle_global_mouse_click,
+                on_scroll=self.handle_global_mouse_scroll,
+                suppress=False,
+                **mouse_options,
+            )
+
+            self.keyboard_listener.start()
+            self.keyboard_listener.wait()
+            self.mouse_listener.start()
+            self.mouse_listener.wait()
+            self.raise_if_input_listener_failed(self.keyboard_listener)
+            self.raise_if_input_listener_failed(self.mouse_listener)
+
+            with self.input_lock:
+                self.input_backend_ready = True
+                self.input_permission_required = False
+                if sys.platform == "darwin":
+                    self.input_support_message = "Global hooks ready. F8 toggles remote control while connected."
+                else:
+                    self.input_support_message = "Global hooks ready. Scroll Lock toggles remote control while connected."
+        except Exception as exc:
+            self.stop_input_backend()
+            with self.input_lock:
+                self.input_backend_ready = False
+                self.input_permission_required = sys.platform == "darwin"
+                self.input_support_message = self.build_input_backend_error_message(exc)
+            self.append_log(f"[input share] {self.input_support_message}")
+
+        self.refresh_input_ui()
+        self.update_controls()
+
+    def stop_input_backend(self) -> None:
+        for listener_name in ("keyboard_listener", "mouse_listener"):
+            listener = getattr(self, listener_name)
+            if listener is None:
+                continue
+            try:
+                listener.stop()
+                listener.join(0.5)
+            except Exception:
+                pass
+            setattr(self, listener_name, None)
+
+        self.keyboard_controller = None
+        self.mouse_controller = None
+        with self.input_lock:
+            self.input_backend_ready = False
+            self.input_permission_required = False
+            self.input_support_message = self.build_default_input_support_message()
+
+    def raise_if_input_listener_failed(self, listener: object) -> None:
+        if listener is None:
+            raise RuntimeError("Input listener failed to initialize.")
+
+        trusted = getattr(listener, "IS_TRUSTED", True)
+        if sys.platform == "darwin" and not trusted:
+            raise PermissionError("Input event monitoring is not trusted.")
+
+        if listener.is_alive():
+            return
+
+        listener.join(0)
+        raise RuntimeError("Input listener stopped during startup.")
+
+    def stop_input_sessions_for_disconnect(self) -> None:
+        local_session = ""
+        remote_session = ""
+        should_send_remote_stop = False
+
+        with self.input_lock:
+            if self.input_state in {INPUT_STATE_REQUESTING, INPUT_STATE_CONTROLLING} and self.local_input_session_id:
+                local_session = self.local_input_session_id
+                should_send_remote_stop = True
+
+            if self.input_state == INPUT_STATE_CONTROLLED and self.remote_input_session_id:
+                remote_session = self.remote_input_session_id
+
+            self.local_input_session_id = ""
+            self.remote_input_session_id = ""
+            self.local_input_request_deadline = 0.0
+            self.input_state = INPUT_STATE_IDLE
+            self.clear_local_capture_state_locked()
+            self.clear_input_notice_locked()
+
+        if should_send_remote_stop and local_session:
+            try:
+                self.send_control_message("INPUT_RELEASE_ALL", local_session)
+                self.send_control_message("INPUT_STOP", local_session)
+            except Exception:
+                pass
+
+        if remote_session:
+            self.release_remote_inputs()
+
+        self.queue_refresh_input_ui()
+
+    def clear_local_capture_state_locked(self) -> None:
+        self.local_pressed_key_tokens.clear()
+        self.local_pressed_mouse_tokens.clear()
+        self.pending_mouse_dx = 0
+        self.pending_mouse_dy = 0
+        self.mouse_anchor = None
+        self.mouse_warp_events_to_ignore = 0
+
+    def stop_local_input_control(self, send_remote_stop: bool, log_message: str | None = None) -> None:
+        session_id = ""
+        with self.input_lock:
+            if self.input_state not in {INPUT_STATE_REQUESTING, INPUT_STATE_CONTROLLING} or not self.local_input_session_id:
+                return
+
+            session_id = self.local_input_session_id
+            self.local_input_session_id = ""
+            self.local_input_request_deadline = 0.0
+            self.input_state = INPUT_STATE_IDLE
+            self.clear_local_capture_state_locked()
+            self.clear_input_notice_locked()
+
+        if send_remote_stop and session_id:
+            try:
+                self.send_control_message("INPUT_RELEASE_ALL", session_id)
+                self.send_control_message("INPUT_STOP", session_id)
+            except Exception:
+                pass
+
+        if log_message:
+            self.append_log(log_message)
+
+        self.refresh_input_ui()
+        self.update_controls()
+
+    def finish_remote_input_control(self, expected_session_id: str, log_message: str | None = None) -> None:
+        release_inputs = False
+
+        with self.input_lock:
+            if self.remote_input_session_id != expected_session_id:
+                return
+
+            self.remote_input_session_id = ""
+            self.input_state = INPUT_STATE_IDLE
+            self.clear_input_notice_locked()
+            release_inputs = True
+
+        if release_inputs:
+            self.release_remote_inputs()
+
+        if log_message:
+            self.ui_events.put(("log", log_message))
+        self.queue_refresh_input_ui()
+
+    def check_input_timers(self) -> None:
+        refresh_required = False
+        log_message = None
+
+        with self.input_lock:
+            now = time.monotonic()
+
+            if self.input_notice_message and self.input_notice_deadline <= now:
+                self.clear_input_notice_locked()
+                refresh_required = True
+
+            if self.input_state == INPUT_STATE_REQUESTING and self.local_input_request_deadline and self.local_input_request_deadline <= now:
+                self.local_input_session_id = ""
+                self.local_input_request_deadline = 0.0
+                self.input_state = INPUT_STATE_IDLE
+                self.clear_local_capture_state_locked()
+                log_message = "[input share] remote control request timed out."
+                refresh_required = True
+
+        if log_message:
+            self.append_log(log_message)
+
+        if refresh_required:
+            self.refresh_input_ui()
+            self.update_controls()
+
+    def toggle_remote_control(self) -> None:
+        if not self.serial_connected():
+            return
+
+        with self.input_lock:
+            state = self.input_state
+            input_backend_ready = self.input_backend_ready
+            support_message = self.input_support_message
+            permission_required = self.input_permission_required
+
+        if state in {INPUT_STATE_REQUESTING, INPUT_STATE_CONTROLLING}:
+            self.stop_local_input_control(send_remote_stop=True, log_message="[input share] remote control stopped.")
+            return
+
+        if state == INPUT_STATE_CONTROLLED:
+            self.set_input_notice("Busy")
+            self.append_log("[input share] peer is already controlling this machine.")
+            return
+
+        if self.file_send_active:
+            self.set_input_notice("Busy")
+            self.append_log("[input share] file transfer is active. Stop it before remote control.")
+            return
+
+        if not input_backend_ready:
+            self.set_input_notice("Permission required" if permission_required else "Unavailable")
+            self.append_log(f"[input share] {support_message}")
+            self.refresh_input_ui()
+            self.update_controls()
+            return
+
+        session_id = uuid.uuid4().hex
+        with self.input_lock:
+            self.input_state = INPUT_STATE_REQUESTING
+            self.local_input_session_id = session_id
+            self.local_input_request_deadline = time.monotonic() + INPUT_REQUEST_TIMEOUT_SECONDS
+            self.clear_local_capture_state_locked()
+            self.clear_input_notice_locked()
+
+        self.append_log("[input share] requesting remote control...")
+        self.refresh_input_ui()
+        self.update_controls()
+
+        try:
+            self.send_control_message("INPUT_START", session_id)
+        except serial.SerialException as exc:
+            with self.input_lock:
+                self.input_state = INPUT_STATE_IDLE
+                self.local_input_session_id = ""
+                self.local_input_request_deadline = 0.0
+                self.clear_local_capture_state_locked()
+            self.refresh_input_ui()
+            self.update_controls()
+            messagebox.showerror("Remote Control Error", str(exc))
+            self.disconnect()
 
     def read_loop(self) -> None:
         while not self.stop_event.is_set():
-            if not self.serial_port or not self.serial_port.is_open:
+            if not self.serial_connected():
                 break
 
             try:
@@ -468,6 +977,24 @@ class SerialChatApp:
                 self.handle_file_end(parts)
             elif command == "ABORT":
                 self.handle_file_abort(parts)
+            elif command == "INPUT_START":
+                self.handle_input_start(parts)
+            elif command == "INPUT_ACK":
+                self.handle_input_ack(parts)
+            elif command == "INPUT_BUSY":
+                self.handle_input_busy(parts)
+            elif command == "INPUT_STOP":
+                self.handle_input_stop(parts)
+            elif command == "INPUT_RELEASE_ALL":
+                self.handle_input_release_all(parts)
+            elif command == "INPUT_KEY":
+                self.handle_input_key(parts)
+            elif command == "INPUT_MOUSE_MOVE":
+                self.handle_input_mouse_move(parts)
+            elif command == "INPUT_MOUSE_BUTTON":
+                self.handle_input_mouse_button(parts)
+            elif command == "INPUT_MOUSE_SCROLL":
+                self.handle_input_mouse_scroll(parts)
             else:
                 self.ui_events.put(("log", f"[receive error] unknown control command: {command}"))
         except Exception as exc:
@@ -551,6 +1078,175 @@ class SerialChatApp:
         state.file_handle.close()
         self.ui_events.put(("log", f"[receive aborted] {state.original_name}: {reason}"))
 
+    def handle_input_start(self, parts: list[str]) -> None:
+        if len(parts) != 1:
+            raise ValueError("INPUT START message is malformed.")
+
+        requested_session_id = parts[0]
+        accept_request = False
+        reply_busy = False
+        log_message = None
+
+        with self.input_lock:
+            state = self.input_state
+            local_session_id = self.local_input_session_id
+            remote_session_id = self.remote_input_session_id
+            backend_ready = self.input_backend_ready
+
+            if not backend_ready or self.file_send_active:
+                reply_busy = True
+                log_message = "[input share] rejected remote control request while busy."
+            elif state == INPUT_STATE_IDLE:
+                self.remote_input_session_id = requested_session_id
+                self.input_state = INPUT_STATE_CONTROLLED
+                self.clear_input_notice_locked()
+                accept_request = True
+                log_message = "[input share] peer started controlling this machine."
+            elif state == INPUT_STATE_REQUESTING:
+                if local_session_id and requested_session_id < local_session_id:
+                    self.local_input_session_id = ""
+                    self.local_input_request_deadline = 0.0
+                    self.clear_local_capture_state_locked()
+                    self.remote_input_session_id = requested_session_id
+                    self.input_state = INPUT_STATE_CONTROLLED
+                    self.clear_input_notice_locked()
+                    accept_request = True
+                    log_message = "[input share] local request yielded to the peer."
+                else:
+                    reply_busy = True
+                    log_message = "[input share] remote control request rejected because this side is already requesting control."
+            elif state == INPUT_STATE_CONTROLLED and remote_session_id == requested_session_id:
+                accept_request = True
+            else:
+                reply_busy = True
+                log_message = "[input share] remote control request rejected because this side is already busy."
+
+        if accept_request:
+            self.send_control_message("INPUT_ACK", requested_session_id)
+            if log_message:
+                self.ui_events.put(("log", log_message))
+            self.queue_refresh_input_ui()
+            return
+
+        if reply_busy:
+            self.send_control_message("INPUT_BUSY", requested_session_id)
+            if log_message:
+                self.ui_events.put(("log", log_message))
+
+    def handle_input_ack(self, parts: list[str]) -> None:
+        if len(parts) != 1:
+            raise ValueError("INPUT ACK message is malformed.")
+
+        session_id = parts[0]
+        log_message = None
+
+        with self.input_lock:
+            if self.input_state == INPUT_STATE_REQUESTING and self.local_input_session_id == session_id:
+                self.input_state = INPUT_STATE_CONTROLLING
+                self.local_input_request_deadline = 0.0
+                self.clear_input_notice_locked()
+                log_message = "[input share] remote control active."
+            else:
+                return
+
+        self.reset_local_mouse_anchor()
+        self.ui_events.put(("log", log_message))
+        self.queue_refresh_input_ui()
+
+    def handle_input_busy(self, parts: list[str]) -> None:
+        if len(parts) != 1:
+            raise ValueError("INPUT BUSY message is malformed.")
+
+        session_id = parts[0]
+        with self.input_lock:
+            if self.input_state == INPUT_STATE_REQUESTING and self.local_input_session_id == session_id:
+                self.input_state = INPUT_STATE_IDLE
+                self.local_input_session_id = ""
+                self.local_input_request_deadline = 0.0
+                self.clear_local_capture_state_locked()
+                self.input_notice_message = "Busy"
+                self.input_notice_deadline = time.monotonic() + INPUT_NOTICE_SECONDS
+            else:
+                return
+
+        self.ui_events.put(("log", "[input share] peer is busy."))
+        self.queue_refresh_input_ui()
+
+    def handle_input_stop(self, parts: list[str]) -> None:
+        if len(parts) != 1:
+            raise ValueError("INPUT STOP message is malformed.")
+
+        self.finish_remote_input_control(parts[0], log_message="[input share] peer stopped remote control.")
+
+    def handle_input_release_all(self, parts: list[str]) -> None:
+        if len(parts) != 1:
+            raise ValueError("INPUT RELEASE ALL message is malformed.")
+
+        session_id = parts[0]
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_CONTROLLED or self.remote_input_session_id != session_id:
+                return
+
+        self.release_remote_inputs()
+
+    def handle_input_key(self, parts: list[str]) -> None:
+        if len(parts) != 3:
+            raise ValueError("INPUT KEY message is malformed.")
+
+        session_id, action, encoded_key = parts
+        if action not in {"down", "up"}:
+            raise ValueError("INPUT KEY action is malformed.")
+
+        if not self.remote_session_matches(session_id):
+            return
+
+        key_token = decode_control_text(encoded_key)
+        if action == "down":
+            self.inject_remote_key_down(key_token)
+        else:
+            self.inject_remote_key_up(key_token)
+
+    def handle_input_mouse_move(self, parts: list[str]) -> None:
+        if len(parts) != 3:
+            raise ValueError("INPUT MOUSE MOVE message is malformed.")
+
+        session_id, dx_text, dy_text = parts
+        if not self.remote_session_matches(session_id):
+            return
+
+        self.inject_remote_mouse_move(int(dx_text), int(dy_text))
+
+    def handle_input_mouse_button(self, parts: list[str]) -> None:
+        if len(parts) != 3:
+            raise ValueError("INPUT MOUSE BUTTON message is malformed.")
+
+        session_id, encoded_button, action = parts
+        if action not in {"down", "up"}:
+            raise ValueError("INPUT MOUSE BUTTON action is malformed.")
+
+        if not self.remote_session_matches(session_id):
+            return
+
+        button_token = decode_control_text(encoded_button)
+        if action == "down":
+            self.inject_remote_mouse_button_down(button_token)
+        else:
+            self.inject_remote_mouse_button_up(button_token)
+
+    def handle_input_mouse_scroll(self, parts: list[str]) -> None:
+        if len(parts) != 3:
+            raise ValueError("INPUT MOUSE SCROLL message is malformed.")
+
+        session_id, dx_text, dy_text = parts
+        if not self.remote_session_matches(session_id):
+            return
+
+        self.inject_remote_mouse_scroll(int(dx_text), int(dy_text))
+
+    def remote_session_matches(self, session_id: str) -> bool:
+        with self.input_lock:
+            return self.input_state == INPUT_STATE_CONTROLLED and self.remote_input_session_id == session_id
+
     def close_receive_transfers(self, interrupted: bool) -> None:
         for transfer_id, state in list(self.receive_transfers.items()):
             try:
@@ -601,9 +1297,15 @@ class SerialChatApp:
                     self.update_controls()
                 elif kind == "refresh-status":
                     self.refresh_connection_status()
+                elif kind == "refresh-input-ui":
+                    self.refresh_input_ui()
+                    self.update_controls()
+                elif kind == "toggle-input":
+                    self.toggle_remote_control()
         except queue.Empty:
             pass
 
+        self.check_input_timers()
         self.root.after(100, self.process_ui_events)
 
     def send_plain_shortcut(self, event: tk.Event) -> str:
@@ -619,6 +1321,11 @@ class SerialChatApp:
     def send_message(self, mode: str) -> None:
         if mode not in {"plain", "encoded"}:
             raise ValueError(f"Unsupported message mode: {mode}")
+
+        input_state, _ = self.input_state_snapshot()
+        if input_state != INPUT_STATE_IDLE:
+            self.append_log("[input share] text send is disabled while remote control is active.")
+            return
 
         message = self.message_text.get("1.0", "end-1c")
         if not message.strip():
@@ -673,7 +1380,8 @@ class SerialChatApp:
 
     def handle_drag_enter(self, event: tk.Event) -> str:
         del event
-        if self.serial_port and self.serial_port.is_open and not self.file_send_active:
+        input_state, _ = self.input_state_snapshot()
+        if self.serial_connected() and not self.file_send_active and input_state == INPUT_STATE_IDLE:
             self.drop_zone.configure(bg="#dff3ff")
         return "break"
 
@@ -683,7 +1391,7 @@ class SerialChatApp:
         return "break"
 
     def handle_file_drop(self, event: tk.Event) -> str:
-        if not (self.serial_port and self.serial_port.is_open):
+        if not self.serial_connected():
             self.update_drop_zone_state()
             return "break"
 
@@ -694,8 +1402,13 @@ class SerialChatApp:
         return "break"
 
     def start_file_send(self, paths: list[Path]) -> None:
-        if not (self.serial_port and self.serial_port.is_open):
+        if not self.serial_connected():
             messagebox.showerror("File Send Error", "Connect to a serial port first.")
+            return
+
+        input_state, _ = self.input_state_snapshot()
+        if input_state != INPUT_STATE_IDLE:
+            messagebox.showerror("File Send Error", "Stop remote control before sending files.")
             return
 
         if self.file_send_active:
@@ -790,6 +1503,418 @@ class SerialChatApp:
                     continue
 
             return
+
+    def input_sender_loop(self) -> None:
+        while not self.shutdown_event.is_set():
+            try:
+                item = self.input_outbound_queue.get(timeout=INPUT_SENDER_POLL_SECONDS)
+            except queue.Empty:
+                item = None
+
+            self.flush_pending_mouse_move()
+
+            if item is None:
+                continue
+
+            command, session_id, parts = item
+            if command == "__shutdown__":
+                break
+
+            if not self.should_send_input_for_session(session_id):
+                continue
+
+            try:
+                self.send_control_message(command, session_id, *parts)
+            except serial.SerialException as exc:
+                self.ui_events.put(("log", f"[input send error] {exc}"))
+                self.ui_events.put(("disconnect", None))
+                return
+            except Exception as exc:
+                self.ui_events.put(("log", f"[input send error] {exc}"))
+
+    def should_send_input_for_session(self, session_id: str) -> bool:
+        with self.input_lock:
+            return (
+                self.input_state == INPUT_STATE_CONTROLLING
+                and self.local_input_session_id == session_id
+                and self.serial_connected()
+                and not self.stop_event.is_set()
+            )
+
+    def flush_pending_mouse_move(self) -> None:
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_CONTROLLING or not self.local_input_session_id:
+                self.pending_mouse_dx = 0
+                self.pending_mouse_dy = 0
+                return
+
+            dx = self.pending_mouse_dx
+            dy = self.pending_mouse_dy
+            session_id = self.local_input_session_id
+            self.pending_mouse_dx = 0
+            self.pending_mouse_dy = 0
+
+        if dx == 0 and dy == 0:
+            return
+
+        try:
+            self.send_control_message("INPUT_MOUSE_MOVE", session_id, str(dx), str(dy))
+        except serial.SerialException as exc:
+            self.ui_events.put(("log", f"[input send error] {exc}"))
+            self.ui_events.put(("disconnect", None))
+        except Exception as exc:
+            self.ui_events.put(("log", f"[input send error] {exc}"))
+
+    def queue_input_command(self, command: str, session_id: str, *parts: str) -> None:
+        self.input_outbound_queue.put((command, session_id, parts))
+
+    def reset_local_mouse_anchor(self) -> None:
+        anchor = self.get_local_pointer_position()
+        with self.input_lock:
+            self.mouse_anchor = anchor
+            self.mouse_warp_events_to_ignore = 0
+
+    def get_local_pointer_position(self) -> tuple[int, int] | None:
+        controller = self.mouse_controller
+        if controller is None:
+            return None
+
+        try:
+            x, y = controller.position
+        except Exception:
+            return None
+
+        return int(x), int(y)
+
+    def handle_global_key_press(self, key: object, injected: bool = False) -> None:
+        if injected:
+            return
+
+        if self.is_toggle_key(key):
+            self.ui_events.put(("toggle-input", None))
+            return
+
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_CONTROLLING or not self.local_input_session_id:
+                return
+            session_id = self.local_input_session_id
+
+        try:
+            key_token = encode_key_token(key)
+        except Exception:
+            return
+
+        with self.input_lock:
+            if key_token in self.local_pressed_key_tokens:
+                return
+            self.local_pressed_key_tokens.add(key_token)
+
+        self.queue_input_command("INPUT_KEY", session_id, "down", encode_control_text(key_token))
+
+    def handle_global_key_release(self, key: object, injected: bool = False) -> None:
+        if injected:
+            return
+
+        if self.is_toggle_key(key):
+            return
+
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_CONTROLLING or not self.local_input_session_id:
+                return
+            session_id = self.local_input_session_id
+
+        try:
+            key_token = encode_key_token(key)
+        except Exception:
+            return
+
+        with self.input_lock:
+            if key_token not in self.local_pressed_key_tokens:
+                return
+            self.local_pressed_key_tokens.discard(key_token)
+
+        self.queue_input_command("INPUT_KEY", session_id, "up", encode_control_text(key_token))
+
+    def handle_global_mouse_move(self, x: float, y: float, injected: bool = False) -> None:
+        if injected:
+            return
+
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_CONTROLLING or not self.local_input_session_id:
+                return
+
+            if self.mouse_anchor is None:
+                self.mouse_anchor = (int(x), int(y))
+                return
+
+            anchor_x, anchor_y = self.mouse_anchor
+            if self.mouse_warp_events_to_ignore > 0 and abs(int(x) - anchor_x) <= 1 and abs(int(y) - anchor_y) <= 1:
+                self.mouse_warp_events_to_ignore -= 1
+                return
+
+            dx = int(round(x - anchor_x))
+            dy = int(round(y - anchor_y))
+            if dx == 0 and dy == 0:
+                return
+
+            self.pending_mouse_dx += dx
+            self.pending_mouse_dy += dy
+            self.mouse_warp_events_to_ignore = INPUT_WARP_IGNORE_EVENTS
+            anchor = self.mouse_anchor
+
+        self.warp_local_pointer(anchor)
+
+    def handle_global_mouse_click(self, x: float, y: float, button: object, pressed: bool, injected: bool = False) -> None:
+        del x, y
+        if injected:
+            return
+
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_CONTROLLING or not self.local_input_session_id:
+                return
+            session_id = self.local_input_session_id
+
+        try:
+            button_token = encode_mouse_button_token(button)
+        except Exception:
+            return
+
+        with self.input_lock:
+            if pressed:
+                if button_token in self.local_pressed_mouse_tokens:
+                    return
+                self.local_pressed_mouse_tokens.add(button_token)
+                action = "down"
+            else:
+                if button_token not in self.local_pressed_mouse_tokens:
+                    return
+                self.local_pressed_mouse_tokens.discard(button_token)
+                action = "up"
+
+        self.queue_input_command("INPUT_MOUSE_BUTTON", session_id, encode_control_text(button_token), action)
+
+    def handle_global_mouse_scroll(self, x: float, y: float, dx: float, dy: float, injected: bool = False) -> None:
+        del x, y
+        if injected:
+            return
+
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_CONTROLLING or not self.local_input_session_id:
+                return
+            session_id = self.local_input_session_id
+
+        self.queue_input_command("INPUT_MOUSE_SCROLL", session_id, str(int(dx)), str(int(dy)))
+
+    def warp_local_pointer(self, anchor: tuple[int, int] | None) -> None:
+        controller = self.mouse_controller
+        if controller is None or anchor is None:
+            return
+
+        try:
+            controller.position = anchor
+        except Exception:
+            pass
+
+    def is_toggle_key(self, key: object) -> bool:
+        key_name = getattr(key, "name", "")
+        key_vk = getattr(key, "vk", None)
+
+        if sys.platform == "darwin":
+            return key_name == "f8" or key_vk == DARWIN_F8_KEYCODE
+
+        if sys.platform == "win32":
+            return key_name == "scroll_lock" or key_vk == WINDOWS_SCROLL_LOCK_VK or str(key).lower() == "key.scroll_lock"
+
+        return False
+
+    def darwin_event_is_injected(self, event: object) -> bool:
+        if Quartz is None:
+            return False
+
+        try:
+            return bool(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUnixProcessID))
+        except Exception:
+            return False
+
+    def darwin_event_keycode(self, event: object) -> int | None:
+        if Quartz is None:
+            return None
+
+        try:
+            return int(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode))
+        except Exception:
+            return None
+
+    def darwin_keyboard_intercept(self, event_type: int, event: object) -> object | None:
+        del event_type
+        if self.darwin_event_is_injected(event):
+            return event
+
+        if self.darwin_event_keycode(event) == DARWIN_F8_KEYCODE:
+            return None
+
+        with self.input_lock:
+            if self.input_state == INPUT_STATE_CONTROLLING:
+                return None
+
+        return event
+
+    def darwin_mouse_intercept(self, event_type: int, event: object) -> object | None:
+        del event_type
+        if self.darwin_event_is_injected(event):
+            return event
+
+        with self.input_lock:
+            if self.input_state == INPUT_STATE_CONTROLLING:
+                return None
+
+        return event
+
+    def win32_keyboard_filter(self, msg: int, data: object) -> bool:
+        del msg
+        vk_code = getattr(data, "vkCode", None)
+        flags = getattr(data, "flags", 0)
+
+        if flags & WINDOWS_KEY_FLAG_INJECTED:
+            return True
+
+        if vk_code == WINDOWS_SCROLL_LOCK_VK and self.keyboard_listener is not None:
+            self.keyboard_listener.suppress_event()
+            return True
+
+        with self.input_lock:
+            controlling_remote = self.input_state == INPUT_STATE_CONTROLLING
+
+        if controlling_remote and self.keyboard_listener is not None:
+            self.keyboard_listener.suppress_event()
+
+        return True
+
+    def win32_mouse_filter(self, msg: int, data: object) -> bool:
+        del msg
+        flags = getattr(data, "flags", 0)
+        if flags & WINDOWS_MOUSE_FLAG_INJECTED:
+            return True
+
+        with self.input_lock:
+            controlling_remote = self.input_state == INPUT_STATE_CONTROLLING
+
+        if controlling_remote and self.mouse_listener is not None:
+            self.mouse_listener.suppress_event()
+
+        return True
+
+    def inject_remote_key_down(self, key_token: str) -> None:
+        controller = self.keyboard_controller
+        if controller is None:
+            return
+
+        with self.input_lock:
+            if key_token in self.remote_pressed_key_tokens:
+                return
+            self.remote_pressed_key_tokens.add(key_token)
+
+        try:
+            controller.press(decode_key_token(key_token))
+        except Exception as exc:
+            with self.input_lock:
+                self.remote_pressed_key_tokens.discard(key_token)
+            self.ui_events.put(("log", f"[input share] key press failed: {exc}"))
+
+    def inject_remote_key_up(self, key_token: str) -> None:
+        controller = self.keyboard_controller
+        if controller is None:
+            return
+
+        with self.input_lock:
+            if key_token not in self.remote_pressed_key_tokens:
+                return
+            self.remote_pressed_key_tokens.discard(key_token)
+
+        try:
+            controller.release(decode_key_token(key_token))
+        except Exception as exc:
+            self.ui_events.put(("log", f"[input share] key release failed: {exc}"))
+
+    def inject_remote_mouse_move(self, dx: int, dy: int) -> None:
+        controller = self.mouse_controller
+        if controller is None:
+            return
+
+        try:
+            controller.move(dx, dy)
+        except Exception as exc:
+            self.ui_events.put(("log", f"[input share] mouse move failed: {exc}"))
+
+    def inject_remote_mouse_button_down(self, button_token: str) -> None:
+        controller = self.mouse_controller
+        if controller is None:
+            return
+
+        with self.input_lock:
+            if button_token in self.remote_pressed_mouse_tokens:
+                return
+            self.remote_pressed_mouse_tokens.add(button_token)
+
+        try:
+            controller.press(decode_mouse_button_token(button_token))
+        except Exception as exc:
+            with self.input_lock:
+                self.remote_pressed_mouse_tokens.discard(button_token)
+            self.ui_events.put(("log", f"[input share] mouse button press failed: {exc}"))
+
+    def inject_remote_mouse_button_up(self, button_token: str) -> None:
+        controller = self.mouse_controller
+        if controller is None:
+            return
+
+        with self.input_lock:
+            if button_token not in self.remote_pressed_mouse_tokens:
+                return
+            self.remote_pressed_mouse_tokens.discard(button_token)
+
+        try:
+            controller.release(decode_mouse_button_token(button_token))
+        except Exception as exc:
+            self.ui_events.put(("log", f"[input share] mouse button release failed: {exc}"))
+
+    def inject_remote_mouse_scroll(self, dx: int, dy: int) -> None:
+        controller = self.mouse_controller
+        if controller is None:
+            return
+
+        try:
+            controller.scroll(dx, dy)
+        except Exception as exc:
+            self.ui_events.put(("log", f"[input share] mouse scroll failed: {exc}"))
+
+    def release_remote_inputs(self) -> None:
+        controller_keyboard = self.keyboard_controller
+        controller_mouse = self.mouse_controller
+        if controller_keyboard is None and controller_mouse is None:
+            return
+
+        with self.input_lock:
+            key_tokens = list(self.remote_pressed_key_tokens)
+            button_tokens = list(self.remote_pressed_mouse_tokens)
+            self.remote_pressed_key_tokens.clear()
+            self.remote_pressed_mouse_tokens.clear()
+
+        for button_token in button_tokens:
+            if controller_mouse is None:
+                break
+            try:
+                controller_mouse.release(decode_mouse_button_token(button_token))
+            except Exception:
+                pass
+
+        for key_token in key_tokens:
+            if controller_keyboard is None:
+                break
+            try:
+                controller_keyboard.release(decode_key_token(key_token))
+            except Exception:
+                pass
 
     def bind_editor_shortcuts(self) -> None:
         control_shortcuts = {
@@ -964,6 +2089,8 @@ class SerialChatApp:
         self.log_text.configure(state="disabled")
 
     def on_close(self) -> None:
+        self.shutdown_event.set()
+        self.input_outbound_queue.put(("__shutdown__", "", ()))
         self.disconnect()
         self.root.destroy()
 
@@ -974,7 +2101,7 @@ def main() -> None:
     else:
         root = tk.Tk()
 
-    app = SerialChatApp(root)
+    SerialChatApp(root)
     root.mainloop()
 
 

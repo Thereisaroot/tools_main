@@ -1,6 +1,6 @@
 # Serial Text Chat v1
 
-Simple desktop chat for two machines connected through a null modem serial cable.
+Simple desktop serial app for two machines connected through a null modem cable.
 
 ## Features
 
@@ -9,16 +9,18 @@ Simple desktop chat for two machines connected through a null modem serial cable
 - Use a tall editor-style input box with its own scrollbar
 - Send plain text or obfuscated text without JSON or sender metadata
 - Copy the last received raw data or the decoded version to the clipboard
-- Show the raw sent and received data in the log
 - Send files by file picker or drag and drop
 - Save received files into `received_files/`
-- Refresh the available serial port list
+- Open the download folder from the app
+- Toggle serial-based keyboard/mouse sharing between macOS and Windows
+- Share keyboard keys, relative mouse movement, mouse buttons, and mouse wheel
 
 ## Requirements
 
 - Python 3.10+
 - `pyserial`
 - `tkinterdnd2`
+- `pynput`
 
 ## Install
 
@@ -51,35 +53,82 @@ On Windows, you can also run:
 run_serial_text_chat.bat
 ```
 
-## How to use
+## Text and File Use
 
 1. Connect the two machines with a null modem serial cable.
 2. Start the program on both machines.
 3. Select the correct serial port on each machine.
 4. Set the same baud rate on both machines.
 5. Click `Connect`.
-6. Type your message in the large input box.
-7. Click `Send Plain` to transmit the message body as-is.
-8. Click `Send Encoded` to transmit the message body after custom base64-plus-marker obfuscation.
-9. Click `Select Files` to choose files and send them.
-10. Or drag files into the drop area to send them.
-11. Click `Open Download Folder` to open the folder where received files are saved.
-12. Use `Copy to Clipboard` to copy the last received raw data.
-13. Use `Copy to Clipboard After Decode` to decode the last received data and copy the result.
+6. Type in the large message box and use `Send Plain` or `Send Encoded`.
+7. Use `Select Files` or drag files into the drop area to send them.
+8. Received files are written into `received_files/`.
+9. `Copy to Clipboard` copies the last raw text payload.
+10. `Copy to Clipboard After Decode` decodes the last obfuscated payload and copies it.
 
 Keyboard shortcuts:
 
-- `Ctrl+Enter`: send plain
-- `Ctrl+Shift+Enter`: send encoded
+- `Ctrl+Enter`: send plain text
+- `Ctrl+Shift+Enter`: send encoded text
 
-## Port examples
+## Input Share Use
+
+Input sharing is `serial-only`, `hotkey-toggle`, and `bidirectional`.
+
+- Windows hotkey: `Scroll Lock`
+- macOS hotkey: `F8`
+- macOS also accepts `Shift+F8` and `Ctrl+Shift+F8` because the toggle is triggered by the same `F8` key event
+
+How it works:
+
+1. Connect both machines first.
+2. Make sure both machines run this updated version.
+3. On the machine that should control the other one, click `Toggle Remote Control` or press the hotkey.
+4. When the state changes to `Controlling remote`, local keyboard and mouse events are sent over serial.
+5. Press the same hotkey again, or click `Stop Remote Control`, to release control.
+
+Current v1 scope:
+
+- Supported targets: `macOS <-> Windows`
+- Shared input: keyboard, mouse move, click, scroll
+- Mouse mode: relative movement
+- Receiver policy: always armed
+
+Not included in v1:
+
+- clipboard sync
+- edge switching
+- multi-monitor awareness
+- auth/encryption
+- drag/file handoff between machines
+
+## Interaction Rules
+
+- While remote control is active, text send and file send controls are disabled.
+- While file transfer is active, remote control cannot be started.
+- `Open Download Folder` stays available all the time.
+- File transfer still uses per-chunk acknowledgements.
+- Remote control uses a session-based `INPUT_*` control protocol on the same serial link.
+
+## macOS Permissions
+
+macOS global keyboard and mouse hooks need system permissions.
+
+If the app shows `Permission required`, allow the Python app or terminal app in:
+
+- `System Settings -> Privacy & Security -> Accessibility`
+- `System Settings -> Privacy & Security -> Input Monitoring`
+
+Then fully quit and relaunch the program.
+
+## Port Examples
 
 - macOS: `/dev/tty.usbserial-xxxx`, `/dev/cu.usbserial-xxxx`
 - Linux USB serial: `/dev/ttyUSB0`
 - Linux onboard serial: `/dev/ttyS0`
 - Windows: `COM3`
 
-## Serial settings
+## Serial Settings
 
 The program uses these defaults:
 
@@ -87,11 +136,11 @@ The program uses these defaults:
 - no parity
 - 1 stop bit
 - no flow control
-- CRLF line ending
+- `NUL` terminator for payload framing
 
-Both PCs must use matching serial settings.
+Both machines must use matching serial settings.
 
-## Linux permissions
+## Linux Permissions
 
 If the serial port cannot be opened on Linux, add your user to the serial access group and log in again:
 
@@ -101,13 +150,10 @@ sudo usermod -a -G dialout "$USER"
 
 ## Notes
 
-- Messages are framed with a `NUL` terminator so the full body can be received as one unit.
-- File transfers are sent as chunked control frames over the same serial link.
-- File transfers now wait for per-chunk acknowledgements, so they are slower but more reliable across mixed macOS/Windows links.
-- You can type a port manually if it does not appear in the list.
-- `loop://` also works for a local self-test on one machine.
-- Plain messages send only the original body. Encoded messages send only the obfuscated body.
-- Encoded messages insert `A`, `B`, `C` markers after each 4-character base64 block.
-- Received files are saved under `received_files/` next to the program.
+- Text payloads still send only the message body.
+- Encoded text still uses the existing base64-plus-marker obfuscation.
+- File transfers are chunked control frames over the same serial link.
+- Input sharing uses `INPUT_START / INPUT_ACK / INPUT_BUSY / INPUT_STOP / INPUT_RELEASE_ALL` and per-event input frames.
+- Both sides must be updated to the same build for input sharing and file transfer.
 - Common higher baud rates like `230400`, `460800`, `921600`, and `1000000` are listed, and you can type other values manually.
-- If one direction starts corrupting at very high baud rates, try `460800` or `921600` first. This build adds a small send delay above `460800` to improve stability.
+- If one direction starts corrupting at very high baud rates, try `460800` or `921600` first. This build still adds a small send delay above `460800` to improve stability.
