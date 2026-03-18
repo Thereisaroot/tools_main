@@ -49,6 +49,13 @@ else:
     Quartz = None
     AppKit = None
 
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+else:
+    ctypes = None
+    wintypes = None
+
 MESSAGE_TERMINATOR = b"\0"
 CONTROL_PREFIX = "\x1eSTCFILE"
 CONTROL_SEPARATOR = "\x1f"
@@ -66,6 +73,9 @@ INPUT_WARP_IGNORE_EVENTS = 4
 REMOTE_KEY_REPEAT_INITIAL_DELAY_SECONDS = 0.35
 REMOTE_KEY_REPEAT_INTERVAL_SECONDS = 0.05
 REMOTE_KEY_REPEAT_POLL_SECONDS = 0.01
+AUTO_EDGE_HOLD_SECONDS = 1.0
+AUTO_EDGE_EXIT_STALE_SECONDS = 0.2
+AUX_DISPLAY_REFRESH_SECONDS = 1.0
 RECEIVED_FILES_DIR = Path(__file__).resolve().parent / "received_files"
 BAUD_RATE_OPTIONS = [
     "9600",
@@ -94,6 +104,19 @@ EMERGENCY_EXIT_KEY_TOKEN = "special:esc"
 APP_HOTKEY_MODIFIER_TOKENS = frozenset({"special:ctrl", "special:alt"})
 APP_COPY_TRIGGER_CHARS = frozenset({"c", "ㅊ"})
 APP_SEND_TRIGGER_CHARS = frozenset({"v", "ㅍ"})
+AUTO_EDGE_DISABLED = "off"
+AUTO_EDGE_MODE_ENTER = "enter"
+AUTO_EDGE_MODE_EXIT = "exit"
+AUTO_EDGE_SIDE_RIGHT = "Right"
+AUTO_EDGE_SIDE_LEFT = "Left"
+AUTO_EDGE_SIDE_TOP = "Top"
+AUTO_EDGE_SIDE_BOTTOM = "Bottom"
+AUTO_EDGE_SIDE_OPTIONS = [
+    AUTO_EDGE_SIDE_RIGHT,
+    AUTO_EDGE_SIDE_LEFT,
+    AUTO_EDGE_SIDE_TOP,
+    AUTO_EDGE_SIDE_BOTTOM,
+]
 DARWIN_SHORTCUT_KEYCODES = {
     0: "select_all",
     7: "cut",
@@ -340,6 +363,14 @@ class ReceiveFileState:
     next_chunk_index: int = 0
 
 
+@dataclass(frozen=True)
+class DisplayRect:
+    min_x: int
+    min_y: int
+    max_x: int
+    max_y: int
+
+
 class SerialChatApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -386,6 +417,10 @@ class SerialChatApp:
         self.mac_hotkey_local_monitor = None
         self.mac_hotkey_global_handler = None
         self.mac_hotkey_local_handler = None
+        self.mac_mouse_global_monitor = None
+        self.mac_mouse_local_monitor = None
+        self.mac_mouse_global_handler = None
+        self.mac_mouse_local_handler = None
         self.remote_pressed_key_tokens: set[str] = set()
         self.remote_physical_key_tokens: set[str] = set()
         self.remote_pressed_mouse_tokens: set[str] = set()
@@ -394,8 +429,18 @@ class SerialChatApp:
         self.pending_mouse_dy = 0
         self.mouse_anchor: tuple[int, int] | None = None
         self.mouse_warp_events_to_ignore = 0
+        self.last_idle_pointer_position: tuple[int, int, str] | None = None
+        self.edge_hold_direction = ""
+        self.edge_hold_mode = ""
+        self.edge_hold_started_at = 0.0
+        self.edge_hold_last_progress_at = 0.0
+        self.display_rects_cache: tuple[DisplayRect, ...] = ()
+        self.display_rects_cache_mode = ""
+        self.display_rects_cache_deadline = 0.0
         self.editor_modifier_state: set[str] = set()
         self.app_state = self.load_app_state()
+        self.auto_edge_enabled = bool(self.app_state.get("auto_edge_enabled", False))
+        self.peer_side = str(self.app_state.get("peer_side", AUTO_EDGE_SIDE_RIGHT))
 
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="115200")
@@ -403,6 +448,8 @@ class SerialChatApp:
         self.input_state_var = tk.StringVar(value="State: Idle")
         self.input_hotkey_var = tk.StringVar(value=self.build_hotkey_hint())
         self.input_support_var = tk.StringVar(value=self.input_support_message)
+        self.auto_edge_enabled_var = tk.BooleanVar(value=self.auto_edge_enabled)
+        self.peer_side_var = tk.StringVar(value=self.peer_side)
 
         self._build_ui()
         self.refresh_ports()
@@ -490,6 +537,28 @@ class SerialChatApp:
         self.toggle_remote_button.pack(side="left", padx=(0, 12))
 
         ttk.Label(input_actions, textvariable=self.input_state_var).pack(side="left", anchor="w")
+        edge_actions = ttk.Frame(input_share_frame)
+        edge_actions.pack(fill="x", pady=(6, 0))
+
+        self.auto_edge_toggle = ttk.Checkbutton(
+            edge_actions,
+            text="Auto edge toggle",
+            variable=self.auto_edge_enabled_var,
+            command=self.on_auto_edge_settings_changed,
+        )
+        self.auto_edge_toggle.pack(side="left", padx=(0, 12))
+
+        ttk.Label(edge_actions, text="Peer side").pack(side="left")
+        self.peer_side_combo = ttk.Combobox(
+            edge_actions,
+            textvariable=self.peer_side_var,
+            values=AUTO_EDGE_SIDE_OPTIONS,
+            state="readonly",
+            width=8,
+        )
+        self.peer_side_combo.pack(side="left", padx=(8, 0))
+        self.peer_side_combo.bind("<<ComboboxSelected>>", self.on_peer_side_selected)
+
         ttk.Label(input_share_frame, textvariable=self.input_hotkey_var, wraplength=840, justify="left").pack(anchor="w", pady=(6, 0))
         ttk.Label(input_share_frame, textvariable=self.input_support_var, wraplength=840, justify="left").pack(anchor="w", pady=(2, 0))
 
@@ -595,10 +664,14 @@ class SerialChatApp:
             return "Input sharing unavailable: install pynput and restart the app."
         if sys.platform == "darwin":
             return (
-                "Connect first. Global keyboard hotkeys initialize after connect, and mouse capture starts only "
-                "when remote control begins. macOS also needs Accessibility and Input Monitoring."
+                "Connect first. Global keyboard hotkeys initialize after connect. Auto edge toggle uses whole-desktop "
+                "screen edges, and mouse capture starts only when remote control begins. macOS also needs Accessibility "
+                "and Input Monitoring."
             )
-        return "Connect first. Global keyboard hotkeys initialize after connect, and mouse capture starts only when remote control begins."
+        return (
+            "Connect first. Global keyboard hotkeys initialize after connect. Auto edge toggle uses whole-desktop "
+            "screen edges, and mouse capture starts only when remote control begins."
+        )
 
     def build_input_backend_error_message(self, exc: Exception) -> str:
         if not supported_input_platform():
@@ -664,11 +737,13 @@ class SerialChatApp:
                 self.input_support_message = self.build_default_input_support_message()
             elif sys.platform == "darwin":
                 self.input_support_message = (
-                    "Connected. Preparing global keyboard hotkeys. Mouse capture will start only when remote control begins."
+                    "Connected. Preparing global keyboard hotkeys and auto edge monitors. Mouse capture will start only "
+                    "when remote control begins."
                 )
             else:
                 self.input_support_message = (
-                    "Connected. Preparing global keyboard hotkeys. Mouse capture will start only when remote control begins."
+                    "Connected. Preparing global keyboard hotkeys. Auto edge can use the mouse listener while idle, and "
+                    "mouse capture will start when remote control begins."
                 )
 
     def prepare_input_receive_backend(self) -> bool:
@@ -745,6 +820,31 @@ class SerialChatApp:
                     self.mac_hotkey_local_handler,
                 )
 
+            mouse_mask = (
+                AppKit.NSEventMaskMouseMoved
+                | AppKit.NSEventMaskLeftMouseDragged
+                | AppKit.NSEventMaskRightMouseDragged
+                | AppKit.NSEventMaskOtherMouseDragged
+            )
+
+            if self.mac_mouse_global_monitor is None:
+                self.mac_mouse_global_handler = self.handle_mac_mouse_event
+                self.mac_mouse_global_monitor = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                    mouse_mask,
+                    self.mac_mouse_global_handler,
+                )
+
+            if self.mac_mouse_local_monitor is None:
+                def local_mouse_handler(event: object) -> object:
+                    self.handle_mac_mouse_event(event)
+                    return event
+
+                self.mac_mouse_local_handler = local_mouse_handler
+                self.mac_mouse_local_monitor = AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                    mouse_mask,
+                    self.mac_mouse_local_handler,
+                )
+
             self.mac_hotkey_backend_ready = True
             with self.input_lock:
                 self.input_permission_required = False
@@ -771,7 +871,12 @@ class SerialChatApp:
             self.mac_hotkey_backend_ready = False
             return
 
-        for attr_name in ("mac_hotkey_global_monitor", "mac_hotkey_local_monitor"):
+        for attr_name in (
+            "mac_hotkey_global_monitor",
+            "mac_hotkey_local_monitor",
+            "mac_mouse_global_monitor",
+            "mac_mouse_local_monitor",
+        ):
             monitor = getattr(self, attr_name)
             if monitor is None:
                 continue
@@ -783,6 +888,8 @@ class SerialChatApp:
 
         self.mac_hotkey_global_handler = None
         self.mac_hotkey_local_handler = None
+        self.mac_mouse_global_handler = None
+        self.mac_mouse_local_handler = None
         self.mac_hotkey_backend_ready = False
 
     def handle_mac_hotkey_event(self, event: object) -> None:
@@ -816,6 +923,17 @@ class SerialChatApp:
             self.ui_events.put(("copy-last-decoded" if shift_active else "copy-last", None))
         elif keycode == 9:
             self.ui_events.put(("send-encoded-global" if shift_active else "send-plain-global", None))
+
+    def handle_mac_mouse_event(self, event: object) -> None:
+        del event
+        if sys.platform != "darwin" or AppKit is None:
+            return
+
+        if not self.serial_connected():
+            return
+
+        point = AppKit.NSEvent.mouseLocation()
+        self.handle_idle_edge_pointer_move(int(point.x), int(point.y), coordinate_mode="appkit")
 
     def build_keyboard_listener_options(self) -> dict[str, object]:
         keyboard_options: dict[str, object] = {}
@@ -907,14 +1025,29 @@ class SerialChatApp:
         self.update_windows_listener_suppression()
         return True
 
+    def sync_auto_edge_runtime(self) -> None:
+        if not self.serial_connected() or not self.auto_edge_enabled_var.get():
+            return
+
+        if sys.platform == "win32":
+            try:
+                self.ensure_mouse_listener_started()
+            except Exception as exc:
+                self.append_log(f"[input share] auto edge mouse listener unavailable: {exc}")
+        elif sys.platform == "darwin" and not self.mac_hotkey_backend_ready:
+            self.start_hotkey_backend()
+
     def update_controls(self) -> None:
         connected = self.serial_connected()
         input_state, input_backend_ready = self.input_state_snapshot()
+        input_supported = supported_input_platform()
 
         self.connect_button.configure(text="Disconnect" if connected else "Connect")
         self.send_plain_button.configure(state="normal" if connected else "disabled")
         self.send_encoded_button.configure(state="normal" if connected else "disabled")
         self.select_file_button.configure(state="normal" if connected and not self.file_send_active and input_state == INPUT_STATE_IDLE else "disabled")
+        self.auto_edge_toggle.configure(state="normal" if input_supported else "disabled")
+        self.peer_side_combo.configure(state="readonly" if input_supported else "disabled")
 
         if not connected or self.file_send_active:
             toggle_state = "disabled"
@@ -1030,6 +1163,7 @@ class SerialChatApp:
         self.refresh_input_support_for_connection()
         self.prepare_input_receive_backend()
         self.start_hotkey_backend()
+        self.sync_auto_edge_runtime()
         self.reader_thread = threading.Thread(target=self.read_loop, daemon=True)
         self.reader_thread.start()
         self.refresh_connection_status()
@@ -1066,7 +1200,7 @@ class SerialChatApp:
         else:
             self.status_var.set("Disconnected")
 
-    def load_app_state(self) -> dict[str, str]:
+    def load_app_state(self) -> dict[str, object]:
         try:
             raw_state = json.loads(APP_STATE_PATH.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -1075,10 +1209,20 @@ class SerialChatApp:
         if not isinstance(raw_state, dict):
             return {}
 
+        loaded_state: dict[str, object] = {}
         last_port = raw_state.get("last_port")
-        if not isinstance(last_port, str):
-            return {}
-        return {"last_port": last_port}
+        if isinstance(last_port, str):
+            loaded_state["last_port"] = last_port
+
+        auto_edge_enabled = raw_state.get("auto_edge_enabled")
+        if isinstance(auto_edge_enabled, bool):
+            loaded_state["auto_edge_enabled"] = auto_edge_enabled
+
+        peer_side = raw_state.get("peer_side")
+        if isinstance(peer_side, str) and peer_side in AUTO_EDGE_SIDE_OPTIONS:
+            loaded_state["peer_side"] = peer_side
+
+        return loaded_state
 
     def save_app_state(self) -> None:
         try:
@@ -1088,6 +1232,256 @@ class SerialChatApp:
             )
         except OSError:
             pass
+
+    def persist_auto_edge_settings(self) -> None:
+        self.auto_edge_enabled = bool(self.auto_edge_enabled_var.get())
+        self.peer_side = self.peer_side_var.get().strip() or AUTO_EDGE_SIDE_RIGHT
+        self.app_state["auto_edge_enabled"] = self.auto_edge_enabled
+        self.app_state["peer_side"] = self.peer_side
+        self.save_app_state()
+
+    def on_peer_side_selected(self, event: tk.Event) -> None:
+        del event
+        self.on_auto_edge_settings_changed()
+
+    def on_auto_edge_settings_changed(self) -> None:
+        side = self.peer_side_var.get().strip()
+        if side not in AUTO_EDGE_SIDE_OPTIONS:
+            side = AUTO_EDGE_SIDE_RIGHT
+            self.peer_side_var.set(side)
+
+        self.persist_auto_edge_settings()
+        self.reset_auto_edge_hold()
+        self.refresh_input_ui()
+        self.update_controls()
+        self.sync_auto_edge_runtime()
+
+    def current_peer_side(self) -> str:
+        side = self.peer_side
+        if side in AUTO_EDGE_SIDE_OPTIONS:
+            return side
+        return AUTO_EDGE_SIDE_RIGHT
+
+    def current_exit_side(self) -> str:
+        return {
+            AUTO_EDGE_SIDE_RIGHT: AUTO_EDGE_SIDE_LEFT,
+            AUTO_EDGE_SIDE_LEFT: AUTO_EDGE_SIDE_RIGHT,
+            AUTO_EDGE_SIDE_TOP: AUTO_EDGE_SIDE_BOTTOM,
+            AUTO_EDGE_SIDE_BOTTOM: AUTO_EDGE_SIDE_TOP,
+        }[self.current_peer_side()]
+
+    def reset_auto_edge_hold_locked(self) -> None:
+        self.edge_hold_direction = ""
+        self.edge_hold_mode = ""
+        self.edge_hold_started_at = 0.0
+        self.edge_hold_last_progress_at = 0.0
+
+    def reset_auto_edge_hold(self) -> None:
+        with self.input_lock:
+            self.reset_auto_edge_hold_locked()
+
+    def refresh_display_rects(self, coordinate_mode: str) -> tuple[DisplayRect, ...]:
+        if coordinate_mode == "appkit" and sys.platform == "darwin" and AppKit is not None:
+            screens = AppKit.NSScreen.screens()
+            return tuple(
+                DisplayRect(
+                    int(screen.frame().origin.x),
+                    int(screen.frame().origin.y),
+                    int(screen.frame().origin.x + screen.frame().size.width),
+                    int(screen.frame().origin.y + screen.frame().size.height),
+                )
+                for screen in screens
+            )
+
+        if coordinate_mode == "screen" and sys.platform == "win32" and ctypes is not None and wintypes is not None:
+            rects: list[DisplayRect] = []
+
+            callback_type = ctypes.WINFUNCTYPE(
+                ctypes.c_int,
+                wintypes.HMONITOR,
+                wintypes.HDC,
+                ctypes.POINTER(wintypes.RECT),
+                wintypes.LPARAM,
+            )
+
+            @callback_type
+            def enum_callback(monitor: object, hdc: object, rect_ptr: object, data: object) -> int:
+                del monitor, hdc, data
+                rect = rect_ptr.contents
+                rects.append(DisplayRect(int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)))
+                return 1
+
+            ctypes.windll.user32.EnumDisplayMonitors(0, 0, enum_callback, 0)
+            return tuple(rects)
+
+        return ()
+
+    def get_display_rects(self, coordinate_mode: str) -> tuple[DisplayRect, ...]:
+        now = time.monotonic()
+        with self.input_lock:
+            if (
+                self.display_rects_cache
+                and self.display_rects_cache_mode == coordinate_mode
+                and self.display_rects_cache_deadline > now
+            ):
+                return self.display_rects_cache
+
+        rects = self.refresh_display_rects(coordinate_mode)
+        with self.input_lock:
+            self.display_rects_cache = rects
+            self.display_rects_cache_mode = coordinate_mode
+            self.display_rects_cache_deadline = now + AUX_DISPLAY_REFRESH_SECONDS
+        return rects
+
+    def point_matches_edge_segment(self, rect: DisplayRect, side: str, x: int, y: int) -> bool:
+        if side in {AUTO_EDGE_SIDE_RIGHT, AUTO_EDGE_SIDE_LEFT}:
+            return rect.min_y <= y < rect.max_y
+        return rect.min_x <= x < rect.max_x
+
+    def edge_boundary_for_point(self, side: str, x: int, y: int, coordinate_mode: str) -> int | None:
+        rects = self.get_display_rects(coordinate_mode)
+        matching_rects = [rect for rect in rects if self.point_matches_edge_segment(rect, side, x, y)]
+        if not matching_rects:
+            return None
+
+        if side == AUTO_EDGE_SIDE_RIGHT:
+            return max(rect.max_x for rect in matching_rects)
+        if side == AUTO_EDGE_SIDE_LEFT:
+            return min(rect.min_x for rect in matching_rects)
+        if side == AUTO_EDGE_SIDE_TOP:
+            if coordinate_mode == "appkit":
+                return max(rect.max_y for rect in matching_rects)
+            return min(rect.min_y for rect in matching_rects)
+        if coordinate_mode == "appkit":
+            return min(rect.min_y for rect in matching_rects)
+        return max(rect.max_y for rect in matching_rects)
+
+    def point_is_on_outer_edge(self, side: str, x: int, y: int, coordinate_mode: str) -> bool:
+        boundary = self.edge_boundary_for_point(side, x, y, coordinate_mode)
+        if boundary is None:
+            return False
+
+        if side == AUTO_EDGE_SIDE_RIGHT:
+            return x >= boundary - 1
+        if side == AUTO_EDGE_SIDE_LEFT:
+            return x <= boundary + 1
+        if side == AUTO_EDGE_SIDE_TOP:
+            if coordinate_mode == "appkit":
+                return y >= boundary - 1
+            return y <= boundary + 1
+        if coordinate_mode == "appkit":
+            return y <= boundary + 1
+        return y >= boundary - 1
+
+    def movement_toward_side(self, dx: int, dy: int, side: str, coordinate_mode: str) -> bool:
+        if side == AUTO_EDGE_SIDE_RIGHT:
+            return dx > 0
+        if side == AUTO_EDGE_SIDE_LEFT:
+            return dx < 0
+        if side == AUTO_EDGE_SIDE_TOP:
+            return dy > 0 if coordinate_mode == "appkit" else dy < 0
+        return dy < 0 if coordinate_mode == "appkit" else dy > 0
+
+    def movement_away_from_side(self, dx: int, dy: int, side: str, coordinate_mode: str) -> bool:
+        if side == AUTO_EDGE_SIDE_RIGHT:
+            return dx < 0
+        if side == AUTO_EDGE_SIDE_LEFT:
+            return dx > 0
+        if side == AUTO_EDGE_SIDE_TOP:
+            return dy < 0 if coordinate_mode == "appkit" else dy > 0
+        return dy > 0 if coordinate_mode == "appkit" else dy < 0
+
+    def get_idle_pointer_position(self) -> tuple[int, int, str] | None:
+        if sys.platform == "darwin" and AppKit is not None:
+            point = AppKit.NSEvent.mouseLocation()
+            return int(point.x), int(point.y), "appkit"
+
+        position = self.get_local_pointer_position()
+        if position is None:
+            return None
+        return position[0], position[1], "screen"
+
+    def handle_idle_edge_pointer_move(self, x: int, y: int, coordinate_mode: str) -> None:
+        previous_pointer = self.last_idle_pointer_position
+        self.last_idle_pointer_position = (x, y, coordinate_mode)
+
+        with self.input_lock:
+            if (
+                not self.auto_edge_enabled
+                or not self.serial_connected()
+                or self.file_send_active
+                or self.input_state != INPUT_STATE_IDLE
+            ):
+                self.reset_auto_edge_hold_locked()
+                return
+
+            side = self.current_peer_side()
+
+        pointer = self.get_idle_pointer_position()
+        if pointer is not None:
+            x, y, coordinate_mode = pointer
+            self.last_idle_pointer_position = pointer
+
+        at_edge = self.point_is_on_outer_edge(side, x, y, coordinate_mode)
+        if not at_edge:
+            self.reset_auto_edge_hold()
+            return
+
+        with self.input_lock:
+            mode = self.edge_hold_mode
+            direction = self.edge_hold_direction
+            started_at = self.edge_hold_started_at
+
+        if mode == AUTO_EDGE_MODE_ENTER and direction == side and started_at:
+            if previous_pointer is not None:
+                prev_x, prev_y, prev_mode = previous_pointer
+                if prev_mode == coordinate_mode and self.movement_away_from_side(x - prev_x, y - prev_y, side, coordinate_mode):
+                    self.reset_auto_edge_hold()
+                    return
+            return
+
+        if previous_pointer is None:
+            return
+
+        prev_x, prev_y, prev_mode = previous_pointer
+        if prev_mode != coordinate_mode:
+            return
+
+        if not self.movement_toward_side(x - prev_x, y - prev_y, side, coordinate_mode):
+            return
+
+        self.start_auto_edge_hold(side, AUTO_EDGE_MODE_ENTER)
+
+    def start_auto_edge_hold(self, direction: str, mode: str) -> None:
+        now = time.monotonic()
+        with self.input_lock:
+            if self.edge_hold_mode == mode and self.edge_hold_direction == direction and self.edge_hold_started_at:
+                self.edge_hold_last_progress_at = now
+                return
+
+            self.edge_hold_direction = direction
+            self.edge_hold_mode = mode
+            self.edge_hold_started_at = now
+            self.edge_hold_last_progress_at = now
+
+    def handle_auto_edge_exit_motion(self, dx: int, dy: int) -> None:
+        with self.input_lock:
+            if (
+                not self.auto_edge_enabled
+                or self.file_send_active
+                or self.input_state != INPUT_STATE_CONTROLLING
+            ):
+                self.reset_auto_edge_hold_locked()
+                return
+
+            side = self.current_exit_side()
+
+        if not self.movement_toward_side(dx, dy, side, "screen"):
+            if dx != 0 or dy != 0:
+                self.reset_auto_edge_hold()
+            return
+
+        self.start_auto_edge_hold(side, AUTO_EDGE_MODE_EXIT)
 
     def start_input_backend(self) -> None:
         if not self.input_feature_available():
@@ -1189,6 +1583,7 @@ class SerialChatApp:
             self.input_state = INPUT_STATE_IDLE
             self.clear_local_capture_state_locked()
             self.clear_input_notice_locked()
+            self.reset_auto_edge_hold_locked()
 
         if should_send_remote_stop and local_session:
             try:
@@ -1212,6 +1607,8 @@ class SerialChatApp:
         self.pending_mouse_dy = 0
         self.mouse_anchor = None
         self.mouse_warp_events_to_ignore = 0
+        self.last_idle_pointer_position = None
+        self.reset_auto_edge_hold_locked()
 
     def update_windows_listener_suppression(self) -> None:
         if sys.platform != "win32":
@@ -1262,6 +1659,7 @@ class SerialChatApp:
             self.remote_input_session_id = ""
             self.input_state = INPUT_STATE_IDLE
             self.clear_input_notice_locked()
+            self.reset_auto_edge_hold_locked()
             release_inputs = True
 
         if release_inputs:
@@ -1275,6 +1673,7 @@ class SerialChatApp:
     def check_input_timers(self) -> None:
         refresh_required = False
         log_message = None
+        auto_edge_action = ""
 
         with self.input_lock:
             now = time.monotonic()
@@ -1291,8 +1690,23 @@ class SerialChatApp:
                 log_message = "[input share] remote control request timed out."
                 refresh_required = True
 
+            if self.edge_hold_mode == AUTO_EDGE_MODE_EXIT and self.edge_hold_last_progress_at:
+                if self.edge_hold_last_progress_at + AUTO_EDGE_EXIT_STALE_SECONDS <= now:
+                    self.reset_auto_edge_hold_locked()
+
+            if self.edge_hold_started_at and self.edge_hold_started_at + AUTO_EDGE_HOLD_SECONDS <= now:
+                auto_edge_action = self.edge_hold_mode
+                self.reset_auto_edge_hold_locked()
+
         if log_message:
             self.append_log(log_message)
+
+        if auto_edge_action == AUTO_EDGE_MODE_ENTER:
+            pointer = self.get_idle_pointer_position()
+            if pointer is not None and self.point_is_on_outer_edge(self.current_peer_side(), pointer[0], pointer[1], pointer[2]):
+                self.ui_events.put(("auto-edge-enter", None))
+        elif auto_edge_action == AUTO_EDGE_MODE_EXIT:
+            self.ui_events.put(("auto-edge-exit", None))
 
         if refresh_required:
             self.refresh_input_ui()
@@ -1549,6 +1963,7 @@ class SerialChatApp:
                 self.remote_input_session_id = requested_session_id
                 self.input_state = INPUT_STATE_CONTROLLED
                 self.clear_input_notice_locked()
+                self.reset_auto_edge_hold_locked()
                 accept_request = True
                 log_message = "[input share] peer started controlling this machine."
             elif state == INPUT_STATE_REQUESTING:
@@ -1559,6 +1974,7 @@ class SerialChatApp:
                     self.remote_input_session_id = requested_session_id
                     self.input_state = INPUT_STATE_CONTROLLED
                     self.clear_input_notice_locked()
+                    self.reset_auto_edge_hold_locked()
                     accept_request = True
                     log_message = "[input share] local request yielded to the peer."
                 else:
@@ -1762,6 +2178,10 @@ class SerialChatApp:
                     self.send_message("plain")
                 elif kind == "send-encoded-global":
                     self.send_message("encoded")
+                elif kind == "auto-edge-enter":
+                    self.handle_auto_edge_enter_action()
+                elif kind == "auto-edge-exit":
+                    self.handle_auto_edge_exit_action()
                 elif kind == "force-stop-input":
                     self.stop_local_input_control(send_remote_stop=True, log_message="[input share] emergency stop.")
                 elif kind == "force-close":
@@ -1782,6 +2202,30 @@ class SerialChatApp:
         del event
         self.send_message("encoded")
         return "break"
+
+    def handle_auto_edge_enter_action(self) -> None:
+        if not self.auto_edge_enabled or not self.serial_connected():
+            return
+
+        if self.file_send_active:
+            return
+
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_IDLE:
+                return
+
+        self.append_log(f"[input share] auto edge entering toward {self.current_peer_side().lower()}.")
+        self.toggle_remote_control()
+
+    def handle_auto_edge_exit_action(self) -> None:
+        if not self.auto_edge_enabled or not self.serial_connected():
+            return
+
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_CONTROLLING:
+                return
+
+        self.stop_local_input_control(send_remote_stop=True, log_message="[input share] remote control stopped by auto edge.")
 
     def send_message(self, mode: str) -> None:
         if mode not in {"plain", "encoded"}:
@@ -1883,6 +2327,7 @@ class SerialChatApp:
             messagebox.showerror("File Send Error", "No regular files were selected.")
             return
 
+        self.reset_auto_edge_hold()
         self.file_send_active = True
         self.update_controls()
         self.file_send_thread = threading.Thread(target=self.send_files_worker, args=(files,), daemon=True)
@@ -2204,9 +2649,17 @@ class SerialChatApp:
             return
 
         with self.input_lock:
-            if self.input_state != INPUT_STATE_CONTROLLING or not self.local_input_session_id:
-                return
+            state = self.input_state
+            session_id = self.local_input_session_id
 
+        if state != INPUT_STATE_CONTROLLING or not session_id:
+            self.handle_idle_edge_pointer_move(int(x), int(y), coordinate_mode="screen")
+            return
+
+        dx = 0
+        dy = 0
+        anchor: tuple[int, int] | None = None
+        with self.input_lock:
             if self.mouse_anchor is None:
                 self.mouse_anchor = (int(x), int(y))
                 return
@@ -2226,6 +2679,7 @@ class SerialChatApp:
             self.mouse_warp_events_to_ignore = INPUT_WARP_IGNORE_EVENTS
             anchor = self.mouse_anchor
 
+        self.handle_auto_edge_exit_motion(dx, dy)
         self.warp_local_pointer(anchor)
 
     def handle_global_mouse_click(self, x: float, y: float, button: object, pressed: bool, injected: bool = False) -> None:

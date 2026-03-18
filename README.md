@@ -14,6 +14,7 @@ Simple desktop serial app for two machines connected through a null modem cable.
 - Open the download folder from the app
 - Toggle serial-based keyboard/mouse sharing between macOS and Windows
 - Share keyboard keys, relative mouse movement, mouse buttons, and mouse wheel
+- Optionally auto-toggle remote control from a configured whole-desktop screen edge
 
 ## Requirements
 
@@ -88,7 +89,9 @@ How it works:
 3. On the machine that should control the other one, click `Toggle Remote Control` or press the hotkey. The global capture hooks initialize at that moment, while the receive side is prepared after serial connect.
 4. When the state changes to `Controlling remote`, local keyboard and mouse events are sent over serial.
 5. Press the same hotkey again, or click `Stop Remote Control`, to release control.
-6. If remote control ever gets stuck, use the emergency stop or emergency exit combo locally.
+6. Optional: enable `Auto edge toggle`, choose the peer side, then push against that outer screen edge for about 1 second to start remote control.
+7. While controlling remote, push against the opposite direction for about 1 second to stop remote control.
+8. If remote control ever gets stuck, use the emergency stop or emergency exit combo locally.
 
 Current v1 scope:
 
@@ -96,12 +99,12 @@ Current v1 scope:
 - Shared input: keyboard, mouse move, click, scroll
 - Mouse mode: relative movement
 - Receiver policy: always armed
+- Auto edge toggle: whole-desktop outer edges with configurable peer side
 
 Not included in v1:
 
 - clipboard sync
-- edge switching
-- multi-monitor awareness
+- complex multi-host or multi-edge topologies
 - auth/encryption
 - drag/file handoff between machines
 
@@ -110,6 +113,7 @@ Not included in v1:
 - Text messages use separate internal frames, so text send can coexist with remote control traffic.
 - File send stays disabled while remote control is active.
 - While file transfer is active, remote control cannot be started.
+- Auto edge toggle only starts from `Idle` and only stops from `Controlling remote`.
 - `Open Download Folder` stays available all the time.
 - File transfer still uses per-chunk acknowledgements.
 - Remote control uses a session-based `INPUT_*` control protocol on the same serial link.
@@ -159,5 +163,6 @@ sudo usermod -a -G dialout "$USER"
 - File transfers are chunked control frames over the same serial link.
 - Input sharing uses `INPUT_START / INPUT_ACK / INPUT_BUSY / INPUT_STOP / INPUT_RELEASE_ALL` and per-event input frames.
 - Both sides must be updated to the same build for input sharing and file transfer.
+- Auto edge toggle settings persist between launches.
 - Common higher baud rates like `230400`, `460800`, `921600`, and `1000000` are listed, and you can type other values manually.
 - If one direction starts corrupting at very high baud rates, try `460800` or `921600` first. This build still adds a small send delay above `460800` to improve stability.
