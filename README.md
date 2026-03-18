@@ -89,8 +89,8 @@ How it works:
 3. On the machine that should control the other one, click `Toggle Remote Control` or press the hotkey. The global capture hooks initialize at that moment, while the receive side is prepared after serial connect.
 4. When the state changes to `Controlling remote`, local keyboard and mouse events are sent over serial.
 5. Press the same hotkey again, or click `Stop Remote Control`, to release control.
-6. Optional: enable `Auto edge toggle`, choose the peer side, then push against that outer screen edge for about 0.5 seconds to start remote control.
-7. While controlling remote, push against the opposite direction for about 0.5 seconds to stop remote control.
+6. Optional: enable `Auto edge toggle`, choose the peer side, then push against that outer screen edge for about 1 second to start remote control.
+7. While controlling remote, push against the opposite direction for about 1 second to stop remote control.
 8. If remote control ever gets stuck, use the emergency stop or emergency exit combo locally.
 
 Current v1 scope:
