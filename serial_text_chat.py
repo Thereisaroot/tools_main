@@ -73,6 +73,7 @@ INPUT_WARP_IGNORE_EVENTS = 4
 REMOTE_KEY_REPEAT_INITIAL_DELAY_SECONDS = 0.35
 REMOTE_KEY_REPEAT_INTERVAL_SECONDS = 0.05
 REMOTE_KEY_REPEAT_POLL_SECONDS = 0.01
+REMOTE_MOUSE_SCROLL_MULTIPLIER = 5
 AUTO_EDGE_HOLD_SECONDS = 0.5
 AUTO_EDGE_EXIT_STALE_SECONDS = 0.2
 AUX_DISPLAY_REFRESH_SECONDS = 1.0
@@ -2898,7 +2899,12 @@ class SerialChatApp:
                 return
             session_id = self.local_input_session_id
 
-        self.queue_input_command("INPUT_MOUSE_SCROLL", session_id, str(int(dx)), str(int(dy)))
+        self.queue_input_command(
+            "INPUT_MOUSE_SCROLL",
+            session_id,
+            str(int(dx * REMOTE_MOUSE_SCROLL_MULTIPLIER)),
+            str(int(dy * REMOTE_MOUSE_SCROLL_MULTIPLIER)),
+        )
 
     def warp_local_pointer(self, anchor: tuple[int, int] | None) -> None:
         controller = self.mouse_controller
