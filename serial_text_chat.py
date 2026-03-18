@@ -73,7 +73,7 @@ INPUT_WARP_IGNORE_EVENTS = 4
 REMOTE_KEY_REPEAT_INITIAL_DELAY_SECONDS = 0.35
 REMOTE_KEY_REPEAT_INTERVAL_SECONDS = 0.05
 REMOTE_KEY_REPEAT_POLL_SECONDS = 0.01
-AUTO_EDGE_HOLD_SECONDS = 1.0
+AUTO_EDGE_HOLD_SECONDS = 0.5
 AUTO_EDGE_EXIT_STALE_SECONDS = 0.2
 AUX_DISPLAY_REFRESH_SECONDS = 1.0
 RECEIVED_FILES_DIR = Path(__file__).resolve().parent / "received_files"
@@ -371,6 +371,31 @@ class DisplayRect:
     max_y: int
 
 
+def serialize_display_rects(rects: tuple[DisplayRect, ...]) -> str:
+    return json.dumps([[rect.min_x, rect.min_y, rect.max_x, rect.max_y] for rect in rects], separators=(",", ":"))
+
+
+def deserialize_display_rects(serialized: str) -> tuple[DisplayRect, ...]:
+    try:
+        raw_rects = json.loads(serialized)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Display rect snapshot is malformed.") from exc
+
+    if not isinstance(raw_rects, list):
+        raise ValueError("Display rect snapshot is malformed.")
+
+    rects: list[DisplayRect] = []
+    for raw_rect in raw_rects:
+        if (
+            not isinstance(raw_rect, list)
+            or len(raw_rect) != 4
+            or not all(isinstance(value, int) for value in raw_rect)
+        ):
+            raise ValueError("Display rect snapshot is malformed.")
+        rects.append(DisplayRect(*raw_rect))
+    return tuple(rects)
+
+
 class SerialChatApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -437,6 +462,9 @@ class SerialChatApp:
         self.display_rects_cache: tuple[DisplayRect, ...] = ()
         self.display_rects_cache_mode = ""
         self.display_rects_cache_deadline = 0.0
+        self.remote_pointer_position: tuple[int, int] | None = None
+        self.remote_pointer_coordinate_mode = ""
+        self.remote_display_rects: tuple[DisplayRect, ...] = ()
         self.editor_modifier_state: set[str] = set()
         self.app_state = self.load_app_state()
         self.auto_edge_enabled = bool(self.app_state.get("auto_edge_enabled", False))
@@ -1280,6 +1308,14 @@ class SerialChatApp:
         with self.input_lock:
             self.reset_auto_edge_hold_locked()
 
+    def clear_remote_pointer_context_locked(self) -> None:
+        self.remote_pointer_position = None
+        self.remote_pointer_coordinate_mode = ""
+        self.remote_display_rects = ()
+
+    def coordinate_mode_uses_bottom_left_origin(self, coordinate_mode: str) -> bool:
+        return coordinate_mode in {"appkit", "quartz"}
+
     def refresh_display_rects(self, coordinate_mode: str) -> tuple[DisplayRect, ...]:
         if coordinate_mode == "appkit" and sys.platform == "darwin" and AppKit is not None:
             screens = AppKit.NSScreen.screens()
@@ -1292,6 +1328,24 @@ class SerialChatApp:
                 )
                 for screen in screens
             )
+
+        if coordinate_mode == "quartz" and sys.platform == "darwin" and Quartz is not None:
+            error, display_ids, display_count = Quartz.CGGetActiveDisplayList(32, None, None)
+            if error != 0:
+                return ()
+
+            rects: list[DisplayRect] = []
+            for display_id in display_ids[:display_count]:
+                bounds = Quartz.CGDisplayBounds(display_id)
+                rects.append(
+                    DisplayRect(
+                        int(bounds.origin.x),
+                        int(bounds.origin.y),
+                        int(bounds.origin.x + bounds.size.width),
+                        int(bounds.origin.y + bounds.size.height),
+                    )
+                )
+            return tuple(rects)
 
         if coordinate_mode == "screen" and sys.platform == "win32" and ctypes is not None and wintypes is not None:
             rects: list[DisplayRect] = []
@@ -1338,8 +1392,14 @@ class SerialChatApp:
             return rect.min_y <= y < rect.max_y
         return rect.min_x <= x < rect.max_x
 
-    def edge_boundary_for_point(self, side: str, x: int, y: int, coordinate_mode: str) -> int | None:
-        rects = self.get_display_rects(coordinate_mode)
+    def edge_boundary_for_rects(
+        self,
+        rects: tuple[DisplayRect, ...],
+        side: str,
+        x: int,
+        y: int,
+        coordinate_mode: str,
+    ) -> int | None:
         matching_rects = [rect for rect in rects if self.point_matches_edge_segment(rect, side, x, y)]
         if not matching_rects:
             return None
@@ -1349,15 +1409,26 @@ class SerialChatApp:
         if side == AUTO_EDGE_SIDE_LEFT:
             return min(rect.min_x for rect in matching_rects)
         if side == AUTO_EDGE_SIDE_TOP:
-            if coordinate_mode == "appkit":
+            if self.coordinate_mode_uses_bottom_left_origin(coordinate_mode):
                 return max(rect.max_y for rect in matching_rects)
             return min(rect.min_y for rect in matching_rects)
-        if coordinate_mode == "appkit":
+        if self.coordinate_mode_uses_bottom_left_origin(coordinate_mode):
             return min(rect.min_y for rect in matching_rects)
         return max(rect.max_y for rect in matching_rects)
 
-    def point_is_on_outer_edge(self, side: str, x: int, y: int, coordinate_mode: str) -> bool:
-        boundary = self.edge_boundary_for_point(side, x, y, coordinate_mode)
+    def edge_boundary_for_point(self, side: str, x: int, y: int, coordinate_mode: str) -> int | None:
+        rects = self.get_display_rects(coordinate_mode)
+        return self.edge_boundary_for_rects(rects, side, x, y, coordinate_mode)
+
+    def point_is_on_outer_edge_for_rects(
+        self,
+        rects: tuple[DisplayRect, ...],
+        side: str,
+        x: int,
+        y: int,
+        coordinate_mode: str,
+    ) -> bool:
+        boundary = self.edge_boundary_for_rects(rects, side, x, y, coordinate_mode)
         if boundary is None:
             return False
 
@@ -1366,12 +1437,16 @@ class SerialChatApp:
         if side == AUTO_EDGE_SIDE_LEFT:
             return x <= boundary + 1
         if side == AUTO_EDGE_SIDE_TOP:
-            if coordinate_mode == "appkit":
+            if self.coordinate_mode_uses_bottom_left_origin(coordinate_mode):
                 return y >= boundary - 1
             return y <= boundary + 1
-        if coordinate_mode == "appkit":
+        if self.coordinate_mode_uses_bottom_left_origin(coordinate_mode):
             return y <= boundary + 1
         return y >= boundary - 1
+
+    def point_is_on_outer_edge(self, side: str, x: int, y: int, coordinate_mode: str) -> bool:
+        rects = self.get_display_rects(coordinate_mode)
+        return self.point_is_on_outer_edge_for_rects(rects, side, x, y, coordinate_mode)
 
     def movement_toward_side(self, dx: int, dy: int, side: str, coordinate_mode: str) -> bool:
         if side == AUTO_EDGE_SIDE_RIGHT:
@@ -1379,8 +1454,8 @@ class SerialChatApp:
         if side == AUTO_EDGE_SIDE_LEFT:
             return dx < 0
         if side == AUTO_EDGE_SIDE_TOP:
-            return dy > 0 if coordinate_mode == "appkit" else dy < 0
-        return dy < 0 if coordinate_mode == "appkit" else dy > 0
+            return dy > 0 if self.coordinate_mode_uses_bottom_left_origin(coordinate_mode) else dy < 0
+        return dy < 0 if self.coordinate_mode_uses_bottom_left_origin(coordinate_mode) else dy > 0
 
     def movement_away_from_side(self, dx: int, dy: int, side: str, coordinate_mode: str) -> bool:
         if side == AUTO_EDGE_SIDE_RIGHT:
@@ -1388,8 +1463,74 @@ class SerialChatApp:
         if side == AUTO_EDGE_SIDE_LEFT:
             return dx > 0
         if side == AUTO_EDGE_SIDE_TOP:
-            return dy < 0 if coordinate_mode == "appkit" else dy > 0
-        return dy > 0 if coordinate_mode == "appkit" else dy < 0
+            return dy < 0 if self.coordinate_mode_uses_bottom_left_origin(coordinate_mode) else dy > 0
+        return dy > 0 if self.coordinate_mode_uses_bottom_left_origin(coordinate_mode) else dy < 0
+
+    def point_is_inside_rects(self, rects: tuple[DisplayRect, ...], x: int, y: int) -> bool:
+        return any(rect.min_x <= x < rect.max_x and rect.min_y <= y < rect.max_y for rect in rects)
+
+    def constrain_point_to_rects(self, rects: tuple[DisplayRect, ...], x: int, y: int) -> tuple[int, int]:
+        if not rects:
+            return x, y
+
+        if self.point_is_inside_rects(rects, x, y):
+            return x, y
+
+        best_candidate: tuple[int, int] | None = None
+        best_distance: int | None = None
+        for rect in rects:
+            candidate_x = min(max(x, rect.min_x), rect.max_x - 1)
+            candidate_y = min(max(y, rect.min_y), rect.max_y - 1)
+            distance = (candidate_x - x) ** 2 + (candidate_y - y) ** 2
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_candidate = (candidate_x, candidate_y)
+
+        if best_candidate is None:
+            return x, y
+        return best_candidate
+
+    def translate_screen_delta_for_coordinate_mode(self, dx: int, dy: int, coordinate_mode: str) -> tuple[int, int]:
+        if self.coordinate_mode_uses_bottom_left_origin(coordinate_mode):
+            return dx, -dy
+        return dx, dy
+
+    def capture_local_pointer_context(self) -> tuple[str, int, int, tuple[DisplayRect, ...]] | None:
+        if sys.platform == "darwin" and Quartz is not None:
+            try:
+                event = Quartz.CGEventCreate(None)
+                point = Quartz.CGEventGetLocation(event)
+                rects = self.get_display_rects("quartz")
+            except Exception:
+                return None
+
+            if not rects:
+                return None
+            x, y = self.constrain_point_to_rects(rects, int(point.x), int(point.y))
+            return "quartz", x, y, rects
+
+        position = self.get_local_pointer_position()
+        if position is None:
+            return None
+
+        rects = self.get_display_rects("screen")
+        if not rects:
+            return None
+        x, y = self.constrain_point_to_rects(rects, position[0], position[1])
+        return "screen", x, y, rects
+
+    def advance_remote_pointer_locked(self, dx: int, dy: int) -> tuple[int, int, str] | None:
+        if self.remote_pointer_position is None or not self.remote_display_rects or not self.remote_pointer_coordinate_mode:
+            return None
+
+        translated_dx, translated_dy = self.translate_screen_delta_for_coordinate_mode(
+            dx, dy, self.remote_pointer_coordinate_mode
+        )
+        next_x = self.remote_pointer_position[0] + translated_dx
+        next_y = self.remote_pointer_position[1] + translated_dy
+        constrained = self.constrain_point_to_rects(self.remote_display_rects, next_x, next_y)
+        self.remote_pointer_position = constrained
+        return constrained[0], constrained[1], self.remote_pointer_coordinate_mode
 
     def get_idle_pointer_position(self) -> tuple[int, int, str] | None:
         if sys.platform == "darwin" and AppKit is not None:
@@ -1464,7 +1605,7 @@ class SerialChatApp:
             self.edge_hold_started_at = now
             self.edge_hold_last_progress_at = now
 
-    def handle_auto_edge_exit_motion(self, dx: int, dy: int) -> None:
+    def handle_auto_edge_exit_motion(self, dx: int, dy: int, remote_pointer: tuple[int, int, str] | None) -> None:
         with self.input_lock:
             if (
                 not self.auto_edge_enabled
@@ -1475,10 +1616,21 @@ class SerialChatApp:
                 return
 
             side = self.current_exit_side()
+            coordinate_mode = self.remote_pointer_coordinate_mode
+            rects = self.remote_display_rects
 
-        if not self.movement_toward_side(dx, dy, side, "screen"):
+        if remote_pointer is None or not coordinate_mode or not rects:
+            self.reset_auto_edge_hold()
+            return
+
+        translated_dx, translated_dy = self.translate_screen_delta_for_coordinate_mode(dx, dy, coordinate_mode)
+        if not self.movement_toward_side(translated_dx, translated_dy, side, coordinate_mode):
             if dx != 0 or dy != 0:
                 self.reset_auto_edge_hold()
+            return
+
+        if not self.point_is_on_outer_edge_for_rects(rects, side, remote_pointer[0], remote_pointer[1], coordinate_mode):
+            self.reset_auto_edge_hold()
             return
 
         self.start_auto_edge_hold(side, AUTO_EDGE_MODE_EXIT)
@@ -1608,6 +1760,7 @@ class SerialChatApp:
         self.mouse_anchor = None
         self.mouse_warp_events_to_ignore = 0
         self.last_idle_pointer_position = None
+        self.clear_remote_pointer_context_locked()
         self.reset_auto_edge_hold_locked()
 
     def update_windows_listener_suppression(self) -> None:
@@ -1949,6 +2102,7 @@ class SerialChatApp:
         accept_request = False
         reply_busy = False
         log_message = None
+        ack_parts = [requested_session_id]
 
         with self.input_lock:
             state = self.input_state
@@ -1987,7 +2141,12 @@ class SerialChatApp:
                 log_message = "[input share] remote control request rejected because this side is already busy."
 
         if accept_request:
-            self.send_control_message("INPUT_ACK", requested_session_id)
+            pointer_context = self.capture_local_pointer_context()
+            if pointer_context is not None:
+                coordinate_mode, x, y, rects = pointer_context
+                ack_parts.extend([coordinate_mode, str(x), str(y), encode_control_text(serialize_display_rects(rects))])
+
+            self.send_control_message("INPUT_ACK", *ack_parts)
             if log_message:
                 self.ui_events.put(("log", log_message))
             self.queue_refresh_input_ui()
@@ -2000,17 +2159,33 @@ class SerialChatApp:
                 self.ui_events.put(("log", log_message))
 
     def handle_input_ack(self, parts: list[str]) -> None:
-        if len(parts) != 1:
+        if len(parts) not in {1, 5}:
             raise ValueError("INPUT ACK message is malformed.")
 
         session_id = parts[0]
         log_message = None
+        remote_pointer_context: tuple[str, int, int, tuple[DisplayRect, ...]] | None = None
+
+        if len(parts) == 5:
+            coordinate_mode = parts[1]
+            x = int(parts[2])
+            y = int(parts[3])
+            rects = deserialize_display_rects(decode_control_text(parts[4]))
+            if not rects:
+                raise ValueError("INPUT ACK display rect snapshot is empty.")
+            x, y = self.constrain_point_to_rects(rects, x, y)
+            remote_pointer_context = (coordinate_mode, x, y, rects)
 
         with self.input_lock:
             if self.input_state == INPUT_STATE_REQUESTING and self.local_input_session_id == session_id:
                 self.input_state = INPUT_STATE_CONTROLLING
                 self.local_input_request_deadline = 0.0
                 self.clear_input_notice_locked()
+                if remote_pointer_context is not None:
+                    coordinate_mode, x, y, rects = remote_pointer_context
+                    self.remote_pointer_coordinate_mode = coordinate_mode
+                    self.remote_pointer_position = (x, y)
+                    self.remote_display_rects = rects
                 log_message = "[input share] remote control active."
             else:
                 return
@@ -2659,6 +2834,7 @@ class SerialChatApp:
         dx = 0
         dy = 0
         anchor: tuple[int, int] | None = None
+        remote_pointer: tuple[int, int, str] | None = None
         with self.input_lock:
             if self.mouse_anchor is None:
                 self.mouse_anchor = (int(x), int(y))
@@ -2678,8 +2854,9 @@ class SerialChatApp:
             self.pending_mouse_dy += dy
             self.mouse_warp_events_to_ignore = INPUT_WARP_IGNORE_EVENTS
             anchor = self.mouse_anchor
+            remote_pointer = self.advance_remote_pointer_locked(dx, dy)
 
-        self.handle_auto_edge_exit_motion(dx, dy)
+        self.handle_auto_edge_exit_motion(dx, dy, remote_pointer)
         self.warp_local_pointer(anchor)
 
     def handle_global_mouse_click(self, x: float, y: float, button: object, pressed: bool, injected: bool = False) -> None:
