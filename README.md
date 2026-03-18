@@ -78,14 +78,17 @@ Input sharing is `serial-only`, `hotkey-toggle`, and `bidirectional`.
 - Windows hotkey: `Scroll Lock`
 - macOS hotkey: `F8`
 - macOS also accepts `Shift+F8` and `Ctrl+Shift+F8` because the toggle is triggered by the same `F8` key event
+- Emergency stop on both platforms: `Ctrl+Alt+Shift+Backspace`
+- Emergency exit on both platforms: `Ctrl+Alt+Shift+Esc`
 
 How it works:
 
 1. Connect both machines first.
 2. Make sure both machines run this updated version.
-3. On the machine that should control the other one, click `Toggle Remote Control` or press the hotkey.
+3. On the machine that should control the other one, click `Toggle Remote Control` or press the hotkey. The global capture hooks initialize at that moment, while the receive side is prepared after serial connect.
 4. When the state changes to `Controlling remote`, local keyboard and mouse events are sent over serial.
 5. Press the same hotkey again, or click `Stop Remote Control`, to release control.
+6. If remote control ever gets stuck, use the emergency stop or emergency exit combo locally.
 
 Current v1 scope:
 

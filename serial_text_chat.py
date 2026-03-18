@@ -77,6 +77,9 @@ WINDOWS_SCROLL_LOCK_VK = 145
 WINDOWS_KEY_FLAG_INJECTED = 0x10
 WINDOWS_MOUSE_FLAG_INJECTED = 0x01
 DARWIN_F8_KEYCODE = 100
+EMERGENCY_MODIFIER_TOKENS = frozenset({"special:ctrl", "special:alt", "special:shift"})
+EMERGENCY_STOP_KEY_TOKEN = "special:backspace"
+EMERGENCY_EXIT_KEY_TOKEN = "special:esc"
 
 
 def obfuscate_text(text: str) -> str:
@@ -212,6 +215,21 @@ def decode_mouse_button_token(token: str) -> object:
     return button
 
 
+def canonical_key_token(key_token: str) -> str:
+    modifier_aliases = {
+        "special:ctrl_l": "special:ctrl",
+        "special:ctrl_r": "special:ctrl",
+        "special:alt_l": "special:alt",
+        "special:alt_r": "special:alt",
+        "special:alt_gr": "special:alt",
+        "special:shift_l": "special:shift",
+        "special:shift_r": "special:shift",
+        "special:cmd_l": "special:cmd",
+        "special:cmd_r": "special:cmd",
+    }
+    return modifier_aliases.get(key_token, key_token)
+
+
 @dataclass
 class ReceiveFileState:
     transfer_id: str
@@ -251,6 +269,7 @@ class SerialChatApp:
         self.keyboard_controller = None
         self.mouse_controller = None
         self.input_backend_ready = False
+        self.input_receive_ready = False
         self.input_permission_required = False
         self.input_support_message = self.build_default_input_support_message()
         self.input_state = INPUT_STATE_IDLE
@@ -261,6 +280,7 @@ class SerialChatApp:
         self.input_notice_deadline = 0.0
         self.local_pressed_key_tokens: set[str] = set()
         self.local_pressed_mouse_tokens: set[str] = set()
+        self.hotkey_pressed_key_tokens: set[str] = set()
         self.remote_pressed_key_tokens: set[str] = set()
         self.remote_pressed_mouse_tokens: set[str] = set()
         self.pending_mouse_dx = 0
@@ -279,6 +299,7 @@ class SerialChatApp:
         self.refresh_ports()
         self.refresh_input_ui()
         self.update_controls()
+        self.update_windows_listener_suppression()
 
         self.input_sender_thread = threading.Thread(target=self.input_sender_loop, daemon=True)
         self.input_sender_thread.start()
@@ -358,7 +379,7 @@ class SerialChatApp:
         self.toggle_remote_button.pack(side="left", padx=(0, 12))
 
         ttk.Label(input_actions, textvariable=self.input_state_var).pack(side="left", anchor="w")
-        ttk.Label(input_share_frame, textvariable=self.input_hotkey_var).pack(anchor="w", pady=(6, 0))
+        ttk.Label(input_share_frame, textvariable=self.input_hotkey_var, wraplength=840, justify="left").pack(anchor="w", pady=(6, 0))
         ttk.Label(input_share_frame, textvariable=self.input_support_var, wraplength=840, justify="left").pack(anchor="w", pady=(2, 0))
 
         file_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
@@ -443,9 +464,9 @@ class SerialChatApp:
 
     def build_hotkey_hint(self) -> str:
         if sys.platform == "win32":
-            return "Hotkey: Scroll Lock"
+            return "Hotkey: Scroll Lock | Emergency stop: Ctrl+Alt+Shift+Backspace | Emergency exit: Ctrl+Alt+Shift+Esc"
         if sys.platform == "darwin":
-            return "Hotkey: F8 (Shift/Ctrl modifiers are also accepted)"
+            return "Hotkey: F8 (Shift/Ctrl modifiers are also accepted) | Emergency stop: Ctrl+Alt+Shift+Backspace | Emergency exit: Ctrl+Alt+Shift+Esc"
         return "Hotkey: unsupported on this platform"
 
     def build_default_input_support_message(self) -> str:
@@ -454,8 +475,8 @@ class SerialChatApp:
         if PYNPUT_IMPORT_ERROR is not None:
             return "Input sharing unavailable: install pynput and restart the app."
         if sys.platform == "darwin":
-            return "Connect to initialize global hooks. macOS also needs Accessibility and Input Monitoring."
-        return "Connect to initialize global hooks."
+            return "Connect first. Remote control hooks initialize only when needed. macOS also needs Accessibility and Input Monitoring."
+        return "Connect first. Remote control hooks initialize only when needed."
 
     def build_input_backend_error_message(self, exc: Exception) -> str:
         if not supported_input_platform():
@@ -509,6 +530,67 @@ class SerialChatApp:
         with self.input_lock:
             return self.input_state, self.input_backend_ready
 
+    def input_feature_available(self) -> bool:
+        return supported_input_platform() and PYNPUT_IMPORT_ERROR is None and pynput_keyboard is not None and pynput_mouse is not None
+
+    def refresh_input_support_for_connection(self) -> None:
+        with self.input_lock:
+            self.input_backend_ready = False
+            self.input_receive_ready = False
+            self.input_permission_required = False
+            if not self.input_feature_available():
+                self.input_support_message = self.build_default_input_support_message()
+            elif sys.platform == "darwin":
+                self.input_support_message = (
+                    "Connected. Click Toggle Remote Control or press F8 to initialize input sharing. "
+                    "Incoming remote control also initializes on demand."
+                )
+            else:
+                self.input_support_message = (
+                    "Connected. Click Toggle Remote Control or press Scroll Lock to initialize input sharing. "
+                    "Incoming remote control also initializes on demand."
+                )
+
+    def prepare_input_receive_backend(self) -> bool:
+        if not self.input_feature_available():
+            with self.input_lock:
+                self.input_receive_ready = False
+                self.input_permission_required = False
+                self.input_support_message = self.build_default_input_support_message()
+            self.refresh_input_ui()
+            self.update_controls()
+            return False
+
+        try:
+            if self.keyboard_controller is None:
+                self.keyboard_controller = pynput_keyboard.Controller()
+            if self.mouse_controller is None:
+                self.mouse_controller = pynput_mouse.Controller()
+
+            with self.input_lock:
+                self.input_receive_ready = True
+                self.input_permission_required = False
+                if sys.platform == "darwin":
+                    self.input_support_message = (
+                        "Connected. Remote receive is ready. F8 starts local remote control when needed."
+                    )
+                else:
+                    self.input_support_message = (
+                        "Connected. Remote receive is ready. Scroll Lock starts local remote control when needed."
+                    )
+        except Exception as exc:
+            with self.input_lock:
+                self.input_receive_ready = False
+                self.input_permission_required = sys.platform == "darwin"
+                self.input_support_message = self.build_input_backend_error_message(exc)
+            self.append_log(f"[input share] {self.input_support_message}")
+
+        self.refresh_input_ui()
+        self.update_controls()
+        self.update_windows_listener_suppression()
+        with self.input_lock:
+            return self.input_receive_ready
+
     def update_controls(self) -> None:
         connected = self.serial_connected()
         input_state, input_backend_ready = self.input_state_snapshot()
@@ -525,7 +607,7 @@ class SerialChatApp:
             toggle_state = "normal"
         elif input_state == INPUT_STATE_CONTROLLED:
             toggle_state = "disabled"
-        elif input_backend_ready:
+        elif input_backend_ready or self.input_feature_available():
             toggle_state = "normal"
         else:
             toggle_state = "disabled"
@@ -617,7 +699,8 @@ class SerialChatApp:
         self.receive_buffer.clear()
         self.connected_port_name = port_name
         self.connected_baudrate = baudrate
-        self.start_input_backend()
+        self.refresh_input_support_for_connection()
+        self.prepare_input_receive_backend()
         self.reader_thread = threading.Thread(target=self.read_loop, daemon=True)
         self.reader_thread.start()
         self.refresh_connection_status()
@@ -655,21 +738,20 @@ class SerialChatApp:
             self.status_var.set("Disconnected")
 
     def start_input_backend(self) -> None:
-        self.stop_input_backend()
-
-        with self.input_lock:
-            self.input_backend_ready = False
-            self.input_permission_required = False
-            self.input_support_message = self.build_default_input_support_message()
-
-        if not supported_input_platform() or PYNPUT_IMPORT_ERROR is not None or pynput_keyboard is None or pynput_mouse is None:
+        if not self.input_feature_available():
             self.refresh_input_ui()
             self.update_controls()
-            return
+            return False
 
         try:
-            self.keyboard_controller = pynput_keyboard.Controller()
-            self.mouse_controller = pynput_mouse.Controller()
+            if self.keyboard_controller is None:
+                self.keyboard_controller = pynput_keyboard.Controller()
+            if self.mouse_controller is None:
+                self.mouse_controller = pynput_mouse.Controller()
+
+            with self.input_lock:
+                self.input_receive_ready = True
+                self.input_permission_required = False
 
             keyboard_options: dict[str, object] = {}
             mouse_options: dict[str, object] = {}
@@ -682,36 +764,39 @@ class SerialChatApp:
                 keyboard_options["win32_event_filter"] = self.win32_keyboard_filter
                 mouse_options["win32_event_filter"] = self.win32_mouse_filter
 
-            self.keyboard_listener = pynput_keyboard.Listener(
-                on_press=self.handle_global_key_press,
-                on_release=self.handle_global_key_release,
-                suppress=False,
-                **keyboard_options,
-            )
-            self.mouse_listener = pynput_mouse.Listener(
-                on_move=self.handle_global_mouse_move,
-                on_click=self.handle_global_mouse_click,
-                on_scroll=self.handle_global_mouse_scroll,
-                suppress=False,
-                **mouse_options,
-            )
+            if self.keyboard_listener is None:
+                self.keyboard_listener = pynput_keyboard.Listener(
+                    on_press=self.handle_global_key_press,
+                    on_release=self.handle_global_key_release,
+                    suppress=False,
+                    **keyboard_options,
+                )
+                self.keyboard_listener.start()
+                self.keyboard_listener.wait()
+                self.raise_if_input_listener_failed(self.keyboard_listener)
 
-            self.keyboard_listener.start()
-            self.keyboard_listener.wait()
-            self.mouse_listener.start()
-            self.mouse_listener.wait()
-            self.raise_if_input_listener_failed(self.keyboard_listener)
-            self.raise_if_input_listener_failed(self.mouse_listener)
+            if self.mouse_listener is None:
+                self.mouse_listener = pynput_mouse.Listener(
+                    on_move=self.handle_global_mouse_move,
+                    on_click=self.handle_global_mouse_click,
+                    on_scroll=self.handle_global_mouse_scroll,
+                    suppress=False,
+                    **mouse_options,
+                )
+                self.mouse_listener.start()
+                self.mouse_listener.wait()
+                self.raise_if_input_listener_failed(self.mouse_listener)
 
             with self.input_lock:
                 self.input_backend_ready = True
+                self.input_receive_ready = True
                 self.input_permission_required = False
                 if sys.platform == "darwin":
                     self.input_support_message = "Global hooks ready. F8 toggles remote control while connected."
                 else:
                     self.input_support_message = "Global hooks ready. Scroll Lock toggles remote control while connected."
         except Exception as exc:
-            self.stop_input_backend()
+            self.stop_input_capture_backend()
             with self.input_lock:
                 self.input_backend_ready = False
                 self.input_permission_required = sys.platform == "darwin"
@@ -720,8 +805,9 @@ class SerialChatApp:
 
         self.refresh_input_ui()
         self.update_controls()
+        return self.input_backend_ready
 
-    def stop_input_backend(self) -> None:
+    def stop_input_capture_backend(self) -> None:
         for listener_name in ("keyboard_listener", "mouse_listener"):
             listener = getattr(self, listener_name)
             if listener is None:
@@ -733,12 +819,20 @@ class SerialChatApp:
                 pass
             setattr(self, listener_name, None)
 
+        with self.input_lock:
+            self.input_backend_ready = False
+        self.update_windows_listener_suppression()
+
+    def stop_input_backend(self) -> None:
+        self.stop_input_capture_backend()
         self.keyboard_controller = None
         self.mouse_controller = None
         with self.input_lock:
             self.input_backend_ready = False
+            self.input_receive_ready = False
             self.input_permission_required = False
             self.input_support_message = self.build_default_input_support_message()
+        self.update_windows_listener_suppression()
 
     def raise_if_input_listener_failed(self, listener: object) -> None:
         if listener is None:
@@ -785,14 +879,28 @@ class SerialChatApp:
             self.release_remote_inputs()
 
         self.queue_refresh_input_ui()
+        self.update_windows_listener_suppression()
 
     def clear_local_capture_state_locked(self) -> None:
         self.local_pressed_key_tokens.clear()
         self.local_pressed_mouse_tokens.clear()
+        self.hotkey_pressed_key_tokens.clear()
         self.pending_mouse_dx = 0
         self.pending_mouse_dy = 0
         self.mouse_anchor = None
         self.mouse_warp_events_to_ignore = 0
+
+    def update_windows_listener_suppression(self) -> None:
+        if sys.platform != "win32":
+            return
+
+        with self.input_lock:
+            suppress = self.input_state == INPUT_STATE_CONTROLLING
+
+        for listener_name in ("keyboard_listener", "mouse_listener"):
+            listener = getattr(self, listener_name)
+            if listener is not None and hasattr(listener, "_suppress"):
+                listener._suppress = suppress
 
     def stop_local_input_control(self, send_remote_stop: bool, log_message: str | None = None) -> None:
         session_id = ""
@@ -819,6 +927,7 @@ class SerialChatApp:
 
         self.refresh_input_ui()
         self.update_controls()
+        self.update_windows_listener_suppression()
 
     def finish_remote_input_control(self, expected_session_id: str, log_message: str | None = None) -> None:
         release_inputs = False
@@ -838,6 +947,7 @@ class SerialChatApp:
         if log_message:
             self.ui_events.put(("log", log_message))
         self.queue_refresh_input_ui()
+        self.update_windows_listener_suppression()
 
     def check_input_timers(self) -> None:
         refresh_required = False
@@ -864,9 +974,19 @@ class SerialChatApp:
         if refresh_required:
             self.refresh_input_ui()
             self.update_controls()
+            self.update_windows_listener_suppression()
 
     def toggle_remote_control(self) -> None:
         if not self.serial_connected():
+            return
+
+        if not self.input_feature_available():
+            with self.input_lock:
+                self.input_permission_required = False
+                self.input_support_message = self.build_default_input_support_message()
+            self.set_input_notice("Unavailable")
+            self.refresh_input_ui()
+            self.update_controls()
             return
 
         with self.input_lock:
@@ -888,6 +1008,12 @@ class SerialChatApp:
             self.set_input_notice("Busy")
             self.append_log("[input share] file transfer is active. Stop it before remote control.")
             return
+
+        if not input_backend_ready:
+            input_backend_ready = bool(self.start_input_backend())
+            with self.input_lock:
+                support_message = self.input_support_message
+                permission_required = self.input_permission_required
 
         if not input_backend_ready:
             self.set_input_notice("Permission required" if permission_required else "Unavailable")
@@ -1091,7 +1217,7 @@ class SerialChatApp:
             state = self.input_state
             local_session_id = self.local_input_session_id
             remote_session_id = self.remote_input_session_id
-            backend_ready = self.input_backend_ready
+            backend_ready = self.input_receive_ready
 
             if not backend_ready or self.file_send_active:
                 reply_busy = True
@@ -1126,6 +1252,7 @@ class SerialChatApp:
             if log_message:
                 self.ui_events.put(("log", log_message))
             self.queue_refresh_input_ui()
+            self.update_windows_listener_suppression()
             return
 
         if reply_busy:
@@ -1152,6 +1279,7 @@ class SerialChatApp:
         self.reset_local_mouse_anchor()
         self.ui_events.put(("log", log_message))
         self.queue_refresh_input_ui()
+        self.update_windows_listener_suppression()
 
     def handle_input_busy(self, parts: list[str]) -> None:
         if len(parts) != 1:
@@ -1171,6 +1299,7 @@ class SerialChatApp:
 
         self.ui_events.put(("log", "[input share] peer is busy."))
         self.queue_refresh_input_ui()
+        self.update_windows_listener_suppression()
 
     def handle_input_stop(self, parts: list[str]) -> None:
         if len(parts) != 1:
@@ -1302,6 +1431,11 @@ class SerialChatApp:
                     self.update_controls()
                 elif kind == "toggle-input":
                     self.toggle_remote_control()
+                elif kind == "force-stop-input":
+                    self.stop_local_input_control(send_remote_stop=True, log_message="[input share] emergency stop.")
+                elif kind == "force-close":
+                    self.on_close()
+                    return
         except queue.Empty:
             pass
 
@@ -1586,22 +1720,53 @@ class SerialChatApp:
 
         return int(x), int(y)
 
+    def is_emergency_stop_combo_active(self, trigger_token: str) -> bool:
+        if trigger_token != EMERGENCY_STOP_KEY_TOKEN:
+            return False
+
+        with self.input_lock:
+            return EMERGENCY_MODIFIER_TOKENS.issubset(self.hotkey_pressed_key_tokens)
+
+    def is_emergency_exit_combo_active(self, trigger_token: str) -> bool:
+        if trigger_token != EMERGENCY_EXIT_KEY_TOKEN:
+            return False
+
+        with self.input_lock:
+            return EMERGENCY_MODIFIER_TOKENS.issubset(self.hotkey_pressed_key_tokens)
+
     def handle_global_key_press(self, key: object, injected: bool = False) -> None:
         if injected:
             return
+
+        with self.input_lock:
+            state = self.input_state
+            session_id = self.local_input_session_id
+
+        key_token: str | None = None
+        canonical_token: str | None = None
+        try:
+            key_token = encode_key_token(key)
+            canonical_token = canonical_key_token(key_token)
+        except Exception:
+            pass
+
+        if canonical_token is not None:
+            with self.input_lock:
+                self.hotkey_pressed_key_tokens.add(canonical_token)
+
+            if self.is_emergency_exit_combo_active(canonical_token):
+                self.ui_events.put(("force-close", None))
+                return
+
+            if self.is_emergency_stop_combo_active(canonical_token):
+                self.ui_events.put(("force-stop-input", None))
+                return
 
         if self.is_toggle_key(key):
             self.ui_events.put(("toggle-input", None))
             return
 
-        with self.input_lock:
-            if self.input_state != INPUT_STATE_CONTROLLING or not self.local_input_session_id:
-                return
-            session_id = self.local_input_session_id
-
-        try:
-            key_token = encode_key_token(key)
-        except Exception:
+        if state != INPUT_STATE_CONTROLLING or not session_id or key_token is None:
             return
 
         with self.input_lock:
@@ -1615,17 +1780,26 @@ class SerialChatApp:
         if injected:
             return
 
+        with self.input_lock:
+            state = self.input_state
+            session_id = self.local_input_session_id
+
+        key_token: str | None = None
+        canonical_token: str | None = None
+        try:
+            key_token = encode_key_token(key)
+            canonical_token = canonical_key_token(key_token)
+        except Exception:
+            pass
+
+        if canonical_token is not None:
+            with self.input_lock:
+                self.hotkey_pressed_key_tokens.discard(canonical_token)
+
         if self.is_toggle_key(key):
             return
 
-        with self.input_lock:
-            if self.input_state != INPUT_STATE_CONTROLLING or not self.local_input_session_id:
-                return
-            session_id = self.local_input_session_id
-
-        try:
-            key_token = encode_key_token(key)
-        except Exception:
+        if state != INPUT_STATE_CONTROLLING or not session_id or key_token is None:
             return
 
         with self.input_lock:
@@ -1778,15 +1952,8 @@ class SerialChatApp:
         if flags & WINDOWS_KEY_FLAG_INJECTED:
             return True
 
-        if vk_code == WINDOWS_SCROLL_LOCK_VK and self.keyboard_listener is not None:
-            self.keyboard_listener.suppress_event()
+        if vk_code == WINDOWS_SCROLL_LOCK_VK:
             return True
-
-        with self.input_lock:
-            controlling_remote = self.input_state == INPUT_STATE_CONTROLLING
-
-        if controlling_remote and self.keyboard_listener is not None:
-            self.keyboard_listener.suppress_event()
 
         return True
 
@@ -1795,12 +1962,6 @@ class SerialChatApp:
         flags = getattr(data, "flags", 0)
         if flags & WINDOWS_MOUSE_FLAG_INJECTED:
             return True
-
-        with self.input_lock:
-            controlling_remote = self.input_state == INPUT_STATE_CONTROLLING
-
-        if controlling_remote and self.mouse_listener is not None:
-            self.mouse_listener.suppress_event()
 
         return True
 
