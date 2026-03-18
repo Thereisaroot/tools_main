@@ -99,6 +99,34 @@ DARWIN_CONTROL_CHAR_SHORTCUTS = {
     "\x19": "redo",
     "\x1a": "undo",
 }
+DARWIN_EDITOR_SHORTCUT_CHARS = {
+    "a": "select_all",
+    "c": "copy",
+    "x": "cut",
+    "v": "paste",
+    "y": "redo",
+    "z": "undo",
+    "ㅁ": "select_all",
+    "ㅊ": "copy",
+    "ㅌ": "cut",
+    "ㅍ": "paste",
+    "ㅛ": "redo",
+    "ㅋ": "undo",
+}
+EDITOR_SHORTCUT_MODIFIER_KEYSYMS = {
+    "control_l": "control",
+    "control_r": "control",
+    "meta_l": "command",
+    "meta_r": "command",
+    "command": "command",
+    "command_l": "command",
+    "command_r": "command",
+    "super_l": "command",
+    "super_r": "command",
+    "shift_l": "shift",
+    "shift_r": "shift",
+}
+APP_STATE_PATH = Path.home() / ".serial_text_chat_state.json"
 
 
 def obfuscate_text(text: str) -> str:
@@ -347,6 +375,8 @@ class SerialChatApp:
         self.pending_mouse_dy = 0
         self.mouse_anchor: tuple[int, int] | None = None
         self.mouse_warp_events_to_ignore = 0
+        self.editor_modifier_state: set[str] = set()
+        self.app_state = self.load_app_state()
 
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="115200")
@@ -712,9 +742,20 @@ class SerialChatApp:
     def refresh_ports(self) -> None:
         ports = [port.device for port in list_ports.comports()]
         self.port_combo["values"] = ports
+        preferred_port = self.app_state.get("last_port", "")
+        current_port = self.port_var.get().strip()
 
-        if ports and self.port_var.get() not in ports:
-            self.port_var.set(ports[0])
+        if not ports:
+            return
+
+        if current_port in ports:
+            return
+
+        if preferred_port in ports:
+            self.port_var.set(preferred_port)
+            return
+
+        self.port_var.set(ports[0])
 
     def toggle_connection(self) -> None:
         if self.serial_connected():
@@ -758,6 +799,8 @@ class SerialChatApp:
         self.receive_buffer.clear()
         self.connected_port_name = port_name
         self.connected_baudrate = baudrate
+        self.app_state["last_port"] = port_name
+        self.save_app_state()
         self.refresh_input_support_for_connection()
         self.prepare_input_receive_backend()
         self.reader_thread = threading.Thread(target=self.read_loop, daemon=True)
@@ -795,6 +838,29 @@ class SerialChatApp:
             self.status_var.set(f"Connected to {self.connected_port_name} @ {self.connected_baudrate}")
         else:
             self.status_var.set("Disconnected")
+
+    def load_app_state(self) -> dict[str, str]:
+        try:
+            raw_state = json.loads(APP_STATE_PATH.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+        if not isinstance(raw_state, dict):
+            return {}
+
+        last_port = raw_state.get("last_port")
+        if not isinstance(last_port, str):
+            return {}
+        return {"last_port": last_port}
+
+    def save_app_state(self) -> None:
+        try:
+            APP_STATE_PATH.write_text(
+                json.dumps(self.app_state, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
 
     def start_input_backend(self) -> None:
         if not self.input_feature_available():
@@ -2179,10 +2245,15 @@ class SerialChatApp:
             self.message_text.bind(sequence, handler)
 
         if sys.platform == "darwin":
+            self.message_text.bind("<FocusOut>", self.clear_editor_modifier_state, add="+")
             self.message_text.bind("<KeyPress>", self.handle_darwin_editor_control_char, add="+")
+            self.message_text.bind("<KeyPress>", self.handle_darwin_editor_modifier_tracking, add="+")
+            self.message_text.bind("<KeyRelease>", self.handle_darwin_editor_modifier_tracking, add="+")
             self.message_text.bind("<Control-KeyPress>", self.handle_darwin_control_editor_shortcut, add="+")
             self.message_text.bind("<Command-KeyPress>", self.handle_darwin_command_editor_shortcut, add="+")
             self.root.bind_all("<KeyPress>", self.handle_darwin_editor_control_char, add="+")
+            self.root.bind_all("<KeyPress>", self.handle_darwin_editor_modifier_tracking, add="+")
+            self.root.bind_all("<KeyRelease>", self.handle_darwin_editor_modifier_tracking, add="+")
             self.root.bind_all("<Control-KeyPress>", self.handle_darwin_control_editor_shortcut, add="+")
 
         if sys.platform == "darwin":
@@ -2207,15 +2278,49 @@ class SerialChatApp:
 
         return self.dispatch_darwin_editor_shortcut(action, event)
 
+    def handle_darwin_editor_modifier_tracking(self, event: tk.Event) -> str | None:
+        keysym = str(getattr(event, "keysym", "")).lower()
+        modifier = EDITOR_SHORTCUT_MODIFIER_KEYSYMS.get(keysym)
+        if modifier is not None:
+            if getattr(event, "type", None) == tk.EventType.KeyRelease:
+                self.editor_modifier_state.discard(modifier)
+            else:
+                self.editor_modifier_state.add(modifier)
+            return None
+
+        if not self.message_editor_matches_event(event):
+            return None
+
+        if not (self.editor_modifier_state & {"control", "command"}):
+            return None
+
+        action = self.resolve_darwin_editor_shortcut_action(event)
+        if action is None:
+            return None
+
+        if action == "undo" and "shift" in self.editor_modifier_state:
+            action = "redo"
+        return self.dispatch_darwin_editor_shortcut(action, event)
+
     def handle_darwin_editor_shortcut(self, event: tk.Event) -> str | None:
         if not self.message_editor_matches_event(event):
             return None
 
-        action = DARWIN_SHORTCUT_KEYCODES.get(getattr(event, "keycode", None))
+        action = self.resolve_darwin_editor_shortcut_action(event)
         if action is None:
             return None
 
         return self.dispatch_darwin_editor_shortcut(action, event)
+
+    def resolve_darwin_editor_shortcut_action(self, event: tk.Event) -> str | None:
+        action = DARWIN_SHORTCUT_KEYCODES.get(getattr(event, "keycode", None))
+        if action is not None:
+            return action
+
+        char = str(getattr(event, "char", "")).lower()
+        if not char:
+            return None
+        return DARWIN_EDITOR_SHORTCUT_CHARS.get(char)
 
     def dispatch_darwin_editor_shortcut(self, action: str, event: tk.Event) -> str | None:
         if action == "select_all":
@@ -2239,6 +2344,9 @@ class SerialChatApp:
 
     def message_editor_matches_event(self, event: tk.Event) -> bool:
         return getattr(event, "widget", None) is self.message_text or self.message_editor_has_focus()
+
+    def clear_editor_modifier_state(self, event: tk.Event | None = None) -> None:
+        self.editor_modifier_state.clear()
 
     def select_all_message(self, event: tk.Event) -> str | None:
         if not self.message_editor_matches_event(event):
