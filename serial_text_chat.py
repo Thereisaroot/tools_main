@@ -41,8 +41,13 @@ if sys.platform == "darwin":
         import Quartz
     except Exception:  # pragma: no cover - environment dependent
         Quartz = None
+    try:
+        import AppKit
+    except Exception:  # pragma: no cover - environment dependent
+        AppKit = None
 else:
     Quartz = None
+    AppKit = None
 
 MESSAGE_TERMINATOR = b"\0"
 CONTROL_PREFIX = "\x1eSTCFILE"
@@ -83,6 +88,9 @@ DARWIN_F8_KEYCODE = 100
 EMERGENCY_MODIFIER_TOKENS = frozenset({"special:ctrl", "special:alt", "special:shift"})
 EMERGENCY_STOP_KEY_TOKEN = "special:backspace"
 EMERGENCY_EXIT_KEY_TOKEN = "special:esc"
+APP_HOTKEY_MODIFIER_TOKENS = frozenset({"special:ctrl", "special:alt"})
+APP_COPY_TRIGGER_CHARS = frozenset({"c", "ㅊ"})
+APP_SEND_TRIGGER_CHARS = frozenset({"v", "ㅍ"})
 DARWIN_SHORTCUT_KEYCODES = {
     0: "select_all",
     7: "cut",
@@ -369,6 +377,12 @@ class SerialChatApp:
         self.local_pressed_key_tokens: set[str] = set()
         self.local_pressed_mouse_tokens: set[str] = set()
         self.hotkey_pressed_key_tokens: set[str] = set()
+        self.active_app_hotkey_key_tokens: set[str] = set()
+        self.mac_hotkey_backend_ready = False
+        self.mac_hotkey_global_monitor = None
+        self.mac_hotkey_local_monitor = None
+        self.mac_hotkey_global_handler = None
+        self.mac_hotkey_local_handler = None
         self.remote_pressed_key_tokens: set[str] = set()
         self.remote_pressed_mouse_tokens: set[str] = set()
         self.pending_mouse_dx = 0
@@ -554,9 +568,17 @@ class SerialChatApp:
 
     def build_hotkey_hint(self) -> str:
         if sys.platform == "win32":
-            return "Hotkey: Scroll Lock | Emergency stop: Ctrl+Alt+Shift+Backspace | Emergency exit: Ctrl+Alt+Shift+Esc"
+            return (
+                "Hotkey: Scroll Lock | Global app hotkeys: Ctrl+Alt+C copy, Ctrl+Alt+V send plain, "
+                "Ctrl+Alt+Shift+C decode copy, Ctrl+Alt+Shift+V send encoded | "
+                "Emergency stop: Ctrl+Alt+Shift+Backspace | Emergency exit: Ctrl+Alt+Shift+Esc"
+            )
         if sys.platform == "darwin":
-            return "Hotkey: F8 (Shift/Ctrl modifiers are also accepted) | Emergency stop: Ctrl+Alt+Shift+Backspace | Emergency exit: Ctrl+Alt+Shift+Esc"
+            return (
+                "Hotkey: F8 (Shift/Ctrl modifiers are also accepted) | Global app hotkeys: Ctrl+Alt+C copy, "
+                "Ctrl+Alt+V send plain, Ctrl+Alt+Shift+C decode copy, Ctrl+Alt+Shift+V send encoded | "
+                "Emergency stop: Ctrl+Alt+Shift+Backspace | Emergency exit: Ctrl+Alt+Shift+Esc"
+            )
         return "Hotkey: unsupported on this platform"
 
     def build_default_input_support_message(self) -> str:
@@ -565,8 +587,11 @@ class SerialChatApp:
         if PYNPUT_IMPORT_ERROR is not None:
             return "Input sharing unavailable: install pynput and restart the app."
         if sys.platform == "darwin":
-            return "Connect first. Remote control hooks initialize only when needed. macOS also needs Accessibility and Input Monitoring."
-        return "Connect first. Remote control hooks initialize only when needed."
+            return (
+                "Connect first. Global keyboard hotkeys initialize after connect, and mouse capture starts only "
+                "when remote control begins. macOS also needs Accessibility and Input Monitoring."
+            )
+        return "Connect first. Global keyboard hotkeys initialize after connect, and mouse capture starts only when remote control begins."
 
     def build_input_backend_error_message(self, exc: Exception) -> str:
         if not supported_input_platform():
@@ -632,13 +657,11 @@ class SerialChatApp:
                 self.input_support_message = self.build_default_input_support_message()
             elif sys.platform == "darwin":
                 self.input_support_message = (
-                    "Connected. Click Toggle Remote Control or press F8 to initialize input sharing. "
-                    "Incoming remote control also initializes on demand."
+                    "Connected. Preparing global keyboard hotkeys. Mouse capture will start only when remote control begins."
                 )
             else:
                 self.input_support_message = (
-                    "Connected. Click Toggle Remote Control or press Scroll Lock to initialize input sharing. "
-                    "Incoming remote control also initializes on demand."
+                    "Connected. Preparing global keyboard hotkeys. Mouse capture will start only when remote control begins."
                 )
 
     def prepare_input_receive_backend(self) -> bool:
@@ -662,11 +685,11 @@ class SerialChatApp:
                 self.input_permission_required = False
                 if sys.platform == "darwin":
                     self.input_support_message = (
-                        "Connected. Remote receive is ready. F8 starts local remote control when needed."
+                        "Connected. Remote receive is ready. Global keyboard hotkeys will be enabled after listener startup."
                     )
                 else:
                     self.input_support_message = (
-                        "Connected. Remote receive is ready. Scroll Lock starts local remote control when needed."
+                        "Connected. Remote receive is ready. Global keyboard hotkeys will be enabled after listener startup."
                     )
         except Exception as exc:
             with self.input_lock:
@@ -680,6 +703,202 @@ class SerialChatApp:
         self.update_windows_listener_suppression()
         with self.input_lock:
             return self.input_receive_ready
+
+    def start_mac_hotkey_backend(self) -> bool:
+        if sys.platform != "darwin":
+            return False
+
+        if AppKit is None:
+            with self.input_lock:
+                self.input_permission_required = True
+                self.input_support_message = "Input sharing unavailable: AppKit global hotkey support is unavailable."
+            self.refresh_input_ui()
+            self.update_controls()
+            return False
+
+        if self.mac_hotkey_backend_ready:
+            return True
+
+        try:
+            if self.mac_hotkey_global_monitor is None:
+                self.mac_hotkey_global_handler = self.handle_mac_hotkey_event
+                self.mac_hotkey_global_monitor = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                    AppKit.NSEventMaskKeyDown,
+                    self.mac_hotkey_global_handler,
+                )
+
+            if self.mac_hotkey_local_monitor is None:
+                def local_handler(event: object) -> object:
+                    self.handle_mac_hotkey_event(event)
+                    return event
+
+                self.mac_hotkey_local_handler = local_handler
+                self.mac_hotkey_local_monitor = AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                    AppKit.NSEventMaskKeyDown,
+                    self.mac_hotkey_local_handler,
+                )
+
+            self.mac_hotkey_backend_ready = True
+            with self.input_lock:
+                self.input_permission_required = False
+                self.input_support_message = (
+                    "Global keyboard hotkeys are ready. F8 and Ctrl+Alt(+Shift)+C/V work while connected. "
+                    "Mouse capture starts only when remote control begins."
+                )
+        except Exception as exc:
+            self.stop_mac_hotkey_backend()
+            with self.input_lock:
+                self.input_permission_required = True
+                self.input_support_message = self.build_input_backend_error_message(exc)
+            self.append_log(f"[input share] {self.input_support_message}")
+            self.refresh_input_ui()
+            self.update_controls()
+            return False
+
+        self.refresh_input_ui()
+        self.update_controls()
+        return True
+
+    def stop_mac_hotkey_backend(self) -> None:
+        if sys.platform != "darwin" or AppKit is None:
+            self.mac_hotkey_backend_ready = False
+            return
+
+        for attr_name in ("mac_hotkey_global_monitor", "mac_hotkey_local_monitor"):
+            monitor = getattr(self, attr_name)
+            if monitor is None:
+                continue
+            try:
+                AppKit.NSEvent.removeMonitor_(monitor)
+            except Exception:
+                pass
+            setattr(self, attr_name, None)
+
+        self.mac_hotkey_global_handler = None
+        self.mac_hotkey_local_handler = None
+        self.mac_hotkey_backend_ready = False
+
+    def handle_mac_hotkey_event(self, event: object) -> None:
+        if not self.serial_connected() or AppKit is None:
+            return
+
+        try:
+            if bool(event.isARepeat()):
+                return
+        except Exception:
+            pass
+
+        try:
+            keycode = int(event.keyCode())
+            modifier_flags = int(event.modifierFlags())
+        except Exception:
+            return
+
+        control_active = bool(modifier_flags & AppKit.NSEventModifierFlagControl)
+        alt_active = bool(modifier_flags & AppKit.NSEventModifierFlagOption)
+        shift_active = bool(modifier_flags & AppKit.NSEventModifierFlagShift)
+
+        if keycode == DARWIN_F8_KEYCODE:
+            self.ui_events.put(("toggle-input", None))
+            return
+
+        if not (control_active and alt_active):
+            return
+
+        if keycode == 8:
+            self.ui_events.put(("copy-last-decoded" if shift_active else "copy-last", None))
+        elif keycode == 9:
+            self.ui_events.put(("send-encoded-global" if shift_active else "send-plain-global", None))
+
+    def build_keyboard_listener_options(self) -> dict[str, object]:
+        keyboard_options: dict[str, object] = {}
+        if sys.platform == "darwin":
+            if Quartz is None:
+                raise PermissionError("Quartz support is unavailable.")
+            keyboard_options["darwin_intercept"] = self.darwin_keyboard_intercept
+        elif sys.platform == "win32":
+            keyboard_options["win32_event_filter"] = self.win32_keyboard_filter
+        return keyboard_options
+
+    def build_mouse_listener_options(self) -> dict[str, object]:
+        mouse_options: dict[str, object] = {}
+        if sys.platform == "darwin":
+            if Quartz is None:
+                raise PermissionError("Quartz support is unavailable.")
+            mouse_options["darwin_intercept"] = self.darwin_mouse_intercept
+        elif sys.platform == "win32":
+            mouse_options["win32_event_filter"] = self.win32_mouse_filter
+        return mouse_options
+
+    def ensure_keyboard_listener_started(self) -> None:
+        if self.keyboard_listener is not None:
+            self.raise_if_input_listener_failed(self.keyboard_listener)
+            return
+
+        self.keyboard_listener = pynput_keyboard.Listener(
+            on_press=self.handle_global_key_press,
+            on_release=self.handle_global_key_release,
+            suppress=False,
+            **self.build_keyboard_listener_options(),
+        )
+        self.keyboard_listener.start()
+        self.keyboard_listener.wait()
+        self.raise_if_input_listener_failed(self.keyboard_listener)
+
+    def ensure_mouse_listener_started(self) -> None:
+        if self.mouse_listener is not None:
+            self.raise_if_input_listener_failed(self.mouse_listener)
+            return
+
+        self.mouse_listener = pynput_mouse.Listener(
+            on_move=self.handle_global_mouse_move,
+            on_click=self.handle_global_mouse_click,
+            on_scroll=self.handle_global_mouse_scroll,
+            suppress=False,
+            **self.build_mouse_listener_options(),
+        )
+        self.mouse_listener.start()
+        self.mouse_listener.wait()
+        self.raise_if_input_listener_failed(self.mouse_listener)
+
+    def start_hotkey_backend(self) -> bool:
+        if not self.input_feature_available():
+            return False
+
+        if sys.platform == "darwin":
+            return self.start_mac_hotkey_backend()
+
+        try:
+            self.ensure_keyboard_listener_started()
+            with self.input_lock:
+                self.input_permission_required = False
+                if sys.platform == "darwin":
+                    self.input_support_message = (
+                        "Global keyboard hotkeys are ready. F8 and Ctrl+Alt(+Shift)+C/V work while connected. "
+                        "Mouse capture starts only when remote control begins."
+                    )
+                else:
+                    self.input_support_message = (
+                        "Global keyboard hotkeys are ready. Scroll Lock and Ctrl+Alt(+Shift)+C/V work while connected. "
+                        "Mouse capture starts only when remote control begins."
+                    )
+        except Exception as exc:
+            try:
+                self.stop_input_capture_backend()
+            except Exception:
+                pass
+            with self.input_lock:
+                self.input_permission_required = sys.platform == "darwin"
+                self.input_support_message = self.build_input_backend_error_message(exc)
+            self.append_log(f"[input share] {self.input_support_message}")
+            self.refresh_input_ui()
+            self.update_controls()
+            return False
+
+        self.refresh_input_ui()
+        self.update_controls()
+        self.update_windows_listener_suppression()
+        return True
 
     def update_controls(self) -> None:
         connected = self.serial_connected()
@@ -803,6 +1022,7 @@ class SerialChatApp:
         self.save_app_state()
         self.refresh_input_support_for_connection()
         self.prepare_input_receive_backend()
+        self.start_hotkey_backend()
         self.reader_thread = threading.Thread(target=self.read_loop, daemon=True)
         self.reader_thread.start()
         self.refresh_connection_status()
@@ -878,39 +1098,8 @@ class SerialChatApp:
                 self.input_receive_ready = True
                 self.input_permission_required = False
 
-            keyboard_options: dict[str, object] = {}
-            mouse_options: dict[str, object] = {}
-            if sys.platform == "darwin":
-                if Quartz is None:
-                    raise PermissionError("Quartz support is unavailable.")
-                keyboard_options["darwin_intercept"] = self.darwin_keyboard_intercept
-                mouse_options["darwin_intercept"] = self.darwin_mouse_intercept
-            elif sys.platform == "win32":
-                keyboard_options["win32_event_filter"] = self.win32_keyboard_filter
-                mouse_options["win32_event_filter"] = self.win32_mouse_filter
-
-            if self.keyboard_listener is None:
-                self.keyboard_listener = pynput_keyboard.Listener(
-                    on_press=self.handle_global_key_press,
-                    on_release=self.handle_global_key_release,
-                    suppress=False,
-                    **keyboard_options,
-                )
-                self.keyboard_listener.start()
-                self.keyboard_listener.wait()
-                self.raise_if_input_listener_failed(self.keyboard_listener)
-
-            if self.mouse_listener is None:
-                self.mouse_listener = pynput_mouse.Listener(
-                    on_move=self.handle_global_mouse_move,
-                    on_click=self.handle_global_mouse_click,
-                    on_scroll=self.handle_global_mouse_scroll,
-                    suppress=False,
-                    **mouse_options,
-                )
-                self.mouse_listener.start()
-                self.mouse_listener.wait()
-                self.raise_if_input_listener_failed(self.mouse_listener)
+            self.ensure_keyboard_listener_started()
+            self.ensure_mouse_listener_started()
 
             with self.input_lock:
                 self.input_backend_ready = True
@@ -950,6 +1139,7 @@ class SerialChatApp:
 
     def stop_input_backend(self) -> None:
         self.stop_input_capture_backend()
+        self.stop_mac_hotkey_backend()
         self.keyboard_controller = None
         self.mouse_controller = None
         with self.input_lock:
@@ -1010,6 +1200,7 @@ class SerialChatApp:
         self.local_pressed_key_tokens.clear()
         self.local_pressed_mouse_tokens.clear()
         self.hotkey_pressed_key_tokens.clear()
+        self.active_app_hotkey_key_tokens.clear()
         self.pending_mouse_dx = 0
         self.pending_mouse_dy = 0
         self.mouse_anchor = None
@@ -1556,6 +1747,14 @@ class SerialChatApp:
                     self.update_controls()
                 elif kind == "toggle-input":
                     self.toggle_remote_control()
+                elif kind == "copy-last":
+                    self.copy_last_received()
+                elif kind == "copy-last-decoded":
+                    self.copy_last_received_after_decode()
+                elif kind == "send-plain-global":
+                    self.send_message("plain")
+                elif kind == "send-encoded-global":
+                    self.send_message("encoded")
                 elif kind == "force-stop-input":
                     self.stop_local_input_control(send_remote_stop=True, log_message="[input share] emergency stop.")
                 elif kind == "force-close":
@@ -1857,6 +2056,34 @@ class SerialChatApp:
         with self.input_lock:
             return EMERGENCY_MODIFIER_TOKENS.issubset(self.hotkey_pressed_key_tokens)
 
+    def decode_key_token_char(self, key_token: str) -> str | None:
+        if not key_token.startswith("char:"):
+            return None
+
+        try:
+            return decode_control_text(key_token[5:]).lower()
+        except Exception:
+            return None
+
+    def get_app_hotkey_action(self, key_token: str) -> str | None:
+        char = self.decode_key_token_char(key_token)
+        if char is None:
+            return None
+
+        with self.input_lock:
+            if key_token in self.active_app_hotkey_key_tokens:
+                return None
+            active_tokens = set(self.hotkey_pressed_key_tokens)
+
+        if not APP_HOTKEY_MODIFIER_TOKENS.issubset(active_tokens):
+            return None
+
+        if char in APP_COPY_TRIGGER_CHARS:
+            return "copy-last-decoded" if "special:shift" in active_tokens else "copy-last"
+        if char in APP_SEND_TRIGGER_CHARS:
+            return "send-encoded-global" if "special:shift" in active_tokens else "send-plain-global"
+        return None
+
     def handle_global_key_press(self, key: object, injected: bool = False) -> None:
         if injected:
             return
@@ -1885,7 +2112,15 @@ class SerialChatApp:
                 self.ui_events.put(("force-stop-input", None))
                 return
 
-        if self.is_toggle_key(key):
+        if key_token is not None and sys.platform != "darwin":
+            app_hotkey_action = self.get_app_hotkey_action(key_token)
+            if app_hotkey_action is not None:
+                with self.input_lock:
+                    self.active_app_hotkey_key_tokens.add(key_token)
+                self.ui_events.put((app_hotkey_action, None))
+                return
+
+        if self.is_toggle_key(key) and not (sys.platform == "darwin" and self.mac_hotkey_backend_ready):
             self.ui_events.put(("toggle-input", None))
             return
 
@@ -1918,8 +2153,10 @@ class SerialChatApp:
         if canonical_token is not None:
             with self.input_lock:
                 self.hotkey_pressed_key_tokens.discard(canonical_token)
+                if key_token is not None:
+                    self.active_app_hotkey_key_tokens.discard(key_token)
 
-        if self.is_toggle_key(key):
+        if self.is_toggle_key(key) and not (sys.platform == "darwin" and self.mac_hotkey_backend_ready):
             return
 
         if state != INPUT_STATE_CONTROLLING or not session_id or key_token is None:
