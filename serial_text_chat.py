@@ -74,6 +74,7 @@ REMOTE_KEY_REPEAT_INITIAL_DELAY_SECONDS = 0.35
 REMOTE_KEY_REPEAT_INTERVAL_SECONDS = 0.05
 REMOTE_KEY_REPEAT_POLL_SECONDS = 0.01
 REMOTE_MOUSE_SCROLL_MULTIPLIER = 5
+AUTO_EDGE_ENTRY_ANCHOR_INSET_PIXELS = 48
 AUTO_EDGE_HOLD_SECONDS = 0.5
 AUTO_EDGE_EXIT_STALE_SECONDS = 0.2
 AUX_DISPLAY_REFRESH_SECONDS = 1.0
@@ -466,6 +467,9 @@ class SerialChatApp:
         self.remote_pointer_position: tuple[int, int] | None = None
         self.remote_pointer_coordinate_mode = ""
         self.remote_display_rects: tuple[DisplayRect, ...] = ()
+        self.arm_auto_edge_anchor_on_next_request = False
+        self.pending_auto_edge_anchor_side = ""
+        self.pending_auto_edge_anchor_session_id = ""
         self.editor_modifier_state: set[str] = set()
         self.app_state = self.load_app_state()
         self.auto_edge_enabled = bool(self.app_state.get("auto_edge_enabled", False))
@@ -1314,6 +1318,11 @@ class SerialChatApp:
         self.remote_pointer_coordinate_mode = ""
         self.remote_display_rects = ()
 
+    def clear_pending_auto_edge_anchor_locked(self) -> None:
+        self.arm_auto_edge_anchor_on_next_request = False
+        self.pending_auto_edge_anchor_side = ""
+        self.pending_auto_edge_anchor_session_id = ""
+
     def coordinate_mode_uses_bottom_left_origin(self, coordinate_mode: str) -> bool:
         return coordinate_mode in {"appkit", "quartz"}
 
@@ -1736,6 +1745,7 @@ class SerialChatApp:
             self.input_state = INPUT_STATE_IDLE
             self.clear_local_capture_state_locked()
             self.clear_input_notice_locked()
+            self.clear_pending_auto_edge_anchor_locked()
             self.reset_auto_edge_hold_locked()
 
         if should_send_remote_stop and local_session:
@@ -1788,6 +1798,7 @@ class SerialChatApp:
             self.input_state = INPUT_STATE_IDLE
             self.clear_local_capture_state_locked()
             self.clear_input_notice_locked()
+            self.clear_pending_auto_edge_anchor_locked()
 
         if send_remote_stop and session_id:
             try:
@@ -1841,6 +1852,7 @@ class SerialChatApp:
                 self.local_input_request_deadline = 0.0
                 self.input_state = INPUT_STATE_IDLE
                 self.clear_local_capture_state_locked()
+                self.clear_pending_auto_edge_anchor_locked()
                 log_message = "[input share] remote control request timed out."
                 refresh_required = True
 
@@ -1920,6 +1932,13 @@ class SerialChatApp:
             self.local_input_request_deadline = time.monotonic() + INPUT_REQUEST_TIMEOUT_SECONDS
             self.clear_local_capture_state_locked()
             self.clear_input_notice_locked()
+            if self.arm_auto_edge_anchor_on_next_request:
+                self.pending_auto_edge_anchor_side = self.current_peer_side()
+                self.pending_auto_edge_anchor_session_id = session_id
+                self.arm_auto_edge_anchor_on_next_request = False
+            else:
+                self.pending_auto_edge_anchor_side = ""
+                self.pending_auto_edge_anchor_session_id = ""
 
         self.append_log("[input share] requesting remote control...")
         self.refresh_input_ui()
@@ -1933,6 +1952,7 @@ class SerialChatApp:
                 self.local_input_session_id = ""
                 self.local_input_request_deadline = 0.0
                 self.clear_local_capture_state_locked()
+                self.clear_pending_auto_edge_anchor_locked()
             self.refresh_input_ui()
             self.update_controls()
             messagebox.showerror("Remote Control Error", str(exc))
@@ -2182,6 +2202,10 @@ class SerialChatApp:
                 self.input_state = INPUT_STATE_CONTROLLING
                 self.local_input_request_deadline = 0.0
                 self.clear_input_notice_locked()
+                anchor_side = ""
+                if self.pending_auto_edge_anchor_session_id == session_id:
+                    anchor_side = self.pending_auto_edge_anchor_side
+                self.clear_pending_auto_edge_anchor_locked()
                 if remote_pointer_context is not None:
                     coordinate_mode, x, y, rects = remote_pointer_context
                     self.remote_pointer_coordinate_mode = coordinate_mode
@@ -2191,7 +2215,7 @@ class SerialChatApp:
             else:
                 return
 
-        self.reset_local_mouse_anchor()
+        self.reset_local_mouse_anchor(anchor_side or None)
         self.ui_events.put(("log", log_message))
         self.queue_refresh_input_ui()
         self.update_windows_listener_suppression()
@@ -2207,6 +2231,7 @@ class SerialChatApp:
                 self.local_input_session_id = ""
                 self.local_input_request_deadline = 0.0
                 self.clear_local_capture_state_locked()
+                self.clear_pending_auto_edge_anchor_locked()
                 self.input_notice_message = "Busy"
                 self.input_notice_deadline = time.monotonic() + INPUT_NOTICE_SECONDS
             else:
@@ -2389,6 +2414,7 @@ class SerialChatApp:
         with self.input_lock:
             if self.input_state != INPUT_STATE_IDLE:
                 return
+            self.arm_auto_edge_anchor_on_next_request = True
 
         self.append_log(f"[input share] auto edge entering toward {self.current_peer_side().lower()}.")
         self.toggle_remote_control()
@@ -2652,11 +2678,28 @@ class SerialChatApp:
     def queue_input_command(self, command: str, session_id: str, *parts: str) -> None:
         self.input_outbound_queue.put((command, session_id, parts))
 
-    def reset_local_mouse_anchor(self) -> None:
+    def inset_anchor_from_side(self, anchor: tuple[int, int], side: str | None) -> tuple[int, int]:
+        if side == AUTO_EDGE_SIDE_RIGHT:
+            return anchor[0] - AUTO_EDGE_ENTRY_ANCHOR_INSET_PIXELS, anchor[1]
+        if side == AUTO_EDGE_SIDE_LEFT:
+            return anchor[0] + AUTO_EDGE_ENTRY_ANCHOR_INSET_PIXELS, anchor[1]
+        if side == AUTO_EDGE_SIDE_TOP:
+            return anchor[0], anchor[1] + AUTO_EDGE_ENTRY_ANCHOR_INSET_PIXELS
+        if side == AUTO_EDGE_SIDE_BOTTOM:
+            return anchor[0], anchor[1] - AUTO_EDGE_ENTRY_ANCHOR_INSET_PIXELS
+        return anchor
+
+    def reset_local_mouse_anchor(self, inset_side: str | None = None) -> None:
         anchor = self.get_local_pointer_position()
+        should_warp = anchor is not None and inset_side in AUTO_EDGE_SIDE_OPTIONS
+        if anchor is not None and should_warp:
+            anchor = self.inset_anchor_from_side(anchor, inset_side)
         with self.input_lock:
             self.mouse_anchor = anchor
-            self.mouse_warp_events_to_ignore = 0
+            self.mouse_warp_events_to_ignore = INPUT_WARP_IGNORE_EVENTS if should_warp else 0
+
+        if should_warp:
+            self.warp_local_pointer(anchor)
 
     def get_local_pointer_position(self) -> tuple[int, int] | None:
         controller = self.mouse_controller
