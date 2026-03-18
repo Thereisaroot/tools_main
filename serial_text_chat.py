@@ -63,6 +63,9 @@ INPUT_REQUEST_TIMEOUT_SECONDS = 3.0
 INPUT_NOTICE_SECONDS = 2.5
 INPUT_SENDER_POLL_SECONDS = 0.01
 INPUT_WARP_IGNORE_EVENTS = 4
+REMOTE_KEY_REPEAT_INITIAL_DELAY_SECONDS = 0.35
+REMOTE_KEY_REPEAT_INTERVAL_SECONDS = 0.05
+REMOTE_KEY_REPEAT_POLL_SECONDS = 0.01
 RECEIVED_FILES_DIR = Path(__file__).resolve().parent / "received_files"
 BAUD_RATE_OPTIONS = [
     "9600",
@@ -384,7 +387,9 @@ class SerialChatApp:
         self.mac_hotkey_global_handler = None
         self.mac_hotkey_local_handler = None
         self.remote_pressed_key_tokens: set[str] = set()
+        self.remote_physical_key_tokens: set[str] = set()
         self.remote_pressed_mouse_tokens: set[str] = set()
+        self.remote_repeat_deadlines: dict[str, float] = {}
         self.pending_mouse_dx = 0
         self.pending_mouse_dy = 0
         self.mouse_anchor: tuple[int, int] | None = None
@@ -407,6 +412,8 @@ class SerialChatApp:
 
         self.input_sender_thread = threading.Thread(target=self.input_sender_loop, daemon=True)
         self.input_sender_thread.start()
+        self.remote_key_repeat_thread = threading.Thread(target=self.remote_key_repeat_loop, daemon=True)
+        self.remote_key_repeat_thread.start()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self.process_ui_events)
@@ -2084,6 +2091,29 @@ class SerialChatApp:
             return "send-encoded-global" if "special:shift" in active_tokens else "send-plain-global"
         return None
 
+    def key_token_requires_physical_hold(self, key_token: str) -> bool:
+        return canonical_key_token(key_token) in {"special:ctrl", "special:alt", "special:shift", "special:cmd"}
+
+    def key_token_supports_repeat(self, key_token: str) -> bool:
+        if key_token.startswith("char:"):
+            return True
+
+        return canonical_key_token(key_token) in {
+            "special:space",
+            "special:tab",
+            "special:enter",
+            "special:backspace",
+            "special:delete",
+            "special:left",
+            "special:right",
+            "special:up",
+            "special:down",
+            "special:home",
+            "special:end",
+            "special:page_up",
+            "special:page_down",
+        }
+
     def handle_global_key_press(self, key: object, injected: bool = False) -> None:
         if injected:
             return
@@ -2331,6 +2361,8 @@ class SerialChatApp:
             return
 
         canonical_token = canonical_key_token(key_token)
+        should_hold = self.key_token_requires_physical_hold(key_token)
+        should_repeat = self.key_token_supports_repeat(key_token)
         with self.input_lock:
             if key_token in self.remote_pressed_key_tokens:
                 return
@@ -2340,11 +2372,20 @@ class SerialChatApp:
             decoded_key = decode_key_token(key_token)
             if canonical_token == "special:caps_lock":
                 controller.tap(decoded_key)
-            else:
+            elif should_hold:
                 controller.press(decoded_key)
+                with self.input_lock:
+                    self.remote_physical_key_tokens.add(key_token)
+            else:
+                controller.tap(decoded_key)
+                if should_repeat:
+                    with self.input_lock:
+                        self.remote_repeat_deadlines[key_token] = time.monotonic() + REMOTE_KEY_REPEAT_INITIAL_DELAY_SECONDS
         except Exception as exc:
             with self.input_lock:
                 self.remote_pressed_key_tokens.discard(key_token)
+                self.remote_physical_key_tokens.discard(key_token)
+                self.remote_repeat_deadlines.pop(key_token, None)
             self.ui_events.put(("log", f"[input share] key press failed: {exc}"))
 
     def inject_remote_key_up(self, key_token: str) -> None:
@@ -2356,14 +2397,55 @@ class SerialChatApp:
             if key_token not in self.remote_pressed_key_tokens:
                 return
             self.remote_pressed_key_tokens.discard(key_token)
+            should_release = key_token in self.remote_physical_key_tokens
+            self.remote_physical_key_tokens.discard(key_token)
+            self.remote_repeat_deadlines.pop(key_token, None)
 
         if canonical_key_token(key_token) == "special:caps_lock":
+            return
+
+        if not should_release:
             return
 
         try:
             controller.release(decode_key_token(key_token))
         except Exception as exc:
             self.ui_events.put(("log", f"[input share] key release failed: {exc}"))
+
+    def inject_remote_key_repeat(self, key_token: str) -> None:
+        controller = self.keyboard_controller
+        if controller is None:
+            return
+
+        if self.key_token_requires_physical_hold(key_token) or not self.key_token_supports_repeat(key_token):
+            return
+
+        try:
+            controller.tap(decode_key_token(key_token))
+        except Exception as exc:
+            self.ui_events.put(("log", f"[input share] key repeat failed: {exc}"))
+
+    def remote_key_repeat_loop(self) -> None:
+        while not self.shutdown_event.is_set():
+            repeat_tokens: list[str] = []
+            now = time.monotonic()
+
+            with self.input_lock:
+                for key_token, deadline in list(self.remote_repeat_deadlines.items()):
+                    if key_token not in self.remote_pressed_key_tokens:
+                        self.remote_repeat_deadlines.pop(key_token, None)
+                        continue
+
+                    if deadline > now:
+                        continue
+
+                    repeat_tokens.append(key_token)
+                    self.remote_repeat_deadlines[key_token] = now + REMOTE_KEY_REPEAT_INTERVAL_SECONDS
+
+            for key_token in repeat_tokens:
+                self.inject_remote_key_repeat(key_token)
+
+            time.sleep(REMOTE_KEY_REPEAT_POLL_SECONDS)
 
     def inject_remote_mouse_move(self, dx: int, dy: int) -> None:
         controller = self.mouse_controller
@@ -2424,10 +2506,12 @@ class SerialChatApp:
             return
 
         with self.input_lock:
-            key_tokens = list(self.remote_pressed_key_tokens)
+            key_tokens = list(self.remote_physical_key_tokens)
             button_tokens = list(self.remote_pressed_mouse_tokens)
             self.remote_pressed_key_tokens.clear()
+            self.remote_physical_key_tokens.clear()
             self.remote_pressed_mouse_tokens.clear()
+            self.remote_repeat_deadlines.clear()
 
         for button_token in button_tokens:
             if controller_mouse is None:
