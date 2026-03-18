@@ -107,7 +107,8 @@ Not included in v1:
 
 ## Interaction Rules
 
-- While remote control is active, text send and file send controls are disabled.
+- Text messages use separate internal frames, so text send can coexist with remote control traffic.
+- File send stays disabled while remote control is active.
 - While file transfer is active, remote control cannot be started.
 - `Open Download Folder` stays available all the time.
 - File transfer still uses per-chunk acknowledgements.

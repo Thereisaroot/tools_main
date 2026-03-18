@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 import queue
 import subprocess
@@ -46,6 +47,8 @@ else:
 MESSAGE_TERMINATOR = b"\0"
 CONTROL_PREFIX = "\x1eSTCFILE"
 CONTROL_SEPARATOR = "\x1f"
+FRAME_KIND_TEXT = "text"
+FRAME_KIND_CONTROL = "control"
 OBFUSCATION_MARKERS = "ABC"
 FILE_CHUNK_SIZE = 1024
 HIGH_SPEED_FRAME_DELAY_SECONDS = 0.002
@@ -80,6 +83,22 @@ DARWIN_F8_KEYCODE = 100
 EMERGENCY_MODIFIER_TOKENS = frozenset({"special:ctrl", "special:alt", "special:shift"})
 EMERGENCY_STOP_KEY_TOKEN = "special:backspace"
 EMERGENCY_EXIT_KEY_TOKEN = "special:esc"
+DARWIN_SHORTCUT_KEYCODES = {
+    0: "select_all",
+    7: "cut",
+    8: "copy",
+    9: "paste",
+    6: "undo",
+    16: "redo",
+}
+DARWIN_CONTROL_CHAR_SHORTCUTS = {
+    "\x01": "select_all",
+    "\x03": "copy",
+    "\x16": "paste",
+    "\x18": "cut",
+    "\x19": "redo",
+    "\x1a": "undo",
+}
 
 
 def obfuscate_text(text: str) -> str:
@@ -126,10 +145,14 @@ def decode_control_text(text: str) -> str:
 
 
 def build_control_message(command: str, *parts: str) -> str:
-    return CONTROL_PREFIX + CONTROL_SEPARATOR + CONTROL_SEPARATOR.join((command, *parts))
+    return json.dumps(
+        {"t": FRAME_KIND_CONTROL, "c": command, "p": list(parts)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
-def parse_control_message(message: str) -> tuple[str, list[str]] | None:
+def parse_legacy_control_message(message: str) -> tuple[str, list[str]] | None:
     prefix = CONTROL_PREFIX + CONTROL_SEPARATOR
     if not message.startswith(prefix):
         return None
@@ -139,6 +162,43 @@ def parse_control_message(message: str) -> tuple[str, list[str]] | None:
         raise ValueError("Control message is malformed.")
 
     return parts[0], parts[1:]
+
+
+def build_text_message(payload: str) -> str:
+    return json.dumps(
+        {"t": FRAME_KIND_TEXT, "p": payload},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def parse_serial_message(message: str) -> tuple[str, str | tuple[str, list[str]]]:
+    try:
+        frame = json.loads(message)
+    except json.JSONDecodeError:
+        legacy_control = parse_legacy_control_message(message)
+        if legacy_control is not None:
+            return FRAME_KIND_CONTROL, legacy_control
+        return FRAME_KIND_TEXT, message
+
+    if not isinstance(frame, dict):
+        raise ValueError("Serialized frame is malformed.")
+
+    frame_type = frame.get("t")
+    if frame_type == FRAME_KIND_TEXT:
+        payload = frame.get("p")
+        if not isinstance(payload, str):
+            raise ValueError("Serialized text frame is malformed.")
+        return FRAME_KIND_TEXT, payload
+
+    if frame_type == FRAME_KIND_CONTROL:
+        command = frame.get("c")
+        parts = frame.get("p")
+        if not isinstance(command, str) or not isinstance(parts, list) or not all(isinstance(part, str) for part in parts):
+            raise ValueError("Serialized control frame is malformed.")
+        return FRAME_KIND_CONTROL, (command, parts)
+
+    raise ValueError("Serialized frame type is unsupported.")
 
 
 def normalize_dropped_path(raw_path: str) -> Path:
@@ -594,12 +654,11 @@ class SerialChatApp:
     def update_controls(self) -> None:
         connected = self.serial_connected()
         input_state, input_backend_ready = self.input_state_snapshot()
-        input_idle = input_state == INPUT_STATE_IDLE
 
         self.connect_button.configure(text="Disconnect" if connected else "Connect")
-        self.send_plain_button.configure(state="normal" if connected and input_idle else "disabled")
-        self.send_encoded_button.configure(state="normal" if connected and input_idle else "disabled")
-        self.select_file_button.configure(state="normal" if connected and not self.file_send_active and input_idle else "disabled")
+        self.send_plain_button.configure(state="normal" if connected else "disabled")
+        self.send_encoded_button.configure(state="normal" if connected else "disabled")
+        self.select_file_button.configure(state="normal" if connected and not self.file_send_active and input_state == INPUT_STATE_IDLE else "disabled")
 
         if not connected or self.file_send_active:
             toggle_state = "disabled"
@@ -1079,16 +1138,16 @@ class SerialChatApp:
 
     def handle_received_message(self, message: str) -> None:
         try:
-            control_message = parse_control_message(message)
+            frame_type, payload = parse_serial_message(message)
         except ValueError as exc:
             self.ui_events.put(("log", f"[receive error] {exc}"))
             return
 
-        if control_message is None:
-            self.ui_events.put(("text", message))
+        if frame_type == FRAME_KIND_TEXT:
+            self.ui_events.put(("text", str(payload)))
             return
 
-        command, parts = control_message
+        command, parts = payload
 
         if command in {"ACK_START", "ACK_CHUNK", "ACK_END"}:
             self.transfer_ack_queue.put((command, parts))
@@ -1456,11 +1515,6 @@ class SerialChatApp:
         if mode not in {"plain", "encoded"}:
             raise ValueError(f"Unsupported message mode: {mode}")
 
-        input_state, _ = self.input_state_snapshot()
-        if input_state != INPUT_STATE_IDLE:
-            self.append_log("[input share] text send is disabled while remote control is active.")
-            return
-
         message = self.message_text.get("1.0", "end-1c")
         if not message.strip():
             return
@@ -1468,7 +1522,7 @@ class SerialChatApp:
         payload = message if mode == "plain" else obfuscate_text(message)
 
         try:
-            self.send_serial_text(payload)
+            self.send_text_message(payload)
         except serial.SerialException as exc:
             messagebox.showerror("Send Error", str(exc))
             self.disconnect()
@@ -1478,8 +1532,11 @@ class SerialChatApp:
         self.message_text.delete("1.0", "end")
         self.message_text.focus_set()
 
-    def send_serial_text(self, text: str) -> None:
-        payload = text.encode("utf-8") + MESSAGE_TERMINATOR
+    def send_text_message(self, payload: str) -> None:
+        self.send_serial_frame(build_text_message(payload))
+
+    def send_serial_frame(self, frame_text: str) -> None:
+        payload = frame_text.encode("utf-8") + MESSAGE_TERMINATOR
 
         with self.write_lock:
             port = self.serial_port
@@ -1611,7 +1668,7 @@ class SerialChatApp:
             raise
 
     def send_control_message(self, command: str, *parts: str) -> None:
-        self.send_serial_text(build_control_message(command, *parts))
+        self.send_serial_frame(build_control_message(command, *parts))
 
     def wait_for_file_ack(self, expected_command: str, transfer_id: str, expected_value: str | None = None) -> None:
         deadline = time.monotonic() + FILE_ACK_TIMEOUT_SECONDS
@@ -1970,13 +2027,18 @@ class SerialChatApp:
         if controller is None:
             return
 
+        canonical_token = canonical_key_token(key_token)
         with self.input_lock:
             if key_token in self.remote_pressed_key_tokens:
                 return
             self.remote_pressed_key_tokens.add(key_token)
 
         try:
-            controller.press(decode_key_token(key_token))
+            decoded_key = decode_key_token(key_token)
+            if canonical_token == "special:caps_lock":
+                controller.tap(decoded_key)
+            else:
+                controller.press(decoded_key)
         except Exception as exc:
             with self.input_lock:
                 self.remote_pressed_key_tokens.discard(key_token)
@@ -1991,6 +2053,9 @@ class SerialChatApp:
             if key_token not in self.remote_pressed_key_tokens:
                 return
             self.remote_pressed_key_tokens.discard(key_token)
+
+        if canonical_key_token(key_token) == "special:caps_lock":
+            return
 
         try:
             controller.release(decode_key_token(key_token))
@@ -2072,6 +2137,8 @@ class SerialChatApp:
         for key_token in key_tokens:
             if controller_keyboard is None:
                 break
+            if canonical_key_token(key_token) == "special:caps_lock":
+                continue
             try:
                 controller_keyboard.release(decode_key_token(key_token))
             except Exception:
@@ -2112,17 +2179,69 @@ class SerialChatApp:
             self.message_text.bind(sequence, handler)
 
         if sys.platform == "darwin":
+            self.message_text.bind("<KeyPress>", self.handle_darwin_editor_control_char, add="+")
+            self.message_text.bind("<Control-KeyPress>", self.handle_darwin_control_editor_shortcut, add="+")
+            self.message_text.bind("<Command-KeyPress>", self.handle_darwin_command_editor_shortcut, add="+")
+            self.root.bind_all("<KeyPress>", self.handle_darwin_editor_control_char, add="+")
+            self.root.bind_all("<Control-KeyPress>", self.handle_darwin_control_editor_shortcut, add="+")
+
+        if sys.platform == "darwin":
             for sequence, handler in command_shortcuts.items():
                 self.message_text.bind(sequence, handler)
                 self.root.bind_all(sequence, handler, add="+")
+            self.root.bind_all("<Command-KeyPress>", self.handle_darwin_command_editor_shortcut, add="+")
 
+    def handle_darwin_control_editor_shortcut(self, event: tk.Event) -> str | None:
+        return self.handle_darwin_editor_shortcut(event)
+
+    def handle_darwin_command_editor_shortcut(self, event: tk.Event) -> str | None:
+        return self.handle_darwin_editor_shortcut(event)
+
+    def handle_darwin_editor_control_char(self, event: tk.Event) -> str | None:
+        if not self.message_editor_matches_event(event):
+            return None
+
+        action = DARWIN_CONTROL_CHAR_SHORTCUTS.get(getattr(event, "char", ""))
+        if action is None:
+            return None
+
+        return self.dispatch_darwin_editor_shortcut(action, event)
+
+    def handle_darwin_editor_shortcut(self, event: tk.Event) -> str | None:
+        if not self.message_editor_matches_event(event):
+            return None
+
+        action = DARWIN_SHORTCUT_KEYCODES.get(getattr(event, "keycode", None))
+        if action is None:
+            return None
+
+        return self.dispatch_darwin_editor_shortcut(action, event)
+
+    def dispatch_darwin_editor_shortcut(self, action: str, event: tk.Event) -> str | None:
+        if action == "select_all":
+            return self.select_all_message(event)
+        if action == "copy":
+            return self.copy_message_selection(event)
+        if action == "cut":
+            return self.cut_message_selection(event)
+        if action == "paste":
+            return self.paste_into_message(event)
+        if action == "undo":
+            if getattr(event, "state", 0) & 0x1:
+                return self.redo_message_edit(event)
+            return self.undo_message_edit(event)
+        if action == "redo":
+            return self.redo_message_edit(event)
+
+        return None
     def message_editor_has_focus(self) -> bool:
         return self.root.focus_get() is self.message_text
 
-    def select_all_message(self, event: tk.Event) -> str | None:
-        del event
+    def message_editor_matches_event(self, event: tk.Event) -> bool:
+        return getattr(event, "widget", None) is self.message_text or self.message_editor_has_focus()
 
-        if not self.message_editor_has_focus():
+    def select_all_message(self, event: tk.Event) -> str | None:
+        if not self.message_editor_matches_event(event):
             return None
 
         self.message_text.tag_add("sel", "1.0", "end-1c")
@@ -2131,9 +2250,7 @@ class SerialChatApp:
         return "break"
 
     def copy_message_selection(self, event: tk.Event) -> str | None:
-        del event
-
-        if not self.message_editor_has_focus():
+        if not self.message_editor_matches_event(event):
             return None
 
         try:
@@ -2145,9 +2262,7 @@ class SerialChatApp:
         return "break"
 
     def cut_message_selection(self, event: tk.Event) -> str | None:
-        del event
-
-        if not self.message_editor_has_focus():
+        if not self.message_editor_matches_event(event):
             return None
 
         try:
@@ -2160,9 +2275,7 @@ class SerialChatApp:
         return "break"
 
     def paste_into_message(self, event: tk.Event) -> str | None:
-        del event
-
-        if not self.message_editor_has_focus():
+        if not self.message_editor_matches_event(event):
             return None
 
         try:
@@ -2182,9 +2295,7 @@ class SerialChatApp:
         return "break"
 
     def undo_message_edit(self, event: tk.Event) -> str | None:
-        del event
-
-        if not self.message_editor_has_focus():
+        if not self.message_editor_matches_event(event):
             return None
 
         try:
@@ -2194,9 +2305,7 @@ class SerialChatApp:
         return "break"
 
     def redo_message_edit(self, event: tk.Event) -> str | None:
-        del event
-
-        if not self.message_editor_has_focus():
+        if not self.message_editor_matches_event(event):
             return None
 
         try:
