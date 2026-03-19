@@ -11,6 +11,7 @@ import threading
 import time
 import tkinter as tk
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -467,6 +468,12 @@ class SerialChatApp:
         self.remote_pointer_position: tuple[int, int] | None = None
         self.remote_pointer_coordinate_mode = ""
         self.remote_display_rects: tuple[DisplayRect, ...] = ()
+        self.next_mouse_move_sequence = 1
+        self.pending_remote_mouse_moves: deque[tuple[int, int, int]] = deque()
+        self.blocked_mouse_dx_positive = False
+        self.blocked_mouse_dx_negative = False
+        self.blocked_mouse_dy_positive = False
+        self.blocked_mouse_dy_negative = False
         self.arm_auto_edge_anchor_on_next_request = False
         self.pending_auto_edge_anchor_side = ""
         self.pending_auto_edge_anchor_session_id = ""
@@ -1317,6 +1324,12 @@ class SerialChatApp:
         self.remote_pointer_position = None
         self.remote_pointer_coordinate_mode = ""
         self.remote_display_rects = ()
+        self.next_mouse_move_sequence = 1
+        self.pending_remote_mouse_moves.clear()
+        self.blocked_mouse_dx_positive = False
+        self.blocked_mouse_dx_negative = False
+        self.blocked_mouse_dy_positive = False
+        self.blocked_mouse_dy_negative = False
 
     def clear_pending_auto_edge_anchor_locked(self) -> None:
         self.arm_auto_edge_anchor_on_next_request = False
@@ -1504,6 +1517,50 @@ class SerialChatApp:
         if self.coordinate_mode_uses_bottom_left_origin(coordinate_mode):
             return dx, -dy
         return dx, dy
+
+    def filter_blocked_mouse_delta_locked(self, dx: int, dy: int) -> tuple[int, int]:
+        filtered_dx = dx
+        filtered_dy = dy
+        if filtered_dx > 0 and self.blocked_mouse_dx_positive:
+            filtered_dx = 0
+        elif filtered_dx < 0 and self.blocked_mouse_dx_negative:
+            filtered_dx = 0
+
+        if filtered_dy > 0 and self.blocked_mouse_dy_positive:
+            filtered_dy = 0
+        elif filtered_dy < 0 and self.blocked_mouse_dy_negative:
+            filtered_dy = 0
+
+        return filtered_dx, filtered_dy
+
+    def reconcile_mouse_feedback_locked(
+        self,
+        sent_dx: int,
+        sent_dy: int,
+        previous_position: tuple[int, int] | None,
+        current_position: tuple[int, int],
+    ) -> None:
+        if previous_position is None:
+            return
+
+        previous_x, previous_y = previous_position
+        current_x, current_y = current_position
+
+        if current_x != previous_x:
+            self.blocked_mouse_dx_positive = False
+            self.blocked_mouse_dx_negative = False
+        elif sent_dx > 0:
+            self.blocked_mouse_dx_positive = True
+        elif sent_dx < 0:
+            self.blocked_mouse_dx_negative = True
+
+        if current_y != previous_y:
+            self.blocked_mouse_dy_positive = False
+            self.blocked_mouse_dy_negative = False
+        elif sent_dy > 0:
+            self.blocked_mouse_dy_positive = True
+        elif sent_dy < 0:
+            self.blocked_mouse_dy_negative = True
 
     def capture_local_pointer_context(self) -> tuple[str, int, int, tuple[DisplayRect, ...]] | None:
         if sys.platform == "darwin" and Quartz is not None:
@@ -2266,10 +2323,10 @@ class SerialChatApp:
             self.inject_remote_key_up(key_token)
 
     def handle_input_mouse_move(self, parts: list[str]) -> None:
-        if len(parts) != 3:
+        if len(parts) != 4:
             raise ValueError("INPUT MOUSE MOVE message is malformed.")
 
-        session_id, dx_text, dy_text = parts
+        session_id, sequence_text, dx_text, dy_text = parts
         if not self.remote_session_matches(session_id):
             return
 
@@ -2279,17 +2336,27 @@ class SerialChatApp:
             return
 
         coordinate_mode, x, y, _rects = pointer_context
-        self.send_control_message("INPUT_MOUSE_POS", session_id, coordinate_mode, str(x), str(y))
+        self.send_control_message("INPUT_MOUSE_POS", session_id, sequence_text, coordinate_mode, str(x), str(y))
 
     def handle_input_mouse_pos(self, parts: list[str]) -> None:
-        if len(parts) != 4:
+        if len(parts) != 5:
             raise ValueError("INPUT MOUSE POS message is malformed.")
 
-        session_id, coordinate_mode, x_text, y_text = parts
+        session_id, sequence_text, coordinate_mode, x_text, y_text = parts
+        sequence = int(sequence_text)
         with self.input_lock:
             if self.input_state != INPUT_STATE_CONTROLLING or self.local_input_session_id != session_id:
                 return
             rects = self.remote_display_rects
+            previous_position = self.remote_pointer_position
+            sent_dx = 0
+            sent_dy = 0
+            while self.pending_remote_mouse_moves:
+                pending_sequence, pending_dx, pending_dy = self.pending_remote_mouse_moves.popleft()
+                if pending_sequence == sequence:
+                    sent_dx = pending_dx
+                    sent_dy = pending_dy
+                    break
 
         x = int(x_text)
         y = int(y_text)
@@ -2301,6 +2368,7 @@ class SerialChatApp:
                 return
             self.remote_pointer_coordinate_mode = coordinate_mode
             self.remote_pointer_position = (x, y)
+            self.reconcile_mouse_feedback_locked(sent_dx, sent_dy, previous_position, (x, y))
 
     def handle_input_mouse_button(self, parts: list[str]) -> None:
         if len(parts) != 3:
@@ -2684,8 +2752,13 @@ class SerialChatApp:
         if dx == 0 and dy == 0:
             return
 
+        with self.input_lock:
+            move_sequence = self.next_mouse_move_sequence
+            self.next_mouse_move_sequence += 1
+            self.pending_remote_mouse_moves.append((move_sequence, dx, dy))
+
         try:
-            self.send_control_message("INPUT_MOUSE_MOVE", session_id, str(dx), str(dy))
+            self.send_control_message("INPUT_MOUSE_MOVE", session_id, str(move_sequence), str(dx), str(dy))
         except serial.SerialException as exc:
             self.ui_events.put(("log", f"[input send error] {exc}"))
             self.ui_events.put(("disconnect", None))
@@ -2892,8 +2965,8 @@ class SerialChatApp:
             self.handle_idle_edge_pointer_move(int(x), int(y), coordinate_mode="screen")
             return
 
-        dx = 0
-        dy = 0
+        raw_dx = 0
+        raw_dy = 0
         anchor: tuple[int, int] | None = None
         with self.input_lock:
             if self.mouse_anchor is None:
@@ -2905,17 +2978,18 @@ class SerialChatApp:
                 self.mouse_warp_events_to_ignore -= 1
                 return
 
-            dx = int(round(x - anchor_x))
-            dy = int(round(y - anchor_y))
-            if dx == 0 and dy == 0:
+            raw_dx = int(round(x - anchor_x))
+            raw_dy = int(round(y - anchor_y))
+            if raw_dx == 0 and raw_dy == 0:
                 return
 
-            self.pending_mouse_dx += dx
-            self.pending_mouse_dy += dy
+            send_dx, send_dy = self.filter_blocked_mouse_delta_locked(raw_dx, raw_dy)
+            self.pending_mouse_dx += send_dx
+            self.pending_mouse_dy += send_dy
             self.mouse_warp_events_to_ignore = INPUT_WARP_IGNORE_EVENTS
             anchor = self.mouse_anchor
 
-        self.handle_auto_edge_exit_motion(dx, dy)
+        self.handle_auto_edge_exit_motion(raw_dx, raw_dy)
         self.warp_local_pointer(anchor)
 
     def handle_global_mouse_click(self, x: float, y: float, button: object, pressed: bool, injected: bool = False) -> None:
