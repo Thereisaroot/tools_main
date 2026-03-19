@@ -1529,19 +1529,6 @@ class SerialChatApp:
         x, y = self.constrain_point_to_rects(rects, position[0], position[1])
         return "screen", x, y, rects
 
-    def advance_remote_pointer_locked(self, dx: int, dy: int) -> tuple[int, int, str] | None:
-        if self.remote_pointer_position is None or not self.remote_display_rects or not self.remote_pointer_coordinate_mode:
-            return None
-
-        translated_dx, translated_dy = self.translate_screen_delta_for_coordinate_mode(
-            dx, dy, self.remote_pointer_coordinate_mode
-        )
-        next_x = self.remote_pointer_position[0] + translated_dx
-        next_y = self.remote_pointer_position[1] + translated_dy
-        constrained = self.constrain_point_to_rects(self.remote_display_rects, next_x, next_y)
-        self.remote_pointer_position = constrained
-        return constrained[0], constrained[1], self.remote_pointer_coordinate_mode
-
     def get_idle_pointer_position(self) -> tuple[int, int, str] | None:
         if sys.platform == "darwin" and AppKit is not None:
             point = AppKit.NSEvent.mouseLocation()
@@ -1615,7 +1602,7 @@ class SerialChatApp:
             self.edge_hold_started_at = now
             self.edge_hold_last_progress_at = now
 
-    def handle_auto_edge_exit_motion(self, dx: int, dy: int, remote_pointer: tuple[int, int, str] | None) -> None:
+    def handle_auto_edge_exit_motion(self, dx: int, dy: int) -> None:
         with self.input_lock:
             if (
                 not self.auto_edge_enabled
@@ -1628,6 +1615,7 @@ class SerialChatApp:
             side = self.current_exit_side()
             coordinate_mode = self.remote_pointer_coordinate_mode
             rects = self.remote_display_rects
+            remote_pointer = self.remote_pointer_position
 
         if remote_pointer is None or not coordinate_mode or not rects:
             self.reset_auto_edge_hold()
@@ -2028,6 +2016,8 @@ class SerialChatApp:
                 self.handle_input_key(parts)
             elif command == "INPUT_MOUSE_MOVE":
                 self.handle_input_mouse_move(parts)
+            elif command == "INPUT_MOUSE_POS":
+                self.handle_input_mouse_pos(parts)
             elif command == "INPUT_MOUSE_BUTTON":
                 self.handle_input_mouse_button(parts)
             elif command == "INPUT_MOUSE_SCROLL":
@@ -2284,6 +2274,33 @@ class SerialChatApp:
             return
 
         self.inject_remote_mouse_move(int(dx_text), int(dy_text))
+        pointer_context = self.capture_local_pointer_context()
+        if pointer_context is None:
+            return
+
+        coordinate_mode, x, y, _rects = pointer_context
+        self.send_control_message("INPUT_MOUSE_POS", session_id, coordinate_mode, str(x), str(y))
+
+    def handle_input_mouse_pos(self, parts: list[str]) -> None:
+        if len(parts) != 4:
+            raise ValueError("INPUT MOUSE POS message is malformed.")
+
+        session_id, coordinate_mode, x_text, y_text = parts
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_CONTROLLING or self.local_input_session_id != session_id:
+                return
+            rects = self.remote_display_rects
+
+        x = int(x_text)
+        y = int(y_text)
+        if rects:
+            x, y = self.constrain_point_to_rects(rects, x, y)
+
+        with self.input_lock:
+            if self.input_state != INPUT_STATE_CONTROLLING or self.local_input_session_id != session_id:
+                return
+            self.remote_pointer_coordinate_mode = coordinate_mode
+            self.remote_pointer_position = (x, y)
 
     def handle_input_mouse_button(self, parts: list[str]) -> None:
         if len(parts) != 3:
@@ -2878,7 +2895,6 @@ class SerialChatApp:
         dx = 0
         dy = 0
         anchor: tuple[int, int] | None = None
-        remote_pointer: tuple[int, int, str] | None = None
         with self.input_lock:
             if self.mouse_anchor is None:
                 self.mouse_anchor = (int(x), int(y))
@@ -2898,9 +2914,8 @@ class SerialChatApp:
             self.pending_mouse_dy += dy
             self.mouse_warp_events_to_ignore = INPUT_WARP_IGNORE_EVENTS
             anchor = self.mouse_anchor
-            remote_pointer = self.advance_remote_pointer_locked(dx, dy)
 
-        self.handle_auto_edge_exit_motion(dx, dy, remote_pointer)
+        self.handle_auto_edge_exit_motion(dx, dy)
         self.warp_local_pointer(anchor)
 
     def handle_global_mouse_click(self, x: float, y: float, button: object, pressed: bool, injected: bool = False) -> None:
