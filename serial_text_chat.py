@@ -362,7 +362,11 @@ def decode_key_token(token: str) -> object:
         return key
 
     if kind == "char":
-        return decode_control_text(value)
+        char = decode_control_text(value)
+        vk = platform_base_char_to_vk(char)
+        if vk is not None:
+            return pynput_keyboard.KeyCode.from_vk(vk)
+        return char
 
     if kind == "vk":
         return pynput_keyboard.KeyCode.from_vk(int(value))
@@ -410,6 +414,25 @@ def platform_vk_to_base_char(vk: int) -> str | None:
         return DARWIN_VK_TO_BASE_CHAR.get(vk)
     if sys.platform == "win32":
         return WINDOWS_VK_TO_BASE_CHAR.get(vk)
+    return None
+
+
+def platform_base_char_to_vk(char: str) -> int | None:
+    if len(char) != 1:
+        return None
+
+    if sys.platform == "darwin":
+        for vk, base_char in DARWIN_VK_TO_BASE_CHAR.items():
+            if base_char == char:
+                return vk
+        return None
+
+    if sys.platform == "win32":
+        for vk, base_char in WINDOWS_VK_TO_BASE_CHAR.items():
+            if base_char == char:
+                return vk
+        return None
+
     return None
 
 
@@ -1074,6 +1097,7 @@ class SerialChatApp:
         self.keyboard_listener.start()
         self.keyboard_listener.wait()
         self.raise_if_input_listener_failed(self.keyboard_listener)
+        self.debug_log("keyboard listener started")
 
     def ensure_mouse_listener_started(self) -> None:
         if self.mouse_listener is not None:
@@ -1090,6 +1114,7 @@ class SerialChatApp:
         self.mouse_listener.start()
         self.mouse_listener.wait()
         self.raise_if_input_listener_failed(self.mouse_listener)
+        self.debug_log("mouse listener started")
 
     def start_hotkey_backend(self) -> bool:
         if not self.input_feature_available():
@@ -2061,7 +2086,6 @@ class SerialChatApp:
         self.ui_events.put(("disconnect", None))
 
     def handle_received_message(self, message: str) -> None:
-        self.debug_log(f"recv frame raw={message!r}")
         try:
             frame_type, payload = parse_serial_message(message)
         except ValueError as exc:
@@ -2069,12 +2093,16 @@ class SerialChatApp:
             return
 
         if frame_type == FRAME_KIND_TEXT:
+            self.debug_log(f"recv frame raw={message!r}")
             self.debug_log(f"recv text payload={payload!r}")
             self.ui_events.put(("text", str(payload)))
             return
 
         command, parts = payload
-        self.debug_log(f"recv control command={command} parts={parts!r}")
+        if command != "INPUT_MOUSE_MOVE":
+            self.debug_log(f"recv frame raw={message!r}")
+        if command != "INPUT_MOUSE_MOVE":
+            self.debug_log(f"recv control command={command} parts={parts!r}")
 
         if command in {"ACK_START", "ACK_CHUNK", "ACK_END"}:
             self.transfer_ack_queue.put((command, parts))
@@ -2665,7 +2693,8 @@ class SerialChatApp:
             raise
 
     def send_control_message(self, command: str, *parts: str) -> None:
-        self.debug_log(f"send control command={command} parts={parts!r}")
+        if command != "INPUT_MOUSE_MOVE":
+            self.debug_log(f"send control command={command} parts={parts!r}")
         self.send_serial_frame(build_control_message(command, *parts))
 
     def wait_for_file_ack(self, expected_command: str, transfer_id: str, expected_value: str | None = None) -> None:
@@ -2755,7 +2784,8 @@ class SerialChatApp:
             self.ui_events.put(("log", f"[input send error] {exc}"))
 
     def queue_input_command(self, command: str, session_id: str, *parts: str) -> None:
-        self.debug_log(f"queue input command={command} session={session_id} parts={parts!r}")
+        if command != "INPUT_MOUSE_MOVE":
+            self.debug_log(f"queue input command={command} session={session_id} parts={parts!r}")
         self.input_outbound_queue.put((command, session_id, parts))
 
     def inset_anchor_from_side(self, anchor: tuple[int, int], side: str | None) -> tuple[int, int]:
@@ -2875,7 +2905,8 @@ class SerialChatApp:
             pass
 
         self.debug_log(
-            f"local key press raw={key!r} token={key_token!r} canonical={canonical_token!r}"
+            f"local key press raw={key!r} char={getattr(key, 'char', None)!r} vk={getattr(key, 'vk', None)!r} "
+            f"token={key_token!r} canonical={canonical_token!r}"
         )
 
         if canonical_token is not None:
@@ -2934,7 +2965,8 @@ class SerialChatApp:
             pass
 
         self.debug_log(
-            f"local key release raw={key!r} token={key_token!r} canonical={canonical_token!r}"
+            f"local key release raw={key!r} char={getattr(key, 'char', None)!r} vk={getattr(key, 'vk', None)!r} "
+            f"token={key_token!r} canonical={canonical_token!r}"
         )
 
         if canonical_token is not None:

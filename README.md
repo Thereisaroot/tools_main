@@ -54,6 +54,12 @@ chmod +x run_serial_text_chat.sh
 ./run_serial_text_chat.sh
 ```
 
+With debug logging:
+
+```bash
+./run_serial_text_chat.sh --debug
+```
+
 On Windows, you can also run:
 
 ```bat

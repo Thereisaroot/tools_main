@@ -11,4 +11,4 @@ if errorlevel 1 (
     )
 )
 
-py -3 serial_text_chat.py
+py -3 serial_text_chat.py %*

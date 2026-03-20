@@ -6,4 +6,4 @@ if ! python3 -c "import serial" >/dev/null 2>&1; then
   python3 -m pip install -r requirements.txt
 fi
 
-exec python3 serial_text_chat.py
+exec python3 serial_text_chat.py "$@"
