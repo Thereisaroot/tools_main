@@ -577,6 +577,7 @@ class SerialChatApp:
         self.input_support_var = tk.StringVar(value=self.input_support_message)
         self.auto_edge_enabled_var = tk.BooleanVar(value=self.auto_edge_enabled)
         self.peer_side_var = tk.StringVar(value=self.peer_side)
+        self.startup_auto_connect_attempted = False
 
         self._build_ui()
         self.refresh_ports()
@@ -591,6 +592,7 @@ class SerialChatApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self.process_ui_events)
+        self.root.after(10, self.maybe_auto_connect_last_port)
         self.debug_log("debug logging enabled")
 
     def _build_ui(self) -> None:
@@ -1245,6 +1247,25 @@ class SerialChatApp:
             return
 
         self.port_var.set(ports[0])
+
+    def maybe_auto_connect_last_port(self) -> None:
+        if self.startup_auto_connect_attempted or self.serial_connected():
+            return
+
+        self.startup_auto_connect_attempted = True
+        preferred_port = str(self.app_state.get("last_port", "")).strip()
+        if not preferred_port:
+            return
+
+        available_ports = {str(port) for port in self.port_combo.cget("values")}
+        if preferred_port not in available_ports:
+            return
+
+        if self.port_var.get().strip() != preferred_port:
+            self.port_var.set(preferred_port)
+
+        self.debug_log(f"startup auto-connect to {preferred_port}")
+        self.connect()
 
     def toggle_connection(self) -> None:
         if self.serial_connected():

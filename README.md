@@ -79,6 +79,8 @@ run_serial_text_chat.bat
 9. `Copy to Clipboard` copies the last raw text payload.
 10. `Copy to Clipboard After Decode` decodes the last obfuscated payload and copies it.
 
+If the last connected serial port is still present when the app starts, it will be selected and connected automatically.
+
 Keyboard shortcuts:
 
 - `Ctrl+Enter`: send plain text
