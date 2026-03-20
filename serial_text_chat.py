@@ -106,6 +106,75 @@ EMERGENCY_EXIT_KEY_TOKEN = "special:esc"
 APP_HOTKEY_MODIFIER_TOKENS = frozenset({"special:ctrl", "special:alt"})
 APP_COPY_TRIGGER_CHARS = frozenset({"c", "ㅊ"})
 APP_SEND_TRIGGER_CHARS = frozenset({"v", "ㅍ"})
+SHIFTED_CHAR_TO_BASE_CHAR = {
+    "~": "`",
+    "!": "1",
+    "@": "2",
+    "#": "3",
+    "$": "4",
+    "%": "5",
+    "^": "6",
+    "&": "7",
+    "*": "8",
+    "(": "9",
+    ")": "0",
+    "_": "-",
+    "+": "=",
+    "{": "[",
+    "}": "]",
+    "|": "\\",
+    ":": ";",
+    "\"": "'",
+    "<": ",",
+    ">": ".",
+    "?": "/",
+}
+WINDOWS_VK_TO_BASE_CHAR = {
+    0x30: "0",
+    0x31: "1",
+    0x32: "2",
+    0x33: "3",
+    0x34: "4",
+    0x35: "5",
+    0x36: "6",
+    0x37: "7",
+    0x38: "8",
+    0x39: "9",
+    0xBD: "-",
+    0xBB: "=",
+    0xDB: "[",
+    0xDD: "]",
+    0xDC: "\\",
+    0xBA: ";",
+    0xDE: "'",
+    0xBC: ",",
+    0xBE: ".",
+    0xBF: "/",
+    0xC0: "`",
+}
+DARWIN_VK_TO_BASE_CHAR = {
+    18: "1",
+    19: "2",
+    20: "3",
+    21: "4",
+    23: "5",
+    22: "6",
+    26: "7",
+    28: "8",
+    25: "9",
+    29: "0",
+    27: "-",
+    24: "=",
+    33: "[",
+    30: "]",
+    42: "\\",
+    41: ";",
+    39: "'",
+    43: ",",
+    47: ".",
+    44: "/",
+    50: "`",
+}
 AUTO_EDGE_DISABLED = "off"
 AUTO_EDGE_MODE_ENTER = "enter"
 AUTO_EDGE_MODE_EXIT = "exit"
@@ -291,6 +360,9 @@ def encode_key_token(key: object) -> str:
         if key.char is not None:
             return f"char:{encode_control_text(key.char)}"
         if key.vk is not None:
+            base_char = platform_vk_to_base_char(key.vk)
+            if base_char is not None:
+                return f"char:{encode_control_text(base_char)}"
             return f"vk:{key.vk}"
 
     raise ValueError("Unsupported key event.")
@@ -352,6 +424,25 @@ def canonical_key_token(key_token: str) -> str:
         "special:cmd_r": "special:cmd",
     }
     return modifier_aliases.get(key_token, key_token)
+
+
+def platform_vk_to_base_char(vk: int) -> str | None:
+    if sys.platform == "darwin":
+        return DARWIN_VK_TO_BASE_CHAR.get(vk)
+    if sys.platform == "win32":
+        return WINDOWS_VK_TO_BASE_CHAR.get(vk)
+    return None
+
+
+def normalize_key_token_for_remote(key_token: str, shift_active: bool) -> str:
+    if not shift_active or not key_token.startswith("char:"):
+        return key_token
+
+    char = decode_control_text(key_token[5:])
+    normalized_char = SHIFTED_CHAR_TO_BASE_CHAR.get(char, char.lower() if len(char) == 1 and char.isalpha() else char)
+    if normalized_char == char:
+        return key_token
+    return f"char:{encode_control_text(normalized_char)}"
 
 
 @dataclass
@@ -2806,6 +2897,11 @@ class SerialChatApp:
                 self.ui_events.put(("force-stop-input", None))
                 return
 
+        if key_token is not None:
+            with self.input_lock:
+                shift_active = "special:shift" in self.hotkey_pressed_key_tokens
+            key_token = normalize_key_token_for_remote(key_token, shift_active)
+
         if key_token is not None and sys.platform != "darwin":
             app_hotkey_action = self.get_app_hotkey_action(key_token)
             if app_hotkey_action is not None:
@@ -2849,6 +2945,11 @@ class SerialChatApp:
                 self.hotkey_pressed_key_tokens.discard(canonical_token)
                 if key_token is not None:
                     self.active_app_hotkey_key_tokens.discard(key_token)
+
+        if key_token is not None:
+            with self.input_lock:
+                shift_active = "special:shift" in self.hotkey_pressed_key_tokens
+            key_token = normalize_key_token_for_remote(key_token, shift_active)
 
         if self.is_toggle_key(key) and not (sys.platform == "darwin" and self.mac_hotkey_backend_ready):
             return
