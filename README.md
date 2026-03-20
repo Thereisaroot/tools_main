@@ -41,6 +41,12 @@ sudo apt install python3-tk
 python3 serial_text_chat.py
 ```
 
+To print verbose serial/input logs for troubleshooting:
+
+```bash
+python3 serial_text_chat.py --debug
+```
+
 On macOS or Linux, you can also run:
 
 ```bash

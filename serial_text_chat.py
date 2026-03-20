@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import binascii
 import json
@@ -45,9 +46,14 @@ if sys.platform == "darwin":
         import AppKit
     except Exception:  # pragma: no cover - environment dependent
         AppKit = None
+    try:
+        from pynput.keyboard._darwin import SYMBOLS as DARWIN_PYNPUT_SYMBOLS
+    except Exception:  # pragma: no cover - environment dependent
+        DARWIN_PYNPUT_SYMBOLS = {}
 else:
     Quartz = None
     AppKit = None
+    DARWIN_PYNPUT_SYMBOLS = {}
 
 if sys.platform == "win32":
     import ctypes
@@ -130,16 +136,8 @@ SHIFTED_CHAR_TO_BASE_CHAR = {
     "?": "/",
 }
 WINDOWS_VK_TO_BASE_CHAR = {
-    0x30: "0",
-    0x31: "1",
-    0x32: "2",
-    0x33: "3",
-    0x34: "4",
-    0x35: "5",
-    0x36: "6",
-    0x37: "7",
-    0x38: "8",
-    0x39: "9",
+    **{vk: chr(vk + 32) for vk in range(0x41, 0x5B)},
+    **{vk: chr(vk) for vk in range(0x30, 0x3A)},
     0xBD: "-",
     0xBB: "=",
     0xDB: "[",
@@ -153,27 +151,7 @@ WINDOWS_VK_TO_BASE_CHAR = {
     0xC0: "`",
 }
 DARWIN_VK_TO_BASE_CHAR = {
-    18: "1",
-    19: "2",
-    20: "3",
-    21: "4",
-    23: "5",
-    22: "6",
-    26: "7",
-    28: "8",
-    25: "9",
-    29: "0",
-    27: "-",
-    24: "=",
-    33: "[",
-    30: "]",
-    42: "\\",
-    41: ";",
-    39: "'",
-    43: ",",
-    47: ".",
-    44: "/",
-    50: "`",
+    vk: char for vk, char in DARWIN_PYNPUT_SYMBOLS.items() if len(char) == 1 and char.isprintable()
 }
 AUTO_EDGE_DISABLED = "off"
 AUTO_EDGE_MODE_ENTER = "enter"
@@ -357,12 +335,13 @@ def encode_key_token(key: object) -> str:
         return f"special:{key.name}"
 
     if isinstance(key, pynput_keyboard.KeyCode):
-        if key.char is not None:
-            return f"char:{encode_control_text(key.char)}"
         if key.vk is not None:
             base_char = platform_vk_to_base_char(key.vk)
             if base_char is not None:
                 return f"char:{encode_control_text(base_char)}"
+        if key.char is not None:
+            return f"char:{encode_control_text(key.char)}"
+        if key.vk is not None:
             return f"vk:{key.vk}"
 
     raise ValueError("Unsupported key event.")
@@ -490,10 +469,11 @@ def deserialize_display_rects(serialized: str) -> tuple[DisplayRect, ...]:
 
 
 class SerialChatApp:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, debug_enabled: bool = False) -> None:
         self.root = root
         self.root.title("Serial Text Chat v1")
         self.root.geometry("900x820")
+        self.debug_enabled = debug_enabled
 
         self.serial_port: serial.Serial | None = None
         self.reader_thread: threading.Thread | None = None
@@ -588,6 +568,7 @@ class SerialChatApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self.process_ui_events)
+        self.debug_log("debug logging enabled")
 
     def _build_ui(self) -> None:
         controls = ttk.Frame(self.root, padding=12)
@@ -2080,6 +2061,7 @@ class SerialChatApp:
         self.ui_events.put(("disconnect", None))
 
     def handle_received_message(self, message: str) -> None:
+        self.debug_log(f"recv frame raw={message!r}")
         try:
             frame_type, payload = parse_serial_message(message)
         except ValueError as exc:
@@ -2087,10 +2069,12 @@ class SerialChatApp:
             return
 
         if frame_type == FRAME_KIND_TEXT:
+            self.debug_log(f"recv text payload={payload!r}")
             self.ui_events.put(("text", str(payload)))
             return
 
         command, parts = payload
+        self.debug_log(f"recv control command={command} parts={parts!r}")
 
         if command in {"ACK_START", "ACK_CHUNK", "ACK_END"}:
             self.transfer_ack_queue.put((command, parts))
@@ -2361,6 +2345,7 @@ class SerialChatApp:
             return
 
         key_token = decode_control_text(encoded_key)
+        self.debug_log(f"recv input key session={session_id} action={action} token={key_token!r}")
         if action == "down":
             self.inject_remote_key_down(key_token)
         else:
@@ -2542,9 +2527,11 @@ class SerialChatApp:
         self.message_text.focus_set()
 
     def send_text_message(self, payload: str) -> None:
+        self.debug_log(f"send text payload={payload!r}")
         self.send_serial_frame(build_text_message(payload))
 
     def send_serial_frame(self, frame_text: str) -> None:
+        self.debug_log(f"send frame raw={frame_text!r}")
         payload = frame_text.encode("utf-8") + MESSAGE_TERMINATOR
 
         with self.write_lock:
@@ -2678,6 +2665,7 @@ class SerialChatApp:
             raise
 
     def send_control_message(self, command: str, *parts: str) -> None:
+        self.debug_log(f"send control command={command} parts={parts!r}")
         self.send_serial_frame(build_control_message(command, *parts))
 
     def wait_for_file_ack(self, expected_command: str, transfer_id: str, expected_value: str | None = None) -> None:
@@ -2767,6 +2755,7 @@ class SerialChatApp:
             self.ui_events.put(("log", f"[input send error] {exc}"))
 
     def queue_input_command(self, command: str, session_id: str, *parts: str) -> None:
+        self.debug_log(f"queue input command={command} session={session_id} parts={parts!r}")
         self.input_outbound_queue.put((command, session_id, parts))
 
     def inset_anchor_from_side(self, anchor: tuple[int, int], side: str | None) -> tuple[int, int]:
@@ -2885,6 +2874,10 @@ class SerialChatApp:
         except Exception:
             pass
 
+        self.debug_log(
+            f"local key press raw={key!r} token={key_token!r} canonical={canonical_token!r}"
+        )
+
         if canonical_token is not None:
             with self.input_lock:
                 self.hotkey_pressed_key_tokens.add(canonical_token)
@@ -2939,6 +2932,10 @@ class SerialChatApp:
             canonical_token = canonical_key_token(key_token)
         except Exception:
             pass
+
+        self.debug_log(
+            f"local key release raw={key!r} token={key_token!r} canonical={canonical_token!r}"
+        )
 
         if canonical_token is not None:
             with self.input_lock:
@@ -3560,6 +3557,21 @@ class SerialChatApp:
         self.root.clipboard_append(text)
         self.root.update()
 
+    def debug_log(self, message: str) -> None:
+        if not self.debug_enabled:
+            return
+
+        line = f"[debug] {message}"
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+        if threading.current_thread() is threading.main_thread():
+            self.append_log(line)
+        else:
+            self.ui_events.put(("log", line))
+
     def append_log(self, message: str) -> None:
         line = f"{message}\n\n"
 
@@ -3575,13 +3587,20 @@ class SerialChatApp:
         self.root.destroy()
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true", help="Print verbose send/receive/input debug logs.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     if TkinterDnD is not None:
         root = TkinterDnD.Tk()
     else:
         root = tk.Tk()
 
-    SerialChatApp(root)
+    SerialChatApp(root, debug_enabled=args.debug)
     root.mainloop()
 
 
