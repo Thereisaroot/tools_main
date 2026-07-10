@@ -771,3 +771,130 @@ def test_progress_listener_can_close_service_from_completion_thread(tmp_path):
 
     assert closed.wait(2)
     assert errors == []
+
+
+def test_closed_service_rejects_incoming_offer_without_creating_partial_file(tmp_path):
+    offer = make_offer("closed.bin", b"closed", transfer_id="b" * 32)
+    bus = QueueBus()
+    download_dir = tmp_path / "downloads"
+    service = FileService(bus, download_dir)
+    service.close()
+    bus.sent.clear()
+
+    assert not service.handle_message(
+        Message(MessageType.FILE_OFFER, offer.to_metadata())
+    )
+    assert bus.sent == []
+    assert not list(download_dir.glob("*.part"))
+
+
+def test_unacknowledged_cancellation_counts_against_outgoing_capacity(tmp_path):
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    service = FileService(
+        QueueBus(),
+        tmp_path / "downloads",
+        max_outgoing_transfers=1,
+    )
+    transfer_id = service.send_file(first).result(timeout=2)
+    service.cancel(transfer_id)
+
+    with pytest.raises(Exception, match="capacity"):
+        service.send_file(second)
+
+    service.close()
+
+
+def test_exact_terminal_registry_refuses_new_ids_when_its_bound_is_reached(tmp_path):
+    bus = QueueBus()
+    service = FileService(
+        bus,
+        tmp_path / "downloads",
+        max_terminal_transfers=2,
+    )
+    for transfer_id in ("1" * 32, "2" * 32):
+        service.handle_message(
+            Message(
+                MessageType.FILE_CANCEL,
+                {"transfer_id": transfer_id, "reason": "cancelled"},
+            )
+        )
+    bus.sent.clear()
+    offer = make_offer("new.bin", b"new", transfer_id="3" * 32)
+
+    service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+
+    assert bus.sent[-1][0].message_type is MessageType.FILE_CANCEL
+    assert bus.sent[-1][0].metadata["reason"] == "capacity"
+    service.close()
+
+
+def test_disk_capacity_accounts_for_all_reserved_incoming_files(tmp_path, monkeypatch):
+    from shooklink.files import service as service_module
+
+    monkeypatch.setattr(service_module, "_available_disk_bytes", lambda _path: 5)
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads", max_incoming_bytes=100)
+    first = make_offer("first.bin", b"123", transfer_id="4" * 32)
+    second = make_offer("second.bin", b"456", transfer_id="5" * 32)
+
+    service.handle_message(Message(MessageType.FILE_OFFER, first.to_metadata()))
+    service.handle_message(Message(MessageType.FILE_OFFER, second.to_metadata()))
+
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.FILE_ACCEPT,
+        MessageType.FILE_CANCEL,
+    ]
+    assert bus.sent[-1][0].metadata["reason"] == "capacity"
+    service.close()
+
+
+def test_offered_progress_is_linearized_before_peer_cancel(tmp_path, monkeypatch):
+    source = tmp_path / "linearized.bin"
+    source.write_bytes(b"linearized")
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    progress = []
+    service.add_progress_listener(progress.append)
+    notify_entered = threading.Event()
+    release_notify = threading.Event()
+    original_notify = service._notify_outgoing
+
+    def blocking_notify(transfer, state):
+        if state == "offered":
+            notify_entered.set()
+            assert release_notify.wait(2)
+        original_notify(transfer, state)
+
+    monkeypatch.setattr(service, "_notify_outgoing", blocking_notify)
+    future = service.send_file(source)
+    assert notify_entered.wait(2)
+    offer = next(
+        item[0]
+        for item in bus.sent
+        if item[0].message_type is MessageType.FILE_OFFER
+    )
+    cancel_done = threading.Event()
+
+    def cancel_from_peer():
+        service.handle_message(
+            Message(
+                MessageType.FILE_CANCEL,
+                {"transfer_id": offer.metadata["transfer_id"], "reason": "cancelled"},
+            )
+        )
+        cancel_done.set()
+
+    cancel_thread = threading.Thread(target=cancel_from_peer)
+    cancel_thread.start()
+    time.sleep(0.02)
+    release_notify.set()
+    transfer_id = future.result(timeout=2)
+    cancel_thread.join(2)
+
+    assert cancel_done.is_set()
+    assert transfer_id == offer.metadata["transfer_id"]
+    assert [item.state for item in progress[-2:]] == ["offered", "cancelled"]
+    service.close()
