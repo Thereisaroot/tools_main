@@ -64,6 +64,39 @@ def test_connected_return_edge_emits_leave_instead_of_clamping():
     assert transition.position == (0, 540)
 
 
+def test_large_delta_crossing_connected_return_edge_emits_leave():
+    topology = Topology((Monitor("display", Rect(0, 0, 1920, 1080)),))
+    pointer = LogicalPointer(topology, return_side=Side.LEFT)
+    pointer.set_position(5, 540)
+
+    transition = pointer.move(-10, 0)
+
+    assert transition.kind is TransitionKind.LEAVE
+    assert transition.position == (0, 540)
+
+
+def test_large_delta_into_monitor_gap_stays_on_source_monitor():
+    topology = Topology(
+        (
+            Monitor("main", Rect(0, 0, 1920, 1080)),
+            Monitor("right", Rect(1920, 200, 1280, 1024)),
+        )
+    )
+    pointer = LogicalPointer(topology)
+    pointer.set_position(1919, 100)
+
+    transition = pointer.move(200, 0)
+
+    assert transition.position == (1919, 100)
+
+
+def test_set_position_rejects_non_integer_coordinates():
+    pointer, _topology = single_monitor_pointer()
+
+    with pytest.raises(TypeError, match="integers"):
+        pointer.set_position(1.5, 2.5)
+
+
 def test_enter_and_move_use_absolute_destination_coordinates():
     pointer, topology = single_monitor_pointer()
 

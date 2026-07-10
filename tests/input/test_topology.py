@@ -1,3 +1,5 @@
+import pytest
+
 from shooklink.input.topology import EdgeSegment, Monitor, Rect, Side, Topology
 
 
@@ -70,3 +72,12 @@ def test_nearest_valid_point_does_not_land_in_monitor_gap():
 
     assert point == (1919, 100)
     assert topology.contains(*point)
+
+
+def test_topology_geometry_cannot_be_mutated_after_construction():
+    topology = staggered_topology()
+
+    with pytest.raises((AttributeError, TypeError)):
+        topology.monitors = ()
+    with pytest.raises(TypeError):
+        topology._edges[Side.LEFT] = ()

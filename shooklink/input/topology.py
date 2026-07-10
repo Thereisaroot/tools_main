@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
+from typing import Mapping
 
 
 class Side(str, Enum):
@@ -93,20 +95,26 @@ class EdgeSegment:
         return y == self.coordinate and self.start <= x < self.end
 
 
+@dataclass(frozen=True, slots=True, init=False)
 class Topology:
+    monitors: tuple[Monitor, ...]
+    _edges: Mapping[Side, tuple[EdgeSegment, ...]]
+
     def __init__(self, monitors: tuple[Monitor, ...] | list[Monitor]) -> None:
-        self.monitors = tuple(monitors)
-        if not self.monitors:
+        normalized = tuple(monitors)
+        if not normalized:
             raise ValueError("topology must contain at least one monitor")
-        if not all(isinstance(monitor, Monitor) for monitor in self.monitors):
+        if not all(isinstance(monitor, Monitor) for monitor in normalized):
             raise TypeError("topology monitors must be Monitor values")
-        identifiers = [monitor.monitor_id for monitor in self.monitors]
+        identifiers = [monitor.monitor_id for monitor in normalized]
         if len(set(identifiers)) != len(identifiers):
             raise ValueError("monitor IDs must be unique")
-        self._edges = {
+        object.__setattr__(self, "monitors", normalized)
+        edges = {
             side: self._build_edge_segments(side)
             for side in Side
         }
+        object.__setattr__(self, "_edges", MappingProxyType(edges))
 
     def contains(self, x: int, y: int) -> bool:
         return any(monitor.rect.contains(x, y) for monitor in self.monitors)
@@ -168,6 +176,18 @@ class Topology:
             candidates.append((distance, order, candidate_x, candidate_y))
         _distance, _order, nearest_x, nearest_y = min(candidates)
         return nearest_x, nearest_y
+
+    def move_point(self, x: int, y: int, dx: int, dy: int) -> tuple[int, int]:
+        if any(type(value) is not int for value in (x, y, dx, dy)):
+            raise TypeError("pointer coordinates and deltas must be integers")
+        source = self.monitor_at(x, y)
+        if source is None:
+            raise ValueError("pointer position must be on a connected monitor")
+        target_x = x + dx
+        target_y = y + dy
+        if self.contains(target_x, target_y):
+            return target_x, target_y
+        return source.rect.clamp_point(target_x, target_y)
 
     def _build_edge_segments(self, side: Side) -> tuple[EdgeSegment, ...]:
         if side is Side.LEFT:
