@@ -364,7 +364,15 @@ class ShellService:
             process.terminate()
             raise
         try:
-            process.start(columns, rows)
+            with self._lock:
+                if (
+                    not self._allow_remote_shell
+                    or self._session is None
+                    or self._session.session_id != session_id
+                    or self._session.process is not process
+                ):
+                    return
+                process.start(columns, rows)
         except BaseException:
             with self._lock:
                 if self._session is not None and self._session.session_id == session_id:

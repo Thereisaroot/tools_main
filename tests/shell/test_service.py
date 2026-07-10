@@ -238,6 +238,33 @@ def test_permission_revocation_during_process_creation_prevents_start():
     assert bus.sent[-1][0].metadata["reason"] == "permission"
 
 
+def test_permission_revocation_during_accept_send_prevents_start():
+    holder = {}
+
+    class RevokingAcceptBus(FakeBus):
+        def send(self, message, *, secure=True, priority=Priority.NORMAL):
+            super().send(message, secure=secure, priority=priority)
+            if message.message_type is MessageType.SHELL_ACCEPT:
+                holder["service"].set_allow_remote_shell(False)
+
+    bus = RevokingAcceptBus()
+    factory = FakeProcessFactory()
+    service = ShellService(bus, factory)
+    holder["service"] = service
+    service.set_allow_remote_shell(True)
+
+    service.handle_message(
+        shell_message(MessageType.SHELL_OPEN, columns=80, rows=24, term="xterm")
+    )
+
+    assert factory.processes[-1].started == []
+    assert service.active_session_id is None
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.SHELL_ACCEPT,
+        MessageType.SHELL_EXIT,
+    ]
+
+
 def test_shell_accept_precedes_output_emitted_synchronously_by_start():
     bus = FakeBus()
 

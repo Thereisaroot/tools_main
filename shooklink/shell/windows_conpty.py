@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import codecs
 import logging
+import os
 import shutil
 import threading
 from collections.abc import Callable
@@ -142,6 +144,7 @@ class WindowsConPtyProcess:
         self._exit_notified = False
         self._tree_guard = None
         self._cleanup_done = False
+        self._input_decoder = codecs.getincrementaldecoder("utf-8")("strict")
 
     def start(self, columns: int, rows: int) -> None:
         _validate_size(columns, rows)
@@ -149,9 +152,12 @@ class WindowsConPtyProcess:
             if self._process is not None:
                 raise RuntimeError("terminal process can only be started once")
             process_type = self._pty_process_type or _load_pty_process_type()
+            child_environment = os.environ.copy()
+            child_environment["TERM"] = self.term
             self._process = process_type.spawn(
                 self.command,
                 dimensions=(rows, columns),
+                env=child_environment,
             )
             guard_factory = self._process_tree_guard_factory
             if guard_factory is None:
@@ -161,7 +167,8 @@ class WindowsConPtyProcess:
                 try:
                     self._tree_guard = guard_factory(process_id)
                 except BaseException:
-                    logger.exception("could not attach ConPTY process to a Windows job")
+                    self._cleanup_process(force=True)
+                    raise
             self._reader_thread = threading.Thread(
                 target=self._read_loop,
                 name="shooklink-conpty-reader",
@@ -175,9 +182,15 @@ class WindowsConPtyProcess:
             raise TypeError("terminal input must be bytes")
         with self._lock:
             process = self._process
-        if process is None:
-            raise RuntimeError("terminal process is not running")
-        process.write(data.decode("utf-8"))
+            if process is None:
+                raise RuntimeError("terminal process is not running")
+            try:
+                text = self._input_decoder.decode(data, final=False)
+            except UnicodeDecodeError:
+                self._input_decoder.reset()
+                raise
+            if text:
+                process.write(text)
 
     def resize(self, columns: int, rows: int) -> None:
         _validate_size(columns, rows)
@@ -188,13 +201,7 @@ class WindowsConPtyProcess:
         process.setwinsize(rows, columns)
 
     def terminate(self) -> None:
-        with self._lock:
-            process = self._process
-        if process is None:
-            return
-        if process.isalive():
-            process.terminate(force=True)
-        self._cleanup_process()
+        self._cleanup_process(force=True)
 
     def is_running(self) -> bool:
         with self._lock:
@@ -230,12 +237,13 @@ class WindowsConPtyProcess:
             self._cleanup_process()
             self._notify_exit(exit_code)
 
-    def _cleanup_process(self) -> None:
+    def _cleanup_process(self, *, force: bool = False) -> None:
         with self._lock:
             if self._cleanup_done:
                 return
             self._cleanup_done = True
             process = self._process
+            self._process = None
             guard = self._tree_guard
         if guard is not None:
             try:
@@ -246,7 +254,7 @@ class WindowsConPtyProcess:
             close = getattr(process, "close", None)
             if callable(close):
                 try:
-                    close()
+                    close(force=force)
                 except BaseException:
                     logger.exception("could not close ConPTY handles")
 
