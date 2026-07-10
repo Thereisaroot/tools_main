@@ -704,6 +704,8 @@ class FileService:
         self._preparing_count = 0
         self._listeners: list[Callable[[FileProgress], None]] = []
         self._progress_started: dict[str, float] = {}
+        self._connected = True
+        self._connection_epoch = 0
         self._closed = False
         self._timer_stop = threading.Event()
         self._timer_thread = threading.Thread(
@@ -730,6 +732,8 @@ class FileService:
         with self._lock:
             if self._closed:
                 raise FileTransferError("file service is closed")
+            if not self._connected:
+                raise FileTransferError("file service is not connected")
             if (
                 len(self._outgoing)
                 + self._preparing_count
@@ -737,12 +741,13 @@ class FileService:
                 >= self._max_outgoing_transfers
             ):
                 raise FileTransferError("outgoing file transfer capacity is full")
+            connection_epoch = self._connection_epoch
             self._preparing_count += 1
         try:
             future = self._executor.submit(OutgoingTransfer.from_path, path)
         except BaseException:
             with self._lock:
-                self._preparing_count -= 1
+                self._release_preparing_slot_locked(connection_epoch)
             raise
         result: Future[str] = Future()
 
@@ -756,7 +761,7 @@ class FileService:
                     pass
                 finally:
                     with self._lock:
-                        self._preparing_count -= 1
+                        self._release_preparing_slot_locked(connection_epoch)
                 return
             try:
                 transfer = preparation.result()
@@ -764,8 +769,16 @@ class FileService:
                     if self._closed:
                         transfer.cancel()
                         raise FileTransferError("file service is closed")
+                    if (
+                        not self._connected
+                        or connection_epoch != self._connection_epoch
+                    ):
+                        transfer.cancel()
+                        raise FileTransferError(
+                            "file transfer connection changed while preparing"
+                        )
                     self._outgoing[transfer.offer.transfer_id] = transfer
-                    self._preparing_count -= 1
+                    self._release_preparing_slot_locked(connection_epoch)
                     slot_reserved = False
                     self._send(transfer.offer_message(), Priority.NORMAL)
                     self._notify_outgoing(transfer, "offered")
@@ -775,7 +788,7 @@ class FileService:
             except BaseException as error:
                 with self._lock:
                     if slot_reserved:
-                        self._preparing_count -= 1
+                        self._release_preparing_slot_locked(connection_epoch)
                     if transfer is not None:
                         self._outgoing.pop(transfer.offer.transfer_id, None)
                 if transfer is not None:
@@ -798,7 +811,7 @@ class FileService:
         if handler is None:
             return False
         with self._lock:
-            if self._closed:
+            if self._closed or not self._connected:
                 return False
         self._ensure_trusted()
         try:
@@ -806,7 +819,7 @@ class FileService:
         except Exception as error:
             raise FileProtocolError("file message authentication failed") from error
         with self._lock:
-            if self._closed:
+            if self._closed or not self._connected:
                 return False
         if not isinstance(body, bytes):
             raise FileProtocolError("file message decryption returned invalid data")
@@ -816,7 +829,7 @@ class FileService:
     def poll(self, *, now: float | None = None) -> None:
         timestamp = time.monotonic() if now is None else now
         with self._lock:
-            if self._closed:
+            if self._closed or not self._connected:
                 return
             for transfer in self._outgoing.values():
                 pending_messages = transfer.retry_control(now=now)
@@ -856,21 +869,63 @@ class FileService:
                 self._queue_cancel_locked(transfer_id, direction)
                 self._notify_incoming(transfer, "cancelled")
 
+    def connection_changed(self, connected: bool) -> None:
+        if not isinstance(connected, bool):
+            raise TypeError("connected must be a boolean")
+        if not connected:
+            self.disconnect()
+            return
+        with self._lock:
+            if self._closed:
+                raise FileTransferError("file service is closed")
+            self._connected = True
+
+    def disconnect(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._connected = False
+            self._connection_epoch += 1
+            self._preparing_count = 0
+            transfers = tuple(self._outgoing.values()) + tuple(
+                self._incoming.values()
+            )
+            finalizing = tuple(self._finalizing.values())
+            self._outgoing.clear()
+            self._incoming.clear()
+            self._finalizing.clear()
+            self._completed_incoming.clear()
+            self._cancelled_incoming.clear()
+            self._pending_cancels.clear()
+            self._terminal_status.clear()
+            self._progress_started.clear()
+        for transfer in transfers:
+            transfer.cancel()
+        for future in finalizing:
+            future.cancel()
+
     def close(self) -> None:
         self._timer_stop.set()
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            self._connected = False
+            self._connection_epoch += 1
+            self._preparing_count = 0
             transfers = tuple(self._outgoing.values()) + tuple(self._incoming.values())
+            finalizing = tuple(self._finalizing.values())
             self._outgoing.clear()
             self._incoming.clear()
+            self._finalizing.clear()
             self._completed_incoming.clear()
             self._cancelled_incoming.clear()
             self._pending_cancels.clear()
             self._terminal_status.clear()
         for transfer in transfers:
             transfer.cancel()
+        for future in finalizing:
+            future.cancel()
         if self._timer_thread is not threading.current_thread():
             self._timer_thread.join(2.0)
         if self._owns_executor:
@@ -898,6 +953,7 @@ class FileService:
             raise FileProtocolError("file offer cannot contain a body")
         offer = FileOffer.from_metadata(message.metadata)
         with self._lock:
+            connection_epoch = self._connection_epoch
             if self._offer_is_unavailable_locked(offer):
                 return
         try:
@@ -906,7 +962,10 @@ class FileService:
             logger.exception("incoming file policy failed")
             accepted = False
         with self._lock:
-            if self._offer_is_unavailable_locked(offer):
+            if (
+                connection_epoch != self._connection_epoch
+                or self._offer_is_unavailable_locked(offer)
+            ):
                 return
             if not accepted:
                 self._send_cancel(offer.transfer_id, "rejected")
@@ -921,7 +980,7 @@ class FileService:
         self._notify_incoming(transfer, "receiving")
 
     def _offer_is_unavailable_locked(self, offer: FileOffer) -> bool:
-        if self._closed:
+        if self._closed or not self._connected:
             return True
         cancelled = self._cancelled_incoming.get(offer.transfer_id)
         if offer.transfer_id in self._cancelled_incoming:
@@ -1128,34 +1187,50 @@ class FileService:
                 self._send_finish_status(transfer_id, "error")
                 self._notify_incoming(transfer, "failed")
                 return
+            connection_epoch = self._connection_epoch
             future = self._executor.submit(transfer.finalize)
             self._finalizing[transfer_id] = future
 
         def finalized(completion: Future[Path]) -> None:
             notify: tuple[IncomingTransfer, str] | None = None
+
+            def remove_current_transfer_locked() -> bool:
+                if (
+                    connection_epoch != self._connection_epoch
+                    or self._finalizing.get(transfer_id) is not completion
+                ):
+                    return False
+                self._finalizing.pop(transfer_id, None)
+                if self._incoming.get(transfer_id) is not transfer:
+                    return False
+                self._incoming.pop(transfer_id, None)
+                return True
+
             try:
                 path = completion.result()
             except FileTransferCancelled:
                 with self._lock:
-                    self._finalizing.pop(transfer_id, None)
-                    self._incoming.pop(transfer_id, None)
+                    remove_current_transfer_locked()
             except BaseException:
                 transfer.cancel()
                 with self._lock:
-                    self._finalizing.pop(transfer_id, None)
-                    active = self._incoming.pop(transfer_id, None) is transfer
-                    if active and not self._closed:
+                    active = remove_current_transfer_locked()
+                    if active and not self._closed and self._connected:
                         self._remember_completed_locked(transfer, None, "error")
                         self._send_finish_status(transfer_id, "error")
                         notify = (transfer, "failed")
             else:
+                remove_stale_path = False
                 with self._lock:
-                    self._finalizing.pop(transfer_id, None)
-                    active = self._incoming.pop(transfer_id, None) is transfer
-                    if active and not self._closed:
+                    active = remove_current_transfer_locked()
+                    if active and not self._closed and self._connected:
                         self._remember_completed_locked(transfer, path, "ok")
                         self._send_finish_status(transfer_id, "ok")
                         notify = (transfer, "complete")
+                    else:
+                        remove_stale_path = True
+                if remove_stale_path:
+                    path.unlink(missing_ok=True)
             if notify is not None:
                 if notify[1] == "complete":
                     self._notify(
@@ -1318,6 +1393,13 @@ class FileService:
     def _ensure_trusted(self) -> None:
         if not self._bus.trusted:
             raise FilePeerNotTrusted("trust the connected peer before transferring files")
+
+    def _release_preparing_slot_locked(self, connection_epoch: int) -> None:
+        if connection_epoch != self._connection_epoch:
+            return
+        if self._preparing_count <= 0:
+            raise RuntimeError("file preparation capacity accounting underflow")
+        self._preparing_count -= 1
 
     def _notify_outgoing(self, transfer: OutgoingTransfer, state: str) -> None:
         self._notify(

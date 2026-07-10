@@ -55,6 +55,24 @@ class InlineExecutor:
         return future
 
 
+class DeferredExecutor:
+    def __init__(self):
+        self.tasks = []
+
+    def submit(self, function, *args, **kwargs):
+        future = Future()
+        self.tasks.append((future, function, args, kwargs))
+        return future
+
+    def run_next(self):
+        future, function, args, kwargs = self.tasks.pop(0)
+        try:
+            future.set_result(function(*args, **kwargs))
+        except BaseException as error:
+            future.set_exception(error)
+        return future
+
+
 def make_offer(name, data, *, transfer_id="a" * 32, chunk_size=8):
     return FileOffer(
         transfer_id=transfer_id,
@@ -587,6 +605,118 @@ def test_local_and_remote_cancel_emit_terminal_progress(tmp_path):
     )
     assert progress[-1].transfer_id == incoming.transfer_id
     assert progress[-1].state == "cancelled"
+    service.close()
+
+
+def test_disconnect_cancels_transfers_but_service_can_reconnect(tmp_path):
+    bus = QueueBus()
+    downloads = tmp_path / "downloads"
+    service = FileService(bus, downloads)
+    offer = make_offer("partial.bin", b"partial", transfer_id="9" * 32)
+    service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+    assert list(downloads.glob("*.part"))
+
+    service.disconnect()
+
+    assert service._incoming == {}
+    assert service._outgoing == {}
+    assert not list(downloads.glob("*.part"))
+    assert service._timer_thread.is_alive()
+    source = tmp_path / "after-reconnect.bin"
+    source.write_bytes(b"after")
+    with pytest.raises(FileTransferError, match="connected"):
+        service.send_file(source)
+
+    service.connection_changed(True)
+    assert service.send_file(source).result(timeout=2)
+    service.close()
+
+
+def test_preparation_from_old_connection_cannot_offer_after_reconnect(tmp_path):
+    bus = QueueBus()
+    executor = DeferredExecutor()
+    service = FileService(bus, tmp_path / "downloads", executor=executor)
+    source = tmp_path / "stale-prepare.bin"
+    source.write_bytes(b"stale")
+    result = service.send_file(source)
+
+    service.disconnect()
+    service.connection_changed(True)
+    executor.run_next()
+
+    with pytest.raises(FileTransferError, match="connection changed"):
+        result.result(timeout=1)
+    assert not any(
+        message.message_type is MessageType.FILE_OFFER
+        for message, _secure, _priority in bus.sent
+    )
+    service.close()
+
+
+def test_stale_finalizer_cannot_remove_same_id_transfer_after_reconnect(
+    tmp_path,
+    monkeypatch,
+):
+    from shooklink.files import service as service_module
+
+    bus = QueueBus()
+    downloads = tmp_path / "downloads"
+    service = FileService(bus, downloads)
+    old_data = b"old connection"
+    transfer_id = "d" * 32
+    old_offer = make_offer(
+        "old.bin",
+        old_data,
+        transfer_id=transfer_id,
+        chunk_size=len(old_data),
+    )
+    service.handle_message(Message(MessageType.FILE_OFFER, old_offer.to_metadata()))
+    service.handle_message(
+        Message(
+            MessageType.FILE_CHUNK,
+            {"transfer_id": transfer_id, "index": 0},
+            old_data,
+        )
+    )
+
+    started = threading.Event()
+    release = threading.Event()
+    original_hash = service_module._sha256_path
+
+    def blocking_hash(path):
+        started.set()
+        release.wait(2)
+        return original_hash(path)
+
+    monkeypatch.setattr(service_module, "_sha256_path", blocking_hash)
+    service.handle_message(
+        Message(
+            MessageType.FILE_FINISH,
+            {"transfer_id": transfer_id, "sha256": old_offer.sha256},
+        )
+    )
+    assert started.wait(1)
+    old_completion = service._finalizing[transfer_id]
+    callback_done = threading.Event()
+    old_completion.add_done_callback(lambda _future: callback_done.set())
+
+    service.disconnect()
+    service.connection_changed(True)
+    new_data = b"new connection"
+    new_offer = make_offer(
+        "new.bin",
+        new_data,
+        transfer_id=transfer_id,
+        chunk_size=len(new_data),
+    )
+    service.handle_message(Message(MessageType.FILE_OFFER, new_offer.to_metadata()))
+    new_transfer = service._incoming[transfer_id]
+
+    release.set()
+    assert callback_done.wait(2)
+
+    assert service._incoming.get(transfer_id) is new_transfer
+    assert new_transfer.partial_path.exists()
     service.close()
 
 

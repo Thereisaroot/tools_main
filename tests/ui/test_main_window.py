@@ -8,10 +8,12 @@ from PySide6.QtCore import QMimeData, Qt, QUrl
 from PySide6.QtWidgets import QApplication
 
 from shooklink.chat.service import ChatService
+from shooklink.core import CoreSnapshot, CoreState
 from shooklink.files.service import FileProgress
 from shooklink.input.backend import PermissionStatus
 from shooklink.input.service import InputSessionState, InputStateChange
 from shooklink.input.topology import Side
+from shooklink.protocol.crypto import TrustStatus
 from shooklink.protocol.messages import Message, MessageType
 from shooklink.shell.service import ShellOutput, ShellState
 from shooklink.ui.main_window import FileDropZone, MainWindow
@@ -212,6 +214,76 @@ def test_connection_shell_contains_expected_controls(qtbot):
     assert window.connection_status.text() == "Disconnected"
 
 
+def test_connection_state_exposes_trust_approval_and_disconnect(qtbot):
+    bus = FakeBus(trusted=False)
+    window = MainWindow(ChatService(bus))
+    qtbot.addWidget(window)
+    trust_requests = []
+    disconnects = []
+    window.trust_requested.connect(
+        lambda connection_id, fingerprint: trust_requests.append(
+            (connection_id, fingerprint)
+        )
+    )
+    window.disconnect_requested.connect(lambda: disconnects.append(True))
+
+    fingerprint = "SHA256:peer-fingerprint"
+    window.apply_core_snapshot(
+        CoreSnapshot(
+            7,
+            CoreState.UNTRUSTED,
+            "peer-installation",
+            fingerprint,
+            TrustStatus.UNKNOWN,
+            False,
+            False,
+            frozenset({"chat"}),
+        )
+    )
+
+    assert window.connection_status.text() == "Untrusted"
+    assert fingerprint in window.peer_fingerprint.text()
+    assert window.trust_button.isEnabled()
+    qtbot.mouseClick(window.trust_button, Qt.MouseButton.LeftButton)
+    assert trust_requests == [(7, fingerprint)]
+
+    window.apply_core_snapshot(
+        CoreSnapshot(
+            7,
+            CoreState.UNTRUSTED,
+            "peer-installation",
+            fingerprint,
+            TrustStatus.TRUSTED,
+            True,
+            False,
+            frozenset({"chat"}),
+        )
+    )
+    assert window.connection_status.text() == "Awaiting peer approval"
+    assert not window.trust_button.isEnabled()
+
+    qtbot.mouseClick(window.connect_button, Qt.MouseButton.LeftButton)
+    assert disconnects == [True]
+
+
+def test_changed_peer_identity_is_blocked_in_connection_state(qtbot):
+    window = MainWindow(ChatService(FakeBus(trusted=False)))
+    qtbot.addWidget(window)
+
+    window.apply_core_snapshot(
+        CoreSnapshot(
+            9,
+            CoreState.CHANGED,
+            "peer-installation",
+            "SHA256:changed",
+            TrustStatus.CHANGED,
+        )
+    )
+
+    assert window.connection_status.text() == "Identity changed"
+    assert not window.trust_button.isEnabled()
+
+
 def test_file_drop_zone_accepts_local_files_only(tmp_path):
     local_path = tmp_path / "drop.txt"
     local_path.write_text("drop", encoding="utf-8")
@@ -394,7 +466,7 @@ def test_input_share_controls_state_and_leave_chat_file_actions_enabled(qtbot, t
 
     window.set_connected(True)
     window.set_connected(False)
-    assert input_service.connection_changes == [True, False]
+    assert input_service.connection_changes == []
 
     qtbot.mouseClick(window.toggle_input_button, Qt.MouseButton.LeftButton)
     assert input_service.stops == ["manual"]

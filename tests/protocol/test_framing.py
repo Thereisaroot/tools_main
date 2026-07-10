@@ -17,6 +17,7 @@ from shooklink.protocol.framing import (
     cobs_encode,
     decode_frame,
     encode_frame,
+    pack_frame_header,
 )
 
 
@@ -51,6 +52,22 @@ def test_empty_payload_round_trip():
     frame = Frame(1, 0, 0, 0, 0, 0, b"")
 
     assert decode_frame(encode_frame(frame)[:-1]) == frame
+
+
+def test_canonical_header_helper_matches_encoded_frame_header():
+    frame = Frame(7, 1, 2, 11, 12, 13, b"payload")
+
+    decoded = cobs_decode(encode_frame(frame)[:-1])
+
+    assert decoded[: HEADER.size] == pack_frame_header(
+        message_type=frame.message_type,
+        flags=frame.flags,
+        priority=frame.priority,
+        stream_id=frame.stream_id,
+        sequence=frame.sequence,
+        acknowledgement=frame.acknowledgement,
+        payload_length=len(frame.payload),
+    )
 
 
 @pytest.mark.parametrize(

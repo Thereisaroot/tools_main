@@ -108,6 +108,7 @@ class InputService:
         peer_id: str,
         peer_side: Side = Side.RIGHT,
         auto_edge_enabled: bool = False,
+        connected: bool = True,
         clock: Callable[[], float] = time.monotonic,
         session_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     ) -> None:
@@ -119,6 +120,8 @@ class InputService:
             raise TypeError("peer_side must be a Side")
         if not isinstance(auto_edge_enabled, bool):
             raise TypeError("auto_edge_enabled must be a boolean")
+        if not isinstance(connected, bool):
+            raise TypeError("connected must be a boolean")
         if not callable(clock) or not callable(session_factory):
             raise TypeError("clock and session_factory must be callable")
         self._bus = bus
@@ -134,7 +137,7 @@ class InputService:
         self._state = InputSessionState.IDLE
         self._session_id: str | None = None
         self._allow_remote_input = False
-        self._connected = True
+        self._connected = connected
         self._closed = False
         self._pointer: LogicalPointer | None = None
         self._remote_topology: Topology | None = None
@@ -213,6 +216,23 @@ class InputService:
             self._peer_side = normalized
             self._session_peer_side = normalized
             self._reset_edge_hold_locked()
+
+    def set_peer_id(self, peer_id: str) -> None:
+        _validate_peer_id(peer_id)
+        if peer_id == self.local_peer_id:
+            raise ValueError("local and remote peer IDs must differ")
+        with self._lock:
+            if self._closed:
+                raise InputUnavailable("input service is closed")
+            if (
+                self._connected
+                or self._state is not InputSessionState.IDLE
+                or self._session_id is not None
+            ):
+                raise InputUnavailable(
+                    "peer identity can change only while disconnected and idle"
+                )
+            self.peer_id = peer_id
 
     def set_auto_edge_enabled(self, enabled: bool) -> None:
         if not isinstance(enabled, bool):

@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from serial.tools import list_ports
 
 from shooklink.chat.service import ChatMessage, ChatService
+from shooklink.core import CoreSnapshot, CoreState
 from shooklink.files.service import FileProgress
 from shooklink.input.backend import PermissionStatus
 from shooklink.input.service import InputSessionState, InputStateChange
@@ -157,6 +158,8 @@ class MainWindow(QMainWindow):
     """Connection shell and chat interface shared by macOS and Windows."""
 
     connect_requested = Signal(str, int)
+    disconnect_requested = Signal()
+    trust_requested = Signal(int, str)
     incoming_message = Signal(object)
     file_progress = Signal(object)
     file_prepared = Signal(object)
@@ -178,6 +181,9 @@ class MainWindow(QMainWindow):
         self._input_service = input_service
         self._shortcuts: list[QShortcut] = []
         self._connected = False
+        self._connecting = False
+        self._connection_id = 0
+        self._peer_fingerprint: str | None = None
         self._active_transfer_id: str | None = None
         self._file_transfers: OrderedDict[str, FileProgress] = OrderedDict()
         self._active_shell_session: str | None = None
@@ -251,6 +257,13 @@ class MainWindow(QMainWindow):
         connection_layout.addWidget(self.port_combo, 1, 0)
         connection_layout.addWidget(self.baud_combo, 1, 1)
         connection_layout.addWidget(self.connect_button, 1, 2)
+        self.peer_fingerprint = QLabel("No authenticated peer")
+        self.peer_fingerprint.setObjectName("peerFingerprint")
+        self.trust_button = QPushButton("Trust Peer")
+        self.trust_button.clicked.connect(self._request_trust)
+        self.trust_button.setEnabled(False)
+        connection_layout.addWidget(self.peer_fingerprint, 2, 0, 1, 2)
+        connection_layout.addWidget(self.trust_button, 2, 2)
         connection_layout.setColumnStretch(0, 3)
         connection_layout.setColumnStretch(1, 1)
         layout.addWidget(connection)
@@ -464,6 +477,7 @@ class MainWindow(QMainWindow):
                 background: #b4482b; color: white; border-color: #b4482b;
             }
             QLabel#messageKind, QLabel#actionStatus { color: #66756f; }
+            QLabel#peerFingerprint { color: #526761; font-size: 11px; }
             QLabel#fileProgress { color: #526761; font-size: 11px; }
             QLabel#shellStatus { color: #526761; font-size: 11px; }
             QLabel#inputStatus, QLabel#inputPermissionStatus, QLabel#inputEmergencyHelp {
@@ -506,6 +520,9 @@ class MainWindow(QMainWindow):
             self.port_combo.setCurrentText(current)
 
     def _request_connection(self) -> None:
+        if self._connected or self._connecting:
+            self.disconnect_requested.emit()
+            return
         port = self.port_combo.currentText().strip()
         try:
             baud = int(self.baud_combo.currentText().strip())
@@ -517,6 +534,13 @@ class MainWindow(QMainWindow):
             return
         self.action_status.clear()
         self.connect_requested.emit(port, baud)
+
+    def _request_trust(self) -> None:
+        if self._connection_id and self._peer_fingerprint is not None:
+            self.trust_requested.emit(
+                self._connection_id,
+                self._peer_fingerprint,
+            )
 
     def _select_file(self) -> None:
         if self._file_service is None:
@@ -765,12 +789,93 @@ class MainWindow(QMainWindow):
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
+        self._connecting = False
         self.connection_status.setText("Connected" if connected else "Disconnected")
         self.connect_button.setText("Disconnect" if connected else "Connect")
         self.port_combo.setEnabled(not connected)
         self.baud_combo.setEnabled(not connected)
-        if self._input_service is not None:
-            self._input_service.connection_changed(connected)
+
+    def available_ports(self) -> tuple[str, ...]:
+        return tuple(
+            self.port_combo.itemText(index)
+            for index in range(self.port_combo.count())
+        )
+
+    def set_serial_defaults(self, port: str, baud_rate: int) -> None:
+        self.baud_combo.setCurrentText(str(baud_rate))
+        if port and port in self.available_ports():
+            self.port_combo.setCurrentText(port)
+
+    def persistent_preferences(self) -> tuple[str, int, str, bool]:
+        try:
+            baud_rate = int(self.baud_combo.currentText().strip())
+        except ValueError:
+            baud_rate = 115_200
+        peer_side = (
+            self._input_service.peer_side.value
+            if self._input_service is not None
+            else "right"
+        )
+        auto_edge_enabled = bool(
+            self._input_service is not None
+            and self._input_service.auto_edge_enabled
+        )
+        return (
+            self.port_combo.currentText().strip(),
+            baud_rate,
+            peer_side,
+            auto_edge_enabled,
+        )
+
+    def set_connection_pending(self, port: str) -> None:
+        self._connecting = True
+        self.connection_status.setText(f"Connecting {port}")
+        self.connect_button.setText("Disconnect")
+        self.port_combo.setEnabled(False)
+        self.baud_combo.setEnabled(False)
+
+    def show_connection_error(self, message: str) -> None:
+        self.set_connected(False)
+        self.connection_status.setText("Error")
+        self.action_status.setText(message)
+
+    def apply_core_snapshot(self, snapshot: CoreSnapshot) -> None:
+        self._connection_id = snapshot.connection_id
+        self._peer_fingerprint = snapshot.fingerprint
+        connected = snapshot.state not in {
+            CoreState.DISCONNECTED,
+            CoreState.ERROR,
+        }
+        self.set_connected(connected)
+
+        if snapshot.state is CoreState.UNTRUSTED and snapshot.local_approved:
+            status = "Awaiting peer approval"
+        else:
+            status = {
+                CoreState.DISCONNECTED: "Disconnected",
+                CoreState.HANDSHAKING: "Handshaking",
+                CoreState.UNTRUSTED: "Untrusted",
+                CoreState.CHANGED: "Identity changed",
+                CoreState.READY: "Ready",
+                CoreState.ERROR: "Error",
+            }[snapshot.state]
+        self.connection_status.setText(status)
+        if snapshot.error:
+            self.action_status.setText(snapshot.error)
+
+        if snapshot.fingerprint is None:
+            self.peer_fingerprint.setText("No authenticated peer")
+        else:
+            peer = snapshot.peer_id or "Unknown peer"
+            self.peer_fingerprint.setText(
+                f"{peer} · {snapshot.fingerprint}"
+            )
+        self.trust_button.setEnabled(
+            snapshot.state is CoreState.UNTRUSTED
+            and not snapshot.local_approved
+            and snapshot.fingerprint is not None
+        )
+        self.refresh_secure_state()
 
     def refresh_secure_state(self) -> None:
         self.send_secure_button.setEnabled(self._chat_service.secure_available)

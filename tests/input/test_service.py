@@ -54,6 +54,35 @@ def test_input_service_types_are_exported_from_input_package():
     assert ExportedState is InputSessionState
 
 
+def test_disconnected_input_service_can_bind_authenticated_peer_before_connect():
+    service = InputService(
+        FakeBus(),
+        FakeBackend(),
+        local_peer_id="peer-a",
+        peer_id="peer-pending",
+        connected=False,
+    )
+
+    service.set_peer_id("peer-b")
+    service.connection_changed(True)
+    service.set_allow_remote_input(True)
+
+    assert service.handle_message(input_request(controller_id="peer-b"))
+    assert service.state is InputSessionState.BEING_CONTROLLED
+
+
+def test_input_peer_id_cannot_change_while_connected_or_active():
+    service = InputService(
+        FakeBus(),
+        FakeBackend(),
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+    )
+
+    with pytest.raises(InputUnavailable, match="disconnected"):
+        service.set_peer_id("peer-c")
+
+
 class FakeBus:
     def __init__(self, *, trusted=True):
         self.trusted = trusted

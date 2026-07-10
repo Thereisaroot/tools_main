@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 MAGIC = b"SL"
 VERSION = 1
+SECURE_FLAG = 0x01
 MAX_PAYLOAD_SIZE = 65_535
 
 HEADER = struct.Struct(">2sBBBBIIII")
@@ -97,6 +98,36 @@ def _validate_uint(name: str, value: int, maximum: int) -> None:
         raise ValueError(f"{name} must be an integer from 0 to {maximum}")
 
 
+def pack_frame_header(
+    *,
+    message_type: int,
+    flags: int,
+    priority: int,
+    stream_id: int,
+    sequence: int,
+    acknowledgement: int,
+    payload_length: int,
+) -> bytes:
+    _validate_uint("message_type", message_type, 0xFF)
+    _validate_uint("flags", flags, 0xFF)
+    _validate_uint("priority", priority, 0xFF)
+    _validate_uint("stream_id", stream_id, 0xFFFFFFFF)
+    _validate_uint("sequence", sequence, 0xFFFFFFFF)
+    _validate_uint("acknowledgement", acknowledgement, 0xFFFFFFFF)
+    _validate_uint("payload_length", payload_length, MAX_PAYLOAD_SIZE)
+    return HEADER.pack(
+        MAGIC,
+        VERSION,
+        message_type,
+        flags,
+        priority,
+        stream_id,
+        sequence,
+        acknowledgement,
+        payload_length,
+    )
+
+
 def encode_frame(frame: Frame) -> bytes:
     """Encode a validated frame and append the stream delimiter."""
     if not isinstance(frame, Frame):
@@ -113,16 +144,14 @@ def encode_frame(frame: Frame) -> bytes:
     if len(frame.payload) > MAX_PAYLOAD_SIZE:
         raise ValueError(f"payload cannot exceed {MAX_PAYLOAD_SIZE} bytes")
 
-    header = HEADER.pack(
-        MAGIC,
-        VERSION,
-        frame.message_type,
-        frame.flags,
-        frame.priority,
-        frame.stream_id,
-        frame.sequence,
-        frame.acknowledgement,
-        len(frame.payload),
+    header = pack_frame_header(
+        message_type=frame.message_type,
+        flags=frame.flags,
+        priority=frame.priority,
+        stream_id=frame.stream_id,
+        sequence=frame.sequence,
+        acknowledgement=frame.acknowledgement,
+        payload_length=len(frame.payload),
     )
     checked = header + frame.payload
     checksum = CRC.pack(zlib.crc32(checked) & 0xFFFFFFFF)
@@ -246,6 +275,7 @@ __all__ = [
     "MAGIC",
     "MAX_ENCODED_FRAME_SIZE",
     "MAX_PAYLOAD_SIZE",
+    "SECURE_FLAG",
     "VERSION",
     "Frame",
     "FrameDecodeError",
@@ -254,4 +284,5 @@ __all__ = [
     "cobs_encode",
     "decode_frame",
     "encode_frame",
+    "pack_frame_header",
 ]
