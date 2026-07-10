@@ -204,6 +204,17 @@ def test_cancelled_sequence_reservation_allows_stream_release():
     assert mux.tracked_streams == 0
 
 
+def test_sequence_reservations_have_a_global_capacity_bound():
+    mux = Multiplexer(max_reservations=1)
+    first = mux.reserve_sequence(1)
+
+    with pytest.raises(QueueFullError, match="reservation"):
+        mux.reserve_sequence(1)
+
+    mux.cancel_sequence(1, first)
+    assert mux.reserve_sequence(1) == 2
+
+
 def test_sequence_only_streams_are_bounded_and_close_clears_metadata():
     mux = Multiplexer(max_tracked_streams=1)
     assert mux.reserve_sequence(11) == 1

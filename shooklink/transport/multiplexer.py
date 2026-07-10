@@ -17,6 +17,7 @@ DEFAULT_MAX_ITEMS = 4_096
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_PRIORITY_BURST = 32
 DEFAULT_MAX_TRACKED_STREAMS = 4_096
+DEFAULT_MAX_RESERVATIONS = 4_096
 
 
 class MultiplexerClosed(RuntimeError):
@@ -75,6 +76,7 @@ class Multiplexer:
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_priority_burst: int = DEFAULT_MAX_PRIORITY_BURST,
         max_tracked_streams: int = DEFAULT_MAX_TRACKED_STREAMS,
+        max_reservations: int = DEFAULT_MAX_RESERVATIONS,
     ) -> None:
         if type(max_items) is not int or max_items <= 0:
             raise ValueError("max_items must be positive")
@@ -84,6 +86,8 @@ class Multiplexer:
             raise ValueError("max_priority_burst must be positive")
         if type(max_tracked_streams) is not int or max_tracked_streams <= 0:
             raise ValueError("max_tracked_streams must be positive")
+        if type(max_reservations) is not int or max_reservations <= 0:
+            raise ValueError("max_reservations must be positive")
         self._condition = Condition()
         self._queue: list[tuple[int, int, OutboundItem]] = []
         self._pointer_items: dict[int, tuple[int, OutboundItem]] = {}
@@ -96,8 +100,10 @@ class Multiplexer:
         self._max_bytes = max_bytes
         self._max_priority_burst = max_priority_burst
         self._max_tracked_streams = max_tracked_streams
+        self._max_reservations = max_reservations
         self._queued_bytes = 0
         self._priority_streak = 0
+        self._reservation_count = 0
         self._fair_priority_cursor = int(Priority.NORMAL)
         self._closed = False
 
@@ -134,6 +140,8 @@ class Multiplexer:
         *,
         track_reservation: bool = False,
     ) -> int:
+        if track_reservation and self._reservation_count >= self._max_reservations:
+            raise QueueFullError("sequence reservation capacity is full")
         previous = self._last_sequences.get(stream_id, 0)
         if previous >= UINT32_MAX:
             raise OverflowError(f"sequence exhausted for stream {stream_id}")
@@ -141,6 +149,7 @@ class Multiplexer:
         self._last_sequences[stream_id] = sequence
         if track_reservation:
             self._reserved_sequences.setdefault(stream_id, set()).add(sequence)
+            self._reservation_count += 1
         return sequence
 
     def enqueue(self, item: OutboundItem) -> OutboundItem:
@@ -260,6 +269,7 @@ class Multiplexer:
             self._pointer_items.clear()
             self._last_sequences.clear()
             self._reserved_sequences.clear()
+            self._reservation_count = 0
             self._stream_priorities.clear()
             self._in_flight.clear()
             self._queued_bytes = 0
@@ -288,6 +298,7 @@ class Multiplexer:
             if reservations is None or sequence not in reservations:
                 raise ValueError(f"sequence {sequence} is not reserved for stream {stream_id}")
             reservations.remove(sequence)
+            self._reservation_count -= 1
             if not reservations:
                 del self._reserved_sequences[stream_id]
 
@@ -338,6 +349,7 @@ class Multiplexer:
         reservations = self._reserved_sequences.get(stream_id)
         if reservations is not None and sequence in reservations:
             reservations.remove(sequence)
+            self._reservation_count -= 1
             if not reservations:
                 del self._reserved_sequences[stream_id]
         previous = self._last_sequences.get(stream_id, 0)
