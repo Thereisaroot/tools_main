@@ -21,7 +21,7 @@ class MessageDecodeError(ValueError):
 
 class MessageType(IntEnum):
     HELLO = 1
-    TRUST_DECISION = 2
+    TRUST = 2
 
     CHAT_PLAIN = 10
     CHAT_SECURE = 11

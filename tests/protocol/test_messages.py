@@ -73,7 +73,7 @@ def test_metadata_size_is_bounded():
 def test_all_required_message_types_are_stable_and_unique():
     required = {
         "HELLO",
-        "TRUST_DECISION",
+        "TRUST",
         "CHAT_PLAIN",
         "CHAT_SECURE",
         "FILE_OFFER",
