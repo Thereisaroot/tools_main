@@ -149,7 +149,10 @@ class SerialLink:
                 startup_error = error
 
         if startup_error is not None:
-            self._request_stop(startup_error)
+            self._request_stop(
+                startup_error,
+                allow_synchronous_fallback=True,
+            )
             self._stop_finalized.wait(2.0)
             self.wait_closed(2.0)
             raise startup_error
@@ -179,7 +182,13 @@ class SerialLink:
         if timeout < 0:
             raise ValueError("timeout cannot be negative")
         deadline = time.monotonic() + timeout
-        self._request_stop(None)
+        current = threading.current_thread()
+        with self._lifecycle_lock:
+            called_from_worker = current in self._started_threads
+        self._request_stop(
+            None,
+            allow_synchronous_fallback=called_from_worker,
+        )
         remaining = max(0.0, deadline - time.monotonic())
         if not self._stop_finalized.wait(remaining):
             timeout_error = LinkCloseTimeout(
@@ -239,7 +248,7 @@ class SerialLink:
                     self._on_frame(frame)
         except BaseException as error:
             if not self._stop_event.is_set():
-                self._request_stop(error)
+                self._request_stop(error, allow_synchronous_fallback=True)
 
     def _write_loop(self) -> None:
         try:
@@ -261,7 +270,7 @@ class SerialLink:
                 self._write_all(encode_frame(frame))
         except BaseException as error:
             if not self._stop_event.is_set():
-                self._request_stop(error)
+                self._request_stop(error, allow_synchronous_fallback=True)
 
     def _write_all(self, encoded: bytes) -> None:
         view = memoryview(encoded)
@@ -276,7 +285,13 @@ class SerialLink:
         if offset != len(view):
             raise LinkClosedError("serial link closed during write")
 
-    def _request_stop(self, error: BaseException | None) -> None:
+    def _request_stop(
+        self,
+        error: BaseException | None,
+        *,
+        allow_synchronous_fallback: bool = False,
+    ) -> None:
+        use_synchronous_fallback = False
         with self._lifecycle_lock:
             if self._state is _LinkState.CLOSED:
                 return
@@ -300,6 +315,10 @@ class SerialLink:
                 self._finalizer_start_error = start_error
                 if self._terminal_cause is None:
                     self._terminal_cause = start_error
+                use_synchronous_fallback = allow_synchronous_fallback
+
+        if use_synchronous_fallback:
+            self._finalize_stop()
 
     def _finalize_stop(self) -> None:
         close_error: BaseException | None = None

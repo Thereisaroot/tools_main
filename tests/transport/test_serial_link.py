@@ -326,6 +326,34 @@ def test_finalizer_start_failure_is_retriable_without_breaking_deadline(
     assert isinstance(disconnects[0], RuntimeError)
 
 
+def test_worker_error_finalizes_if_finalizer_thread_cannot_start(monkeypatch):
+    endpoint = BrokenWriteEndpoint()
+    endpoint.connect(MemoryEndpoint())
+    disconnects = []
+    disconnected = threading.Event()
+    original_start = threading.Thread.start
+
+    def failing_start(thread):
+        if thread.name == "shooklink-serial-finalizer":
+            raise RuntimeError("cannot start finalizer")
+        return original_start(thread)
+
+    def on_disconnect(error):
+        disconnects.append(error)
+        disconnected.set()
+
+    monkeypatch.setattr(threading.Thread, "start", failing_start)
+    link = SerialLink(endpoint, lambda frame: None, on_disconnect)
+    link.start()
+    link.send(OutboundItem(Priority.NORMAL, 1, b"fail"))
+
+    assert disconnected.wait(1)
+    assert endpoint.close_calls == 1
+    assert len(disconnects) == 1
+    assert isinstance(disconnects[0], OSError)
+    assert link.wait_closed(1)
+
+
 def test_first_stop_owns_disconnect_cause_during_concurrent_close():
     endpoint = BlockingBrokenWriteEndpoint()
     endpoint.connect(MemoryEndpoint())
