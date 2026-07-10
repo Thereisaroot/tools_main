@@ -1,182 +1,181 @@
-# Serial Text Chat v1
+# ShookLink
 
-Simple desktop serial app for two machines connected through a null modem cable.
+ShookLink is a PySide6 desktop application for two computers connected by a
+serial null-modem link. macOS and Windows are equal peers: either side can send
+text and files, open a remote shell, or control the other side's keyboard and
+mouse.
 
-## Features
+> [!IMPORTANT]
+> ShookLink's binary protocol is incompatible with the legacy
+> `serial_text_chat.py` application. Both computers must run ShookLink. Do not
+> connect one ShookLink peer to the old app.
 
-- Connect to a serial port with selectable or manually entered baud rates
-- Send and receive multiline UTF-8 text messages
-- Use a tall editor-style input box with its own scrollbar
-- Send plain text or obfuscated text without JSON or sender metadata
-- Copy the last received raw data or the decoded version to the clipboard
-- Send files by file picker or drag and drop
-- Save received files into `received_files/`
-- Open the download folder from the app
-- Toggle serial-based keyboard/mouse sharing between macOS and Windows
-- Share keyboard keys, relative mouse movement, mouse buttons, and mouse wheel
-- Optionally auto-toggle remote control from a configured whole-desktop screen edge
+## Supported Platforms
 
-## Requirements
+- Python 3.11 or newer
+- macOS and Windows as full desktop clients
+- A serial port or null-modem adapter supported by `pyserial`
 
-- Python 3.10+
-- `pyserial`
-- `tkinterdnd2`
-- `pynput`
+The Windows application is not a server-only companion. It can initiate and
+receive every supported session, including opening the macOS login shell and
+hosting a PowerShell ConPTY session for macOS. Linux is not an acceptance target
+for the first ShookLink release.
 
-## Install
+## Install and Run
 
-```bash
-python3 -m pip install -r requirements.txt
-```
+The launchers check that `shooklink`, `PySide6`, `serial`, `cryptography`, and
+`pyte` can be imported. They install `requirements.txt` only when one of those
+imports is missing, then start the package entry point. Platform-marked packages
+install PyObjC only on macOS and `pywinpty` only on Windows.
 
-On some Linux distributions, `tkinter` may need a separate package:
-
-```bash
-sudo apt install python3-tk
-```
-
-## Run
-
-```bash
-python3 serial_text_chat.py
-```
-
-To print verbose serial/input logs for troubleshooting:
-
-```bash
-python3 serial_text_chat.py --debug
-```
-
-On macOS or Linux, you can also run:
+macOS:
 
 ```bash
 chmod +x run_serial_text_chat.sh
 ./run_serial_text_chat.sh
 ```
 
-With debug logging:
-
-```bash
-./run_serial_text_chat.sh --debug
-```
-
-On Windows, you can also run:
+Windows:
 
 ```bat
 run_serial_text_chat.bat
 ```
 
-## Text and File Use
+Both launchers forward command-line arguments, including `--debug`:
 
-1. Connect the two machines with a null modem serial cable.
-2. Start the program on both machines.
-3. Select the correct serial port on each machine.
-4. Set the same baud rate on both machines.
-5. Click `Connect`.
-6. Type in the large message box and use `Send Plain` or `Send Encoded`.
-7. Use `Select Files` or drag files into the drop area to send them.
-8. Received files are written into `received_files/`.
-9. `Copy to Clipboard` copies the last raw text payload.
-10. `Copy to Clipboard After Decode` decodes the last obfuscated payload and copies it.
+```bash
+./run_serial_text_chat.sh --debug
+```
 
-If the last connected serial port is still present when the app starts, it will be selected and connected automatically.
+You can also install and run the package directly:
 
-Keyboard shortcuts:
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m shooklink
+```
 
-- `Ctrl+Enter`: send plain text
-- `Ctrl+Shift+Enter`: send encoded text
+On Windows, use the Python launcher if `python` is not on `PATH`:
 
-## Input Share Use
+```bat
+py -3 -m pip install -r requirements.txt
+py -3 -m shooklink
+```
 
-Input sharing is `serial-only`, `hotkey-toggle`, and `bidirectional`.
+## Connect and Establish Trust
 
-- Windows hotkey: `Scroll Lock`
-- macOS hotkey: `F8`
-- macOS also accepts `Shift+F8` and `Ctrl+Shift+F8` because the toggle is triggered by the same `F8` key event
-- Emergency stop on both platforms: `Ctrl+Alt+Shift+Backspace`
-- Emergency exit on both platforms: `Ctrl+Alt+Shift+Esc`
+1. Connect the two computers with a null-modem serial cable or equivalent
+   adapter.
+2. Start ShookLink on both computers and select each local serial port.
+3. Select the same baud rate on both peers, then connect.
+4. On a first connection, compare the displayed peer fingerprints through a
+   separate trusted channel and approve the peer on both computers.
+5. Wait for both applications to report the peer as trusted before using secure
+   text, files, remote shell, or input sharing.
 
-How it works:
+Trust is bilateral: one approval is not enough. ShookLink remembers an approved
+identity for later connections. If the identity fingerprint changes, ShookLink
+blocks protected features; investigate and verify the new identity instead of
+approving an unexpected change.
 
-1. Connect both machines first.
-2. Make sure both machines run this updated version.
-3. On the machine that should control the other one, click `Toggle Remote Control` or press the hotkey. The global capture hooks initialize at that moment, while the receive side is prepared after serial connect.
-4. When the state changes to `Controlling remote`, local keyboard and mouse events are sent over serial.
-5. Press the same hotkey again, or click `Stop Remote Control`, to release control.
-6. Optional: enable `Auto edge toggle`, choose the peer side, then push against that outer screen edge for about 0.5 seconds to start remote control.
-7. While controlling remote, push against the opposite direction for about 0.5 seconds to stop remote control.
-8. If remote control ever gets stuck, use the emergency stop or emergency exit combo locally.
+Plain text is intentionally unencrypted and can be sent before trust is
+established. Secure text, file contents, shell traffic, and shared input are
+authenticated and encrypted after trust.
 
-Current v1 scope:
+Typical serial port names are `/dev/cu.usbserial-*` on macOS and `COM3` on
+Windows.
 
-- Supported targets: `macOS <-> Windows`
-- Shared input: keyboard, mouse move, click, scroll
-- Mouse mode: relative movement
-- Receiver policy: always armed
-- Auto edge toggle: whole-desktop outer edges with configurable peer side
+## Baud Rates
 
-Not included in v1:
+The connection screen provides these common rates:
 
-- clipboard sync
-- complex multi-host or multi-edge topologies
-- auth/encryption
-- drag/file handoff between machines
+- `115200` (default)
+- `230400`
+- `460800`
+- `921600`
+- `1000000`
+- `1500000`
+- `2000000`
 
-## Interaction Rules
+The baud field is editable. Persisted custom values are accepted from `300`
+through `4000000`, but the operating system, UART, cable, and adapter must also
+support the selected rate. Both peers must use the same value. If a link is
+unreliable, return to `115200` before troubleshooting higher rates.
 
-- Text messages use separate internal frames, so text send can coexist with remote control traffic.
-- File send stays disabled while remote control is active.
-- While file transfer is active, remote control cannot be started.
-- Auto edge toggle only starts from `Idle` and only stops from `Controlling remote`.
-- `Open Download Folder` stays available all the time.
-- File transfer still uses per-chunk acknowledgements.
-- Remote control uses a session-based `INPUT_*` control protocol on the same serial link.
+ShookLink opens ports as 8 data bits, no parity, 1 stop bit, and no software or
+hardware flow control.
+
+## Remote Shell Authorization
+
+Remote shell access requires a trusted peer and explicit permission on the
+computer that will execute the shell:
+
+1. Enable `Allow Remote Shell` on the executing computer.
+2. Select `Open Remote Shell` on the requesting computer.
+3. Use `Terminate Session`, disable `Allow Remote Shell`, disconnect, or quit to
+   stop the child process.
+
+`Allow Remote Shell` is off by default and is never restored as enabled on the
+next launch. A peer cannot enable it remotely. Only one shell session per peer is
+accepted, and all shell input and output is encrypted. macOS hosts the user's
+login shell; Windows hosts PowerShell and falls back to `cmd.exe` when needed.
+
+## Keyboard and Mouse Sharing
+
+Enable `Allow Remote Input` on the computer that may be controlled. Choose which
+side of the local desktop touches the peer, then use `Toggle Remote Control` or
+enable `Auto Edge Toggle`. Input permission is local, requires trust, and is not
+restored as enabled on restart.
+
+While input capture is active, these local emergency shortcuts are consumed
+before they can be sent to the peer:
+
+- `Ctrl+Alt+Shift+Backspace`: stop input sharing and release tracked keys and
+  mouse buttons on both peers.
+- `Ctrl+Alt+Shift+Escape`: release shared input and exit ShookLink.
+
+Use Control, not Command, for these emergency combinations on macOS.
+
+Application shortcuts:
+
+- `Ctrl+Alt+V`: send plain text
+- `Ctrl+Shift+Alt+V`: send secure text
+- `Ctrl+Alt+C`: copy the last received text
+- `Ctrl+Shift+Alt+C`: copy the last received secure text
 
 ## macOS Permissions
 
-macOS global keyboard and mouse hooks need system permissions.
+Keyboard and mouse sharing fails closed unless macOS grants both event capture
+and event injection permission. Open `System Settings -> Privacy & Security` and
+enable the terminal application used to launch ShookLink, and the Python
+executable if macOS lists it separately, under:
 
-If the app shows `Permission required`, allow the Python app or terminal app in:
+- `Accessibility`
+- `Input Monitoring`
 
-- `System Settings -> Privacy & Security -> Accessibility`
-- `System Settings -> Privacy & Security -> Input Monitoring`
+Fully quit and relaunch the terminal application and ShookLink after changing
+either permission. A permission denial disables input sharing without granting
+the remote peer partial control; text, file, and shell features remain separate.
 
-Then fully quit and relaunch the program.
+## Text and Files
 
-## Port Examples
+- `Send Plain` sends visible UTF-8 without application encryption.
+- `Send Secure` requires completed trust and sends authenticated encrypted text.
+- `Choose File` and the drop target use the same encrypted, windowed transfer
+  service.
+- Received files are finalized only after SHA-256 verification and are stored in
+  `~/Downloads/ShookLink` by default.
+- Chat remains usable while a file or input session is active.
 
-- macOS: `/dev/tty.usbserial-xxxx`, `/dev/cu.usbserial-xxxx`
-- Linux USB serial: `/dev/ttyUSB0`
-- Linux onboard serial: `/dev/ttyS0`
-- Windows: `COM3`
+## Development
 
-## Serial Settings
-
-The program uses these defaults:
-
-- 8 data bits
-- no parity
-- 1 stop bit
-- no flow control
-- `NUL` terminator for payload framing
-
-Both machines must use matching serial settings.
-
-## Linux Permissions
-
-If the serial port cannot be opened on Linux, add your user to the serial access group and log in again:
+Install test dependencies and run the same portable checks used by CI:
 
 ```bash
-sudo usermod -a -G dialout "$USER"
+python3 -m pip install -r requirements-dev.txt
+python3 -m compileall shooklink
+QT_QPA_PLATFORM=offscreen python3 -m pytest -q
 ```
 
-## Notes
-
-- Text payloads still send only the message body.
-- Encoded text still uses the existing base64-plus-marker obfuscation.
-- File transfers are chunked control frames over the same serial link.
-- Input sharing uses `INPUT_START / INPUT_ACK / INPUT_BUSY / INPUT_STOP / INPUT_RELEASE_ALL` and per-event input frames.
-- Both sides must be updated to the same build for input sharing and file transfer.
-- Auto edge toggle settings persist between launches.
-- Common higher baud rates like `230400`, `460800`, `921600`, and `1000000` are listed, and you can type other values manually.
-- If one direction starts corrupting at very high baud rates, try `460800` or `921600` first. This build still adds a small send delay above `460800` to improve stability.
+CI runs this suite on macOS and Windows with Python 3.11 and 3.13. Native PTY,
+ConPTY, and input behavior still requires manual acceptance on both operating
+systems.
