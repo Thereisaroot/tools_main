@@ -265,6 +265,27 @@ def test_cancelling_current_transfer_selects_remaining_active_transfer(qtbot, tm
     assert window.file_cancel_button.isEnabled()
 
 
+def test_terminal_file_progress_history_is_bounded(qtbot, tmp_path):
+    files = FakeFileService(tmp_path / "downloads")
+    window = MainWindow(ChatService(FakeBus()), files)
+    qtbot.addWidget(window)
+
+    for index in range(200):
+        files.emit(
+            FileProgress(
+                f"{index + 1:032x}",
+                f"{index}.bin",
+                "incoming",
+                1,
+                1,
+                "complete",
+                tmp_path / f"{index}.bin",
+            )
+        )
+
+    assert len(window._file_transfers) <= 128
+
+
 def test_remote_shell_controls_open_terminal_and_forward_output(qtbot):
     shell = FakeShellService()
     window = MainWindow(ChatService(FakeBus()), None, shell)

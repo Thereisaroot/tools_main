@@ -495,6 +495,30 @@ def test_cancelled_incoming_transfer_cannot_be_resurrected_by_late_offer(tmp_pat
     service.close()
 
 
+def test_cancel_control_retries_until_peer_acknowledges(tmp_path):
+    source = tmp_path / "cancel-retry.bin"
+    source.write_bytes(b"cancel")
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    transfer_id = service.send_file(source).result(timeout=2)
+    service.cancel(transfer_id)
+    bus.sent.clear()
+
+    service.poll(now=time.monotonic() + RETRANSMIT_TIMEOUT + 1)
+    assert bus.sent[-1][0].message_type is MessageType.FILE_CANCEL
+    service.handle_message(
+        Message(
+            MessageType.FILE_CANCEL,
+            {"transfer_id": transfer_id, "reason": "ack"},
+        )
+    )
+    bus.sent.clear()
+
+    service.poll(now=time.monotonic() + RETRANSMIT_TIMEOUT * 3)
+    assert bus.sent == []
+    service.close()
+
+
 def test_conflicting_duplicate_offer_is_explicitly_rejected(tmp_path):
     first = make_offer("same.bin", b"first", transfer_id="2" * 32)
     conflicting = make_offer("same.bin", b"other", transfer_id="2" * 32)
@@ -506,6 +530,53 @@ def test_conflicting_duplicate_offer_is_explicitly_rejected(tmp_path):
 
     assert bus.sent[-1][0].message_type is MessageType.FILE_CANCEL
     assert bus.sent[-1][0].metadata["reason"] == "duplicate"
+    service.close()
+
+
+def test_cancel_tombstone_survives_bounded_detail_cache_eviction(tmp_path):
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    first_offer = None
+    for index in range(130):
+        offer = make_offer(
+            f"cancel-{index}.bin",
+            b"x",
+            transfer_id=f"{index + 1:032x}",
+            chunk_size=1,
+        )
+        first_offer = first_offer or offer
+        service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+        service.handle_message(
+            Message(MessageType.FILE_CANCEL, {"transfer_id": offer.transfer_id})
+        )
+    bus.sent.clear()
+
+    service.handle_message(Message(MessageType.FILE_OFFER, first_offer.to_metadata()))
+
+    assert bus.sent[-1][0].message_type is MessageType.FILE_CANCEL
+    service.close()
+
+
+def test_incoming_offer_respects_byte_capacity(tmp_path):
+    offer = FileOffer(
+        "1" * 32,
+        "too-large.bin",
+        11,
+        0,
+        "0" * 64,
+        8,
+    )
+    bus = QueueBus()
+    service = FileService(
+        bus,
+        tmp_path / "downloads",
+        max_incoming_bytes=10,
+    )
+
+    service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+
+    assert bus.sent[-1][0].message_type is MessageType.FILE_CANCEL
+    assert bus.sent[-1][0].metadata["reason"] == "capacity"
     service.close()
 
 
@@ -654,3 +725,49 @@ def test_timestamp_and_windows_filename_edge_cases_are_safe(tmp_path):
     assert sanitize_filename("CON .txt").upper().split(".", 1)[0].strip() != "CON"
     sanitized = sanitize_filename("bad\ud800name.txt")
     sanitized.encode("utf-8")
+
+    for reserved in ("CONIN$.txt", "CONOUT$.txt", "COM¹.txt", "LPT³.bin"):
+        assert sanitize_filename(reserved) != reserved
+
+
+def test_progress_listener_can_close_service_from_completion_thread(tmp_path):
+    source = tmp_path / "callback-close.bin"
+    source.write_bytes(b"callback")
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    errors = []
+    closed = threading.Event()
+
+    def listener(progress):
+        if progress.state == "complete":
+            try:
+                service.close()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                closed.set()
+
+    service.add_progress_listener(listener)
+    offer = make_offer(
+        source.name,
+        source.read_bytes(),
+        transfer_id="a" * 32,
+        chunk_size=len(source.read_bytes()),
+    )
+    service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+    service.handle_message(
+        Message(
+            MessageType.FILE_CHUNK,
+            {"transfer_id": offer.transfer_id, "index": 0},
+            source.read_bytes(),
+        )
+    )
+    service.handle_message(
+        Message(
+            MessageType.FILE_FINISH,
+            {"transfer_id": offer.transfer_id, "sha256": offer.sha256},
+        )
+    )
+
+    assert closed.wait(2)
+    assert errors == []

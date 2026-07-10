@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from collections import OrderedDict
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Protocol
@@ -148,7 +149,7 @@ class MainWindow(QMainWindow):
         self._shortcuts: list[QShortcut] = []
         self._connected = False
         self._active_transfer_id: str | None = None
-        self._file_transfers: dict[str, FileProgress] = {}
+        self._file_transfers: OrderedDict[str, FileProgress] = OrderedDict()
         self._active_shell_session: str | None = None
         self.terminal_window: TerminalWindow | None = None
         self._chat_listener = self.incoming_message.emit
@@ -555,6 +556,8 @@ class MainWindow(QMainWindow):
 
     def _show_file_progress(self, progress: FileProgress) -> None:
         self._file_transfers[progress.transfer_id] = progress
+        self._file_transfers.move_to_end(progress.transfer_id)
+        self._prune_file_progress_history()
         finished = progress.state in {"complete", "failed", "cancelled"}
         if not finished:
             self._active_transfer_id = progress.transfer_id
@@ -573,6 +576,21 @@ class MainWindow(QMainWindow):
                 return
             self._active_transfer_id = None
         self._render_file_progress(progress)
+
+    def _prune_file_progress_history(self) -> None:
+        while len(self._file_transfers) > 128:
+            removable = next(
+                (
+                    transfer_id
+                    for transfer_id, progress in self._file_transfers.items()
+                    if transfer_id != self._active_transfer_id
+                    and progress.state in {"complete", "failed", "cancelled"}
+                ),
+                None,
+            )
+            if removable is None:
+                break
+            self._file_transfers.pop(removable, None)
 
     def _render_file_progress(self, progress: FileProgress) -> None:
         percent = 100 if progress.total == 0 else round(
