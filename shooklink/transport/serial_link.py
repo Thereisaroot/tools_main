@@ -200,15 +200,15 @@ class SerialLink:
             if start_error is not None:
                 raise timeout_error from start_error
             raise timeout_error
-        remaining = max(0.0, deadline - time.monotonic())
-        if not self.wait_closed(remaining):
-            raise LinkCloseTimeout("serial worker threads did not stop")
         with self._lifecycle_lock:
             is_callback_thread = (
                 self._disconnect_callback_thread_id == threading.get_ident()
             )
             close_error = self._endpoint_close_error
         if not is_callback_thread:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self.wait_closed(remaining):
+                raise LinkCloseTimeout("serial worker threads did not stop")
             remaining = max(0.0, deadline - time.monotonic())
             if not self._disconnect_callback_completed.wait(remaining):
                 raise LinkCloseTimeout("serial disconnect callback did not finish")

@@ -543,6 +543,43 @@ def test_external_close_waits_for_disconnect_callback_completion():
     assert close_errors == []
 
 
+def test_on_frame_and_on_disconnect_can_both_close_without_cycle():
+    left_endpoint, right_endpoint = endpoint_pair()
+    errors = []
+    frame_finished = threading.Event()
+    disconnect_finished = threading.Event()
+    holder = {}
+
+    def on_frame(_frame):
+        try:
+            holder["right"].close()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            frame_finished.set()
+
+    def on_disconnect(_error):
+        try:
+            holder["right"].close()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            disconnect_finished.set()
+
+    left = SerialLink(left_endpoint, lambda frame: None, lambda error: None)
+    right = SerialLink(right_endpoint, on_frame, on_disconnect)
+    holder["right"] = right
+    left.start()
+    right.start()
+    left.send(OutboundItem(Priority.NORMAL, 1, b"close"))
+
+    assert disconnect_finished.wait(3)
+    assert frame_finished.wait(3)
+    assert errors == []
+    assert right.wait_closed(1)
+    left.close()
+
+
 def _capture_error(callback, errors):
     try:
         callback()
