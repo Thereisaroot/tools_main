@@ -1,6 +1,8 @@
 import json
 import os
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -13,6 +15,7 @@ from shooklink.protocol.crypto import (
     TrustStatus,
     TrustStore,
 )
+import shooklink.protocol.crypto as crypto
 
 
 def _connected_sessions(tmp_path):
@@ -61,12 +64,12 @@ def test_two_signed_handshakes_derive_matching_directional_keys(tmp_path):
 def test_bidirectional_encryption_uses_independent_keys(tmp_path):
     alice, bob = _connected_sessions(tmp_path)
 
-    from_alice = alice.encrypt(1, 1, b"alice")
-    from_bob = bob.encrypt(1, 1, b"bob")
+    from_alice = alice.encrypt(1, 1, b"same plaintext")
+    from_bob = bob.encrypt(1, 1, b"same plaintext")
 
     assert from_alice != from_bob
-    assert bob.decrypt(1, 1, from_alice) == b"alice"
-    assert alice.decrypt(1, 1, from_bob) == b"bob"
+    assert bob.decrypt(1, 1, from_alice) == b"same plaintext"
+    assert alice.decrypt(1, 1, from_bob) == b"same plaintext"
 
 
 def test_tampered_handshake_signature_is_rejected(tmp_path):
@@ -85,6 +88,21 @@ def test_malformed_handshake_is_rejected(tmp_path, hello):
 
     with pytest.raises(HandshakeError):
         SecureSession.responder(identity).receive_hello(hello)
+
+
+def test_signed_low_order_ephemeral_key_is_rejected_as_handshake_error(tmp_path):
+    alice = IdentityStore(tmp_path / "alice.key").load_or_create()
+    bob = IdentityStore(tmp_path / "bob.key").load_or_create()
+    body = (
+        crypto.HELLO_MAGIC
+        + alice.public_bytes
+        + bytes(crypto.HELLO_EPHEMERAL_SIZE)
+        + os.urandom(crypto.HELLO_NONCE_SIZE)
+    )
+    hello = body + alice.sign(crypto.HELLO_DOMAIN + body)
+
+    with pytest.raises(HandshakeError, match="ephemeral"):
+        SecureSession.responder(bob).receive_hello(hello)
 
 
 def test_ciphertext_and_associated_data_tampering_is_rejected(tmp_path):
@@ -137,6 +155,88 @@ def test_failed_authentication_does_not_consume_sequence(tmp_path):
     assert bob.decrypt(10, 4, sealed, associated_data=b"right") == b"payload"
 
 
+def test_invalid_ciphertexts_do_not_allocate_replay_streams(tmp_path):
+    _alice, bob = _connected_sessions(tmp_path)
+
+    for stream_id in range(100):
+        with pytest.raises(SecureSessionError):
+            bob.decrypt(stream_id, 1, b"x" * 16)
+
+    assert len(bob._received_windows) == 0
+
+
+def test_concurrent_encrypt_rejects_duplicate_nonce(tmp_path, monkeypatch):
+    alice, _bob = _connected_sessions(tmp_path)
+    real_cipher = alice._send_cipher
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    class CoordinatedCipher:
+        def encrypt(self, nonce, plaintext, aad):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+                call_number = calls
+            if call_number == 1:
+                first_entered.set()
+                second_entered.wait(0.2)
+            else:
+                second_entered.set()
+            return real_cipher.encrypt(nonce, plaintext, aad)
+
+    monkeypatch.setattr(alice, "_send_cipher", CoordinatedCipher())
+
+    def encrypt_once():
+        try:
+            return alice.encrypt(11, 5, b"same")
+        except ReplayError:
+            return "replay"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: encrypt_once(), range(2)))
+
+    assert sum(result == "replay" for result in results) == 1
+    assert sum(isinstance(result, bytes) for result in results) == 1
+
+
+def test_concurrent_decrypt_rejects_duplicate_ciphertext(tmp_path, monkeypatch):
+    alice, bob = _connected_sessions(tmp_path)
+    sealed = alice.encrypt(12, 6, b"same")
+    real_cipher = bob._receive_cipher
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    class CoordinatedCipher:
+        def decrypt(self, nonce, ciphertext, aad):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+                call_number = calls
+            if call_number == 1:
+                first_entered.set()
+                second_entered.wait(0.2)
+            else:
+                second_entered.set()
+            return real_cipher.decrypt(nonce, ciphertext, aad)
+
+    monkeypatch.setattr(bob, "_receive_cipher", CoordinatedCipher())
+
+    def decrypt_once():
+        try:
+            return bob.decrypt(12, 6, sealed)
+        except ReplayError:
+            return "replay"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: decrypt_once(), range(2)))
+
+    assert sorted(results, key=str) == [b"same", "replay"]
+
+
 def test_encryption_requires_completed_handshake(tmp_path):
     identity = IdentityStore(tmp_path / "identity.key").load_or_create()
     session = SecureSession.initiator(identity)
@@ -175,3 +275,69 @@ def test_trust_store_is_atomic_and_tolerates_corrupt_data(tmp_path):
 
     assert json.loads(path.read_text(encoding="utf-8")) == {"peer": "fingerprint"}
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_concurrent_identity_creation_returns_persisted_winner(tmp_path, monkeypatch):
+    path = tmp_path / "identity.key"
+    real_atomic_write = crypto._atomic_write
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    call_lock = threading.Lock()
+    calls = 0
+
+    def coordinated_write(*args, **kwargs):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_entered.set()
+            second_entered.wait(0.2)
+        else:
+            second_entered.set()
+        return real_atomic_write(*args, **kwargs)
+
+    monkeypatch.setattr(crypto, "_atomic_write", coordinated_write)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        identities = list(
+            executor.map(lambda _index: IdentityStore(path).load_or_create(), range(2))
+        )
+
+    persisted = IdentityStore(path).load_or_create()
+    assert {identity.public_bytes for identity in identities} == {persisted.public_bytes}
+
+
+def test_concurrent_trust_updates_preserve_both_peers(tmp_path, monkeypatch):
+    path = tmp_path / "trusted.json"
+    real_atomic_write = crypto._atomic_write
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    call_lock = threading.Lock()
+    calls = 0
+
+    def coordinated_write(*args, **kwargs):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_entered.set()
+            second_entered.wait(0.2)
+        else:
+            second_entered.set()
+        return real_atomic_write(*args, **kwargs)
+
+    monkeypatch.setattr(crypto, "_atomic_write", coordinated_write)
+    trust = TrustStore(path)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(
+            executor.map(
+                lambda pair: trust.accept(*pair),
+                [("alice", "fingerprint-a"), ("bob", "fingerprint-b")],
+            )
+        )
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "alice": "fingerprint-a",
+        "bob": "fingerprint-b",
+    }

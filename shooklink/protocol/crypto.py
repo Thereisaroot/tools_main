@@ -8,6 +8,7 @@ import json
 import os
 import struct
 import tempfile
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -45,6 +46,9 @@ HIGH_TO_LOW_NONCE = b"H2L1"
 UINT32_MAX = (1 << 32) - 1
 REPLAY_WINDOW_SIZE = 256
 REPLAY_WINDOW_MASK = (1 << REPLAY_WINDOW_SIZE) - 1
+MAX_TRACKED_STREAMS = 1_024
+MAX_TRUST_STORE_SIZE = 1 << 20
+_STORE_LOCK = threading.RLock()
 
 
 class SecureSessionError(RuntimeError):
@@ -111,6 +115,7 @@ def _fingerprint(public_bytes: bytes) -> str:
 def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
+    descriptor: int | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(
             dir=path.parent,
@@ -120,19 +125,17 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
         temporary_path = Path(temporary_name)
         if os.name == "posix":
             os.fchmod(descriptor, mode)
-        try:
-            temporary_file = os.fdopen(descriptor, "wb")
-        except Exception:
-            os.close(descriptor)
-            raise
+        temporary_file = os.fdopen(descriptor, "wb")
+        descriptor = None
         with temporary_file:
             temporary_file.write(data)
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
         os.replace(temporary_path, path)
-        if os.name == "posix":
-            path.chmod(mode)
+        temporary_path = None
     except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
         raise
@@ -158,29 +161,31 @@ class IdentityStore:
         self.path = Path(path)
 
     def load_or_create(self) -> Identity:
-        if self.path.exists():
-            try:
-                private_bytes = self.path.read_bytes()
-                if len(private_bytes) != 32:
-                    raise ValueError("wrong key size")
-                private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
-            except (OSError, ValueError) as error:
-                raise SecureSessionError("invalid identity file") from error
-            if os.name == "posix":
-                self.path.chmod(0o600)
-            return Identity.from_private_key(private_key)
+        with _STORE_LOCK:
+            if self.path.exists():
+                try:
+                    with self.path.open("rb") as identity_file:
+                        private_bytes = identity_file.read(33)
+                    if len(private_bytes) != 32:
+                        raise ValueError("wrong key size")
+                    private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+                except (OSError, ValueError) as error:
+                    raise SecureSessionError("invalid identity file") from error
+                if os.name == "posix":
+                    self.path.chmod(0o600)
+                return Identity.from_private_key(private_key)
 
-        private_key = Ed25519PrivateKey.generate()
-        private_bytes = private_key.private_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PrivateFormat.Raw,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        try:
-            _atomic_write(self.path, private_bytes)
-        except OSError as error:
-            raise SecureSessionError("could not store identity") from error
-        return Identity.from_private_key(private_key)
+            private_key = Ed25519PrivateKey.generate()
+            private_bytes = private_key.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+            try:
+                _atomic_write(self.path, private_bytes)
+            except OSError as error:
+                raise SecureSessionError("could not store identity") from error
+            return Identity.from_private_key(private_key)
 
 
 class TrustStore:
@@ -196,6 +201,8 @@ class TrustStore:
 
     def _load(self) -> dict[str, str]:
         try:
+            if self.path.stat().st_size > MAX_TRUST_STORE_SIZE:
+                return {}
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return {}
@@ -209,33 +216,36 @@ class TrustStore:
 
     def status(self, peer_id: str, fingerprint: str) -> TrustStatus:
         self._validate(peer_id, fingerprint)
-        stored = self._load().get(peer_id)
-        if stored is None:
-            return TrustStatus.UNKNOWN
-        if stored == fingerprint:
-            return TrustStatus.TRUSTED
-        return TrustStatus.CHANGED
+        with _STORE_LOCK:
+            stored = self._load().get(peer_id)
+            if stored is None:
+                return TrustStatus.UNKNOWN
+            if stored == fingerprint:
+                return TrustStatus.TRUSTED
+            return TrustStatus.CHANGED
 
     def check(self, peer_id: str, fingerprint: str) -> bool:
         return self.status(peer_id, fingerprint) is TrustStatus.TRUSTED
 
     def accept(self, peer_id: str, fingerprint: str) -> None:
         self._validate(peer_id, fingerprint)
-        trusted = self._load()
-        trusted[peer_id] = fingerprint
-        encoded = json.dumps(
-            trusted,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        _atomic_write(self.path, encoded)
+        with _STORE_LOCK:
+            trusted = self._load()
+            trusted[peer_id] = fingerprint
+            encoded = json.dumps(
+                trusted,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            _atomic_write(self.path, encoded)
 
 
 class SecureSession:
     def __init__(self, identity: Identity) -> None:
         if not isinstance(identity, Identity):
             raise TypeError("identity must be an Identity")
+        self._crypto_lock = threading.RLock()
         self._identity = identity
         self._ephemeral_private = X25519PrivateKey.generate()
         self._ephemeral_public = _public_bytes(self._ephemeral_private.public_key())
@@ -281,6 +291,10 @@ class SecureSession:
         return self._hello
 
     def receive_hello(self, hello: bytes) -> None:
+        with self._crypto_lock:
+            self._receive_hello(hello)
+
+    def _receive_hello(self, hello: bytes) -> None:
         if not isinstance(hello, bytes) or len(hello) != HELLO_SIZE:
             raise HandshakeError("invalid handshake length")
         if hello[: len(HELLO_MAGIC)] != HELLO_MAGIC:
@@ -310,7 +324,10 @@ class SecureSession:
         except ValueError as error:
             raise HandshakeError("invalid handshake public key") from error
 
-        shared_secret = self._ephemeral_private.exchange(remote_ephemeral)
+        try:
+            shared_secret = self._ephemeral_private.exchange(remote_ephemeral)
+        except ValueError as error:
+            raise HandshakeError("invalid handshake ephemeral key") from error
         ordered_hellos = sorted(
             (self._hello, hello),
             key=lambda item: item[identity_start:ephemeral_start],
@@ -372,22 +389,28 @@ class SecureSession:
         *,
         associated_data: bytes = b"",
     ) -> bytes:
-        if not isinstance(plaintext, bytes):
-            raise TypeError("plaintext must be bytes")
-        nonce, aad = self._aead_parameters(
-            self._send_nonce_prefix,
-            stream_id,
-            sequence,
-            associated_data,
-        )
-        last_sequence = self._sent_sequences.get(stream_id, -1)
-        if sequence <= last_sequence:
-            raise ReplayError("send sequence would reuse a nonce")
-        if self._send_cipher is None:
-            raise SecureSessionError("secure session is not ready")
-        ciphertext = self._send_cipher.encrypt(nonce, plaintext, aad)
-        self._sent_sequences[stream_id] = sequence
-        return ciphertext
+        with self._crypto_lock:
+            if not isinstance(plaintext, bytes):
+                raise TypeError("plaintext must be bytes")
+            nonce, aad = self._aead_parameters(
+                self._send_nonce_prefix,
+                stream_id,
+                sequence,
+                associated_data,
+            )
+            last_sequence = self._sent_sequences.get(stream_id, -1)
+            if sequence <= last_sequence:
+                raise ReplayError("send sequence would reuse a nonce")
+            if (
+                stream_id not in self._sent_sequences
+                and len(self._sent_sequences) >= MAX_TRACKED_STREAMS
+            ):
+                raise SecureSessionError("too many active encrypted streams")
+            if self._send_cipher is None:
+                raise SecureSessionError("secure session is not ready")
+            ciphertext = self._send_cipher.encrypt(nonce, plaintext, aad)
+            self._sent_sequences[stream_id] = sequence
+            return ciphertext
 
     def decrypt(
         self,
@@ -397,24 +420,31 @@ class SecureSession:
         *,
         associated_data: bytes = b"",
     ) -> bytes:
-        if not isinstance(ciphertext, bytes):
-            raise TypeError("ciphertext must be bytes")
-        nonce, aad = self._aead_parameters(
-            self._receive_nonce_prefix,
-            stream_id,
-            sequence,
-            associated_data,
-        )
-        replay_window = self._received_windows.setdefault(stream_id, _ReplayWindow())
-        replay_window.check(sequence)
-        if self._receive_cipher is None:
-            raise SecureSessionError("secure session is not ready")
-        try:
-            plaintext = self._receive_cipher.decrypt(nonce, ciphertext, aad)
-        except InvalidTag as error:
-            raise SecureSessionError("ciphertext authentication failed") from error
-        replay_window.mark(sequence)
-        return plaintext
+        with self._crypto_lock:
+            if not isinstance(ciphertext, bytes):
+                raise TypeError("ciphertext must be bytes")
+            nonce, aad = self._aead_parameters(
+                self._receive_nonce_prefix,
+                stream_id,
+                sequence,
+                associated_data,
+            )
+            replay_window = self._received_windows.get(stream_id)
+            if replay_window is not None:
+                replay_window.check(sequence)
+            if self._receive_cipher is None:
+                raise SecureSessionError("secure session is not ready")
+            try:
+                plaintext = self._receive_cipher.decrypt(nonce, ciphertext, aad)
+            except InvalidTag as error:
+                raise SecureSessionError("ciphertext authentication failed") from error
+            if replay_window is None:
+                if len(self._received_windows) >= MAX_TRACKED_STREAMS:
+                    raise SecureSessionError("too many active encrypted streams")
+                replay_window = _ReplayWindow()
+                self._received_windows[stream_id] = replay_window
+            replay_window.mark(sequence)
+            return plaintext
 
 
 __all__ = [

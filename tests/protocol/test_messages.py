@@ -50,6 +50,30 @@ def test_malformed_message_is_rejected(encoded):
         decode_message(encoded)
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        b'{"type":10,"type":11,"meta":{}}',
+        b'{"type":10,"meta":{"value":1,"value":2}}',
+    ],
+)
+def test_duplicate_json_keys_are_rejected(metadata):
+    encoded = len(metadata).to_bytes(4, "big") + metadata
+
+    with pytest.raises(MessageDecodeError, match="duplicate"):
+        decode_message(encoded)
+
+
+def test_pathological_json_errors_stay_inside_decode_boundary():
+    deep = b'{"type":10,"meta":{"value":' + b"[" * 1_100 + b"0" + b"]" * 1_100 + b"}}"
+    huge_integer = b'{"type":10,"meta":{"value":' + b"9" * 5_000 + b"}}"
+
+    for metadata in (deep, huge_integer):
+        encoded = len(metadata).to_bytes(4, "big") + metadata
+        with pytest.raises(MessageDecodeError):
+            decode_message(encoded)
+
+
 def test_metadata_must_be_an_object_with_string_keys():
     with pytest.raises(TypeError):
         encode_message(Message(MessageType.CHAT_PLAIN, ["not", "object"], b""))
@@ -72,36 +96,35 @@ def test_metadata_size_is_bounded():
 
 def test_all_required_message_types_are_stable_and_unique():
     required = {
-        "HELLO",
-        "TRUST",
-        "CHAT_PLAIN",
-        "CHAT_SECURE",
-        "FILE_OFFER",
-        "FILE_ACCEPT",
-        "FILE_CHUNK",
-        "FILE_ACK",
-        "FILE_FINISH",
-        "FILE_CANCEL",
-        "SHELL_OPEN",
-        "SHELL_ACCEPT",
-        "SHELL_DENY",
-        "SHELL_INPUT",
-        "SHELL_OUTPUT",
-        "SHELL_RESIZE",
-        "SHELL_EXIT",
-        "INPUT_REQUEST",
-        "INPUT_ACCEPT",
-        "INPUT_BUSY",
-        "INPUT_ENTER",
-        "INPUT_LEAVE",
-        "INPUT_KEY",
-        "INPUT_BUTTON",
-        "INPUT_MOVE",
-        "INPUT_WHEEL",
-        "INPUT_POINTER_STATE",
-        "INPUT_STOP",
-        "INPUT_RELEASE_ALL",
+        "HELLO": 1,
+        "TRUST": 2,
+        "CHAT_PLAIN": 10,
+        "CHAT_SECURE": 11,
+        "FILE_OFFER": 20,
+        "FILE_ACCEPT": 21,
+        "FILE_CHUNK": 22,
+        "FILE_ACK": 23,
+        "FILE_FINISH": 24,
+        "FILE_CANCEL": 25,
+        "SHELL_OPEN": 30,
+        "SHELL_ACCEPT": 31,
+        "SHELL_DENY": 32,
+        "SHELL_INPUT": 33,
+        "SHELL_OUTPUT": 34,
+        "SHELL_RESIZE": 35,
+        "SHELL_EXIT": 36,
+        "INPUT_REQUEST": 40,
+        "INPUT_ACCEPT": 41,
+        "INPUT_BUSY": 42,
+        "INPUT_ENTER": 43,
+        "INPUT_LEAVE": 44,
+        "INPUT_KEY": 45,
+        "INPUT_BUTTON": 46,
+        "INPUT_MOVE": 47,
+        "INPUT_WHEEL": 48,
+        "INPUT_POINTER_STATE": 49,
+        "INPUT_STOP": 50,
+        "INPUT_RELEASE_ALL": 51,
     }
 
-    assert required == {member.name for member in MessageType}
-    assert len({member.value for member in MessageType}) == len(required)
+    assert required == {member.name: member.value for member in MessageType}

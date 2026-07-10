@@ -19,6 +19,10 @@ class MessageDecodeError(ValueError):
     """Raised when a typed-message payload is malformed."""
 
 
+class _DuplicateKeyError(ValueError):
+    pass
+
+
 class MessageType(IntEnum):
     HELLO = 1
     TRUST = 2
@@ -82,6 +86,15 @@ def _validate_json_value(value: Any) -> None:
     raise TypeError(f"unsupported metadata value: {type(value).__name__}")
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateKeyError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 def encode_message(message: Message) -> bytes:
     if not isinstance(message, Message):
         raise TypeError("message must be a Message")
@@ -89,7 +102,10 @@ def encode_message(message: Message) -> bytes:
         raise TypeError("message_type must be a MessageType")
     if not isinstance(message.metadata, dict):
         raise TypeError("metadata must be an object")
-    _validate_json_value(message.metadata)
+    try:
+        _validate_json_value(message.metadata)
+    except RecursionError as error:
+        raise TypeError("metadata is nested too deeply") from error
     if not isinstance(message.body, bytes):
         raise TypeError("message body must be bytes")
 
@@ -102,7 +118,7 @@ def encode_message(message: Message) -> bytes:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, RecursionError) as error:
         raise TypeError("metadata is not JSON serializable") from error
 
     if not metadata or len(metadata) > MAX_METADATA_SIZE:
@@ -129,8 +145,13 @@ def decode_message(encoded: bytes) -> Message | None:
         raise MessageDecodeError("truncated message metadata")
 
     try:
-        envelope = json.loads(encoded[METADATA_LENGTH.size : metadata_end].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        envelope = json.loads(
+            encoded[METADATA_LENGTH.size : metadata_end].decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except _DuplicateKeyError as error:
+        raise MessageDecodeError(str(error)) from error
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as error:
         raise MessageDecodeError("invalid message metadata") from error
     if not isinstance(envelope, dict) or set(envelope) != {"meta", "type"}:
         raise MessageDecodeError("invalid message envelope")
@@ -140,7 +161,7 @@ def decode_message(encoded: bytes) -> Message | None:
         raise MessageDecodeError("message metadata must be an object")
     try:
         _validate_json_value(envelope["meta"])
-    except TypeError as error:
+    except (TypeError, RecursionError) as error:
         raise MessageDecodeError(str(error)) from error
 
     try:
