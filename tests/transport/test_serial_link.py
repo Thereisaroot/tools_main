@@ -294,7 +294,7 @@ def test_thread_start_failure_rolls_back_and_closes_endpoint(monkeypatch):
         link.send(OutboundItem(Priority.NORMAL, 1, b"late"))
 
 
-def test_finalizer_start_failure_falls_back_to_synchronous_endpoint_close(
+def test_finalizer_start_failure_is_retriable_without_breaking_deadline(
     monkeypatch,
 ):
     endpoint, _peer = endpoint_pair()
@@ -302,16 +302,25 @@ def test_finalizer_start_failure_falls_back_to_synchronous_endpoint_close(
     link = SerialLink(endpoint, lambda frame: None, disconnects.append)
     original_start = threading.Thread.start
 
+    failed_once = False
+
     def failing_start(thread):
-        if thread.name == "shooklink-serial-finalizer":
+        nonlocal failed_once
+        if thread.name == "shooklink-serial-finalizer" and not failed_once:
+            failed_once = True
             raise RuntimeError("cannot start finalizer")
         return original_start(thread)
 
     monkeypatch.setattr(threading.Thread, "start", failing_start)
 
-    with pytest.raises(LinkCloseError, match="cannot start finalizer"):
-        link.close()
+    started_at = time.monotonic()
+    with pytest.raises(LinkCloseTimeout) as captured:
+        link.close(timeout=0.05)
 
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    assert time.monotonic() - started_at < 0.15
+    assert endpoint.close_calls == 0
+    link.close(timeout=1)
     assert endpoint.close_calls == 1
     assert endpoint.closed
     assert isinstance(disconnects[0], RuntimeError)

@@ -73,6 +73,7 @@ class SerialLink:
         self._disconnect_callback_completed = threading.Event()
         self._state = _LinkState.NEW
         self._endpoint_close_error: BaseException | None = None
+        self._finalizer_start_error: BaseException | None = None
         self._terminal_cause: BaseException | None = None
         self._disconnect_notified = False
         self._disconnect_callback_thread_id: int | None = None
@@ -181,7 +182,14 @@ class SerialLink:
         self._request_stop(None)
         remaining = max(0.0, deadline - time.monotonic())
         if not self._stop_finalized.wait(remaining):
-            raise LinkCloseTimeout("serial endpoint shutdown did not finish")
+            timeout_error = LinkCloseTimeout(
+                "serial endpoint shutdown did not finish"
+            )
+            with self._lifecycle_lock:
+                start_error = self._finalizer_start_error
+            if start_error is not None:
+                raise timeout_error from start_error
+            raise timeout_error
         remaining = max(0.0, deadline - time.monotonic())
         if not self.wait_closed(remaining):
             raise LinkCloseTimeout("serial worker threads did not stop")
@@ -269,14 +277,16 @@ class SerialLink:
             raise LinkClosedError("serial link closed during write")
 
     def _request_stop(self, error: BaseException | None) -> None:
-        use_synchronous_fallback = False
         with self._lifecycle_lock:
-            if self._state in (_LinkState.STOPPING, _LinkState.CLOSED):
+            if self._state is _LinkState.CLOSED:
                 return
-            self._state = _LinkState.STOPPING
-            self._terminal_cause = error
-            self._stop_event.set()
-            self._multiplexer.close()
+            if self._state is not _LinkState.STOPPING:
+                self._state = _LinkState.STOPPING
+                self._terminal_cause = error
+                self._stop_event.set()
+                self._multiplexer.close()
+            elif self._finalizer_thread is not None:
+                return
             try:
                 self._finalizer_thread = threading.Thread(
                     target=self._finalize_stop,
@@ -284,15 +294,12 @@ class SerialLink:
                     daemon=True,
                 )
                 self._finalizer_thread.start()
+                self._finalizer_start_error = None
             except BaseException as start_error:
-                self._endpoint_close_error = start_error
+                self._finalizer_thread = None
+                self._finalizer_start_error = start_error
                 if self._terminal_cause is None:
                     self._terminal_cause = start_error
-                self._finalizer_thread = None
-                use_synchronous_fallback = True
-
-        if use_synchronous_fallback:
-            self._finalize_stop()
 
     def _finalize_stop(self) -> None:
         close_error: BaseException | None = None
