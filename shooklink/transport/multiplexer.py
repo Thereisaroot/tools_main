@@ -178,13 +178,14 @@ class Multiplexer:
         stream_id: int,
         payload: bytes,
         *,
+        priority: Priority = Priority.MOTION,
         message_type: int = 0,
         flags: int = 0,
         acknowledgement: int = 0,
         sequence: int | None = None,
     ) -> OutboundItem:
         item = OutboundItem(
-            Priority.MOTION,
+            priority,
             stream_id,
             payload,
             message_type,
@@ -358,8 +359,9 @@ class Multiplexer:
 
     def _available_priorities_locked(self) -> list[int]:
         priorities = {entry[0] for entry in self._queue}
-        if self._pointer_items:
-            priorities.add(int(Priority.MOTION))
+        priorities.update(
+            int(item.priority) for _order, item in self._pointer_items.values()
+        )
         return sorted(priorities)
 
     def _next_fair_priority(self, available: list[int]) -> int:
@@ -381,8 +383,8 @@ class Multiplexer:
         for index, (item_priority, order, item) in enumerate(self._queue):
             if item_priority == priority:
                 candidates.append((order, "queue", index, item))
-        if priority == int(Priority.MOTION):
-            for stream_id, (order, item) in self._pointer_items.items():
+        for stream_id, (order, item) in self._pointer_items.items():
+            if int(item.priority) == priority:
                 candidates.append((order, "pointer", stream_id, item))
         _order, source, key, item = min(candidates, key=lambda candidate: candidate[0])
         if source == "queue":

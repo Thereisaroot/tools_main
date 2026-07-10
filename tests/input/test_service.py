@@ -15,7 +15,11 @@ from shooklink.input.events import (
     PointerMotionEvent,
     PointerPositionEvent,
 )
-from shooklink.input.service import InputService, InputSessionState
+from shooklink.input.service import (
+    MOTION_INTERVAL_SECONDS,
+    InputService,
+    InputSessionState,
+)
 from shooklink.input.topology import Monitor, Rect, Side
 from shooklink.protocol.messages import Message, MessageType
 from shooklink.transport.multiplexer import Priority
@@ -629,6 +633,25 @@ def test_pending_absolute_pointer_is_flushed_before_button_down():
     assert bus.sent[1][2] is Priority.INTERACTIVE
 
 
+def test_rate_flushed_pointer_cannot_be_overtaken_by_later_button():
+    clock = FakeClock(30.0)
+    service, bus, backend, _session_id = start_controlling(clock=clock)
+    bus.sent.clear()
+    clock.value += MOTION_INTERVAL_SECONDS * 2
+
+    backend.capture(PointerMotionEvent(5, 2))
+    backend.capture(MouseButtonEvent(MouseButton.LEFT, KeyAction.DOWN))
+
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.INPUT_MOVE,
+        MessageType.INPUT_BUTTON,
+    ]
+    assert [item[2] for item in bus.sent] == [
+        Priority.INTERACTIVE,
+        Priority.INTERACTIVE,
+    ]
+
+
 def test_stop_failure_still_releases_and_stops_remote_session():
     class FailingStopBackend(FakeBackend):
         def _stop_native_capture(self):
@@ -731,6 +754,7 @@ def test_motion_scheduler_flushes_the_final_coalesced_position():
         assert [item[0].message_type for item in bus.sent] == [
             MessageType.INPUT_MOVE
         ]
+        assert bus.sent[0][2] is Priority.INTERACTIVE
         assert (bus.sent[0][0].metadata["x"], bus.sent[0][0].metadata["y"]) == (
             5,
             52,

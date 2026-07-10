@@ -838,13 +838,16 @@ class InputService:
                 )
                 leave = False
             elif isinstance(event, WheelEvent):
-                self._flush_pointer_locked(self._clock())
+                self._flush_pointer_locked(
+                    self._clock(),
+                    priority=Priority.INTERACTIVE,
+                )
                 self._send(
                     Message(
                         MessageType.INPUT_WHEEL,
                         {"session_id": session_id, "dx": event.dx, "dy": event.dy},
                     ),
-                    Priority.MOTION,
+                    Priority.INTERACTIVE,
                 )
                 leave = False
             else:
@@ -856,7 +859,7 @@ class InputService:
         self,
         now: float,
         *,
-        priority: Priority = Priority.MOTION,
+        priority: Priority = Priority.INTERACTIVE,
     ) -> None:
         if self._pending_pointer is None or self._session_id is None:
             return

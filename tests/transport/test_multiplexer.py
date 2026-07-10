@@ -43,6 +43,15 @@ def test_pointer_moves_are_coalesced_per_stream():
     assert mux.empty()
 
 
+def test_interactive_pointer_coalescing_preserves_order_before_button():
+    mux = Multiplexer()
+    mux.enqueue_pointer(9, b"old", message_type=47, priority=Priority.INTERACTIVE)
+    mux.enqueue_pointer(9, b"latest", message_type=47, priority=Priority.INTERACTIVE)
+    mux.enqueue(OutboundItem(Priority.INTERACTIVE, 10, b"button", message_type=46))
+
+    assert [mux.pop().payload, mux.pop().payload] == [b"latest", b"button"]
+
+
 def test_pointer_move_overtakes_file_but_not_interactive():
     mux = Multiplexer()
     mux.enqueue(OutboundItem(Priority.FILE, 1, b"file"))
