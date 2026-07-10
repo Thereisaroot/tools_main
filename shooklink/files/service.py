@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
 import re
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -23,7 +25,10 @@ WINDOW_SIZE = 16
 ACK_BITMAP_BITS = 64
 RETRANSMIT_TIMEOUT = 0.75
 MAX_FILE_SIZE = 1 << 42
+MAX_MTIME_NS = (1 << 63) - 1
 MAX_FILENAME_BYTES = 240
+DEFAULT_MAX_INCOMING_TRANSFERS = 8
+MAX_COMPLETED_TRANSFERS = 128
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _TRANSFER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _WINDOWS_RESERVED = {
@@ -34,6 +39,8 @@ _WINDOWS_RESERVED = {
     *(f"COM{index}" for index in range(1, 10)),
     *(f"LPT{index}" for index in range(1, 10)),
 }
+
+logger = logging.getLogger(__name__)
 
 
 class FileTransferError(RuntimeError):
@@ -88,8 +95,8 @@ class FileOffer:
             raise ValueError("file name must be a non-empty string")
         if type(self.size) is not int or not 0 <= self.size <= MAX_FILE_SIZE:
             raise ValueError(f"file size must be from 0 to {MAX_FILE_SIZE}")
-        if type(self.mtime_ns) is not int or self.mtime_ns < 0:
-            raise ValueError("mtime_ns must be a non-negative integer")
+        if type(self.mtime_ns) is not int or not 0 <= self.mtime_ns <= MAX_MTIME_NS:
+            raise ValueError(f"mtime_ns must be from 0 to {MAX_MTIME_NS}")
         if not isinstance(self.sha256, str) or not _SHA256_RE.fullmatch(self.sha256):
             raise ValueError("sha256 must be 64 lowercase hexadecimal characters")
         if type(self.chunk_size) is not int or not 0 < self.chunk_size <= CHUNK_SIZE:
@@ -160,11 +167,15 @@ def sanitize_filename(untrusted_name: str) -> str:
     if not isinstance(untrusted_name, str):
         raise TypeError("file name must be a string")
     basename = untrusted_name.replace("\\", "/").rsplit("/", 1)[-1]
-    basename = "".join(character for character in basename if ord(character) >= 32)
+    basename = "".join(
+        "_" if 0xD800 <= ord(character) <= 0xDFFF else character
+        for character in basename
+        if ord(character) >= 32 and ord(character) != 127
+    )
     basename = re.sub(r'[<>:"/\\|?*]', "_", basename).strip(" .")
     if not basename or basename in {".", ".."}:
         basename = "download"
-    stem = basename.split(".", 1)[0].upper()
+    stem = basename.split(".", 1)[0].rstrip(" .").upper()
     if stem in _WINDOWS_RESERVED:
         basename = f"_{basename}"
     while len(basename.encode("utf-8")) > MAX_FILENAME_BYTES:
@@ -236,8 +247,9 @@ class IncomingTransfer:
         self._file = partial_file
         self._received: set[int] = set()
         self._received_bytes = 0
-        self._closed = False
-        self._cancelled = False
+        self._lock = threading.RLock()
+        self._state = "active"
+        self._cancel_requested = False
 
     @classmethod
     def create(cls, offer: FileOffer, download_dir: str | Path) -> IncomingTransfer:
@@ -268,85 +280,123 @@ class IncomingTransfer:
 
     @property
     def received_bytes(self) -> int:
-        return self._received_bytes
+        with self._lock:
+            return self._received_bytes
 
     @property
     def complete(self) -> bool:
-        return len(self._received) == self.chunk_count
+        with self._lock:
+            return len(self._received) == self.chunk_count
 
     def write_chunk(self, index: int, body: bytes) -> bool:
-        self._ensure_active()
-        if type(index) is not int or not 0 <= index < self.chunk_count:
-            raise FileProtocolError("file chunk index is out of range")
-        if not isinstance(body, bytes):
-            raise TypeError("file chunk body must be bytes")
-        offset = index * self.offer.chunk_size
-        expected_size = min(self.offer.chunk_size, self.offer.size - offset)
-        if len(body) != expected_size:
-            raise FileProtocolError("file chunk has the wrong size")
-        if index in self._received:
-            return False
-        self._file.seek(offset)
-        written = self._file.write(body)
-        if written != len(body):
-            raise OSError("partial file write made no progress")
-        self._received.add(index)
-        self._received_bytes += len(body)
-        return True
+        with self._lock:
+            self._ensure_active_locked()
+            if type(index) is not int or not 0 <= index < self.chunk_count:
+                raise FileProtocolError("file chunk index is out of range")
+            if not isinstance(body, bytes):
+                raise TypeError("file chunk body must be bytes")
+            offset = index * self.offer.chunk_size
+            expected_size = min(self.offer.chunk_size, self.offer.size - offset)
+            if len(body) != expected_size:
+                raise FileProtocolError("file chunk has the wrong size")
+            if index in self._received:
+                return False
+            self._file.seek(offset)
+            written = self._file.write(body)
+            if written != len(body):
+                raise OSError("partial file write made no progress")
+            self._received.add(index)
+            self._received_bytes += len(body)
+            return True
 
     def ack_metadata(self) -> dict[str, Any]:
-        metadata = build_ack_metadata(self._received)
-        metadata["transfer_id"] = self.offer.transfer_id
-        return metadata
+        with self._lock:
+            metadata = build_ack_metadata(self._received)
+            metadata["transfer_id"] = self.offer.transfer_id
+            return metadata
 
     def finalize(self) -> Path:
-        self._ensure_active()
-        if not self.complete:
-            raise FileProtocolError("cannot finalize an incomplete file")
-        try:
+        with self._lock:
+            self._ensure_active_locked()
+            if len(self._received) != self.chunk_count:
+                raise FileProtocolError("cannot finalize an incomplete file")
             self._file.flush()
             os.fsync(self._file.fileno())
             self._file.close()
-            self._closed = True
+            self._state = "finalizing"
+        try:
             actual_hash = _sha256_path(self.partial_path)
-            if actual_hash != self.offer.sha256:
-                self.partial_path.unlink(missing_ok=True)
-                raise FileHashMismatch("completed file SHA-256 did not match")
-            os.replace(self.partial_path, self.final_path)
+            with self._lock:
+                if self._cancel_requested:
+                    self._state = "cancelled"
+                    self.partial_path.unlink(missing_ok=True)
+                    raise FileTransferCancelled("file transfer was cancelled")
+                if actual_hash != self.offer.sha256:
+                    self._state = "failed"
+                    self.partial_path.unlink(missing_ok=True)
+                    raise FileHashMismatch("completed file SHA-256 did not match")
+                self.final_path = self._commit_without_overwrite()
+                self._state = "completed"
             try:
                 os.utime(
                     self.final_path,
                     ns=(self.offer.mtime_ns, self.offer.mtime_ns),
                 )
-            except OSError:
+            except (OSError, OverflowError, ValueError):
                 pass
             return self.final_path
         except BaseException:
-            if not self._closed:
-                try:
-                    self._file.close()
-                finally:
-                    self._closed = True
-            if not self.final_path.exists():
+            with self._lock:
+                if self._state == "finalizing":
+                    self._state = "failed"
                 self.partial_path.unlink(missing_ok=True)
             raise
 
-    def cancel(self) -> None:
-        if self._cancelled:
-            return
-        self._cancelled = True
-        if not self._closed:
+    def cancel(self) -> bool:
+        with self._lock:
+            if self._state in {"cancelled", "failed", "completed"}:
+                return False
+            if self._state == "finalizing":
+                self._cancel_requested = True
+                return True
+            self._state = "cancelled"
             try:
                 self._file.close()
             finally:
-                self._closed = True
-        self.partial_path.unlink(missing_ok=True)
+                self.partial_path.unlink(missing_ok=True)
+            return True
 
-    def _ensure_active(self) -> None:
-        if self._cancelled:
+    def _ensure_active_locked(self) -> None:
+        if self._state == "cancelled":
             raise FileTransferCancelled("file transfer was cancelled")
-        if self._closed:
+        if self._state != "active":
             raise FileTransferError("file transfer is closed")
+
+    def _commit_without_overwrite(self) -> Path:
+        safe_name = self.final_path.name
+        original = Path(safe_name)
+        stem = original.stem or "download"
+        suffix = original.suffix
+        counter = 0
+        while True:
+            name = safe_name if counter == 0 else f"{stem} ({counter}){suffix}"
+            candidate = self.final_path.parent / name
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                counter += 1
+                continue
+            os.close(descriptor)
+            try:
+                os.replace(self.partial_path, candidate)
+            except BaseException:
+                candidate.unlink(missing_ok=True)
+                raise
+            return candidate
 
 
 class OutgoingTransfer:
@@ -372,6 +422,9 @@ class OutgoingTransfer:
         self._accepted = False
         self._cancelled = False
         self._finish_sent = False
+        self._completed = False
+        self._offer_sent_at: float | None = None
+        self._finish_sent_at: float | None = None
 
     @classmethod
     def from_path(
@@ -412,7 +465,12 @@ class OutgoingTransfer:
         queued_bytes = min(self._next_index * self.offer.chunk_size, self.offer.size)
         return queued_bytes - pending_bytes
 
-    def offer_message(self) -> Message:
+    @property
+    def accepted(self) -> bool:
+        return self._accepted
+
+    def offer_message(self, *, now: float | None = None) -> Message:
+        self._offer_sent_at = time.monotonic() if now is None else now
         return Message(MessageType.FILE_OFFER, self.offer.to_metadata())
 
     def accept(self) -> None:
@@ -433,7 +491,7 @@ class OutgoingTransfer:
         ):
             messages.append(self._load_next_chunk(timestamp))
         if not self._pending and self._next_index == self.offer.chunk_count:
-            finish = self._finish_message()
+            finish = self._finish_message(timestamp)
             if finish is not None:
                 messages.append(finish)
         return messages
@@ -479,6 +537,29 @@ class OutgoingTransfer:
                 messages.append(self._chunk_message(pending))
         return messages
 
+    def retry_control(self, *, now: float | None = None) -> list[Message]:
+        if self._cancelled or self._completed:
+            return []
+        timestamp = time.monotonic() if now is None else now
+        if not self._accepted:
+            if (
+                self._offer_sent_at is None
+                or timestamp - self._offer_sent_at >= self.retransmit_timeout
+            ):
+                return [self.offer_message(now=timestamp)]
+            return []
+        if (
+            self._finish_sent
+            and self._finish_sent_at is not None
+            and timestamp - self._finish_sent_at >= self.retransmit_timeout
+        ):
+            self._finish_sent_at = timestamp
+            return [self._new_finish_message()]
+        return []
+
+    def mark_completed(self) -> None:
+        self._completed = True
+
     def cancel(self) -> None:
         if self._cancelled:
             return
@@ -519,11 +600,15 @@ class OutgoingTransfer:
             pending.body,
         )
 
-    def _finish_message(self) -> Message | None:
+    def _finish_message(self, timestamp: float) -> Message | None:
         if self._finish_sent:
             return None
         self._finish_sent = True
+        self._finish_sent_at = timestamp
         self._close_file()
+        return self._new_finish_message()
+
+    def _new_finish_message(self) -> Message:
         return Message(
             MessageType.FILE_FINISH,
             {
@@ -547,7 +632,11 @@ class FileService:
         download_dir: str | Path,
         *,
         executor: Executor | None = None,
+        accept_offer: Callable[[FileOffer], bool] | None = None,
+        max_incoming_transfers: int = DEFAULT_MAX_INCOMING_TRANSFERS,
     ) -> None:
+        if type(max_incoming_transfers) is not int or max_incoming_transfers <= 0:
+            raise ValueError("max_incoming_transfers must be positive")
         self._bus = bus
         self.download_dir = Path(download_dir)
         self._executor = executor or ThreadPoolExecutor(
@@ -555,12 +644,25 @@ class FileService:
             thread_name_prefix="shooklink-file",
         )
         self._owns_executor = executor is None
+        self._accept_offer = accept_offer or (lambda _offer: True)
+        self._max_incoming_transfers = max_incoming_transfers
         self._lock = threading.RLock()
         self._outgoing: dict[str, OutgoingTransfer] = {}
         self._incoming: dict[str, IncomingTransfer] = {}
+        self._finalizing: dict[str, Future[Path]] = {}
+        self._completed_incoming: OrderedDict[
+            str, tuple[FileOffer, str, Path | None]
+        ] = OrderedDict()
         self._listeners: list[Callable[[FileProgress], None]] = []
         self._progress_started: dict[str, float] = {}
         self._closed = False
+        self._timer_stop = threading.Event()
+        self._timer_thread = threading.Thread(
+            target=self._timer_loop,
+            name="shooklink-file-timer",
+            daemon=True,
+        )
+        self._timer_thread.start()
 
     def add_progress_listener(self, listener: Callable[[FileProgress], None]) -> None:
         with self._lock:
@@ -583,6 +685,13 @@ class FileService:
         result: Future[str] = Future()
 
         def prepared(preparation: Future[OutgoingTransfer]) -> None:
+            transfer: OutgoingTransfer | None = None
+            if not result.set_running_or_notify_cancel():
+                try:
+                    preparation.result().cancel()
+                except BaseException:
+                    pass
+                return
             try:
                 transfer = preparation.result()
                 with self._lock:
@@ -590,10 +699,14 @@ class FileService:
                         transfer.cancel()
                         raise FileTransferError("file service is closed")
                     self._outgoing[transfer.offer.transfer_id] = transfer
-                self._send(transfer.offer_message(), Priority.NORMAL)
+                    self._send(transfer.offer_message(), Priority.NORMAL)
                 self._notify_outgoing(transfer, "offered")
                 result.set_result(transfer.offer.transfer_id)
             except BaseException as error:
+                if transfer is not None:
+                    with self._lock:
+                        self._outgoing.pop(transfer.offer.transfer_id, None)
+                    transfer.cancel()
                 result.set_exception(error)
 
         future.add_done_callback(prepared)
@@ -623,29 +736,43 @@ class FileService:
 
     def poll(self, *, now: float | None = None) -> None:
         with self._lock:
-            transfers = tuple(self._outgoing.values())
-        for transfer in transfers:
-            try:
-                messages = transfer.retransmit_expired(now=now)
-            except FileTransferError:
-                continue
-            self._send_many(messages)
+            if self._closed:
+                return
+            for transfer in self._outgoing.values():
+                pending_messages = transfer.retry_control(now=now)
+                try:
+                    if transfer.accepted:
+                        pending_messages.extend(transfer.retransmit_expired(now=now))
+                except FileTransferError:
+                    pass
+                self._send_many(pending_messages)
 
     def cancel(self, transfer_id: str) -> None:
         transfer = None
+        direction = None
         with self._lock:
             transfer = self._outgoing.pop(transfer_id, None)
+            if transfer is not None:
+                direction = "outgoing"
             if transfer is None:
                 transfer = self._incoming.pop(transfer_id, None)
+                if transfer is not None:
+                    direction = "incoming"
         if transfer is None:
             return
-        transfer.cancel()
+        if direction == "outgoing":
+            self._notify_outgoing(transfer, "cancelled")
+            transfer.cancel()
+        else:
+            if transfer.cancel():
+                self._notify_incoming(transfer, "cancelled")
         self._send(
             Message(MessageType.FILE_CANCEL, {"transfer_id": transfer_id}),
             Priority.INTERACTIVE,
         )
 
     def close(self) -> None:
+        self._timer_stop.set()
         with self._lock:
             if self._closed:
                 return
@@ -653,10 +780,21 @@ class FileService:
             transfers = tuple(self._outgoing.values()) + tuple(self._incoming.values())
             self._outgoing.clear()
             self._incoming.clear()
+            self._completed_incoming.clear()
         for transfer in transfers:
             transfer.cancel()
+        if self._timer_thread is not threading.current_thread():
+            self._timer_thread.join(2.0)
         if self._owns_executor:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def _timer_loop(self) -> None:
+        interval = min(0.25, RETRANSMIT_TIMEOUT / 2)
+        while not self._timer_stop.wait(interval):
+            try:
+                self.poll()
+            except BaseException:
+                logger.exception("file retransmission timer failed")
 
     def _handle_offer(self, message: Message) -> None:
         self._ensure_trusted()
@@ -664,100 +802,199 @@ class FileService:
             raise FileProtocolError("file offer cannot contain a body")
         offer = FileOffer.from_metadata(message.metadata)
         with self._lock:
-            if offer.transfer_id in self._incoming or offer.transfer_id in self._outgoing:
-                raise FileProtocolError("duplicate file transfer ID")
-            transfer = IncomingTransfer.create(offer, self.download_dir)
+            completed = self._completed_incoming.get(offer.transfer_id)
+            if completed is not None:
+                if completed[0] == offer:
+                    self._send_finish_status(offer.transfer_id, completed[1])
+                return
+            existing = self._incoming.get(offer.transfer_id)
+            if existing is not None:
+                if existing.offer == offer:
+                    self._send_accept(offer.transfer_id)
+                return
+            if offer.transfer_id in self._outgoing:
+                self._send_cancel(offer.transfer_id, "duplicate")
+                return
+            if len(self._incoming) >= self._max_incoming_transfers:
+                self._send_cancel(offer.transfer_id, "busy")
+                return
+        try:
+            accepted = bool(self._accept_offer(offer))
+        except BaseException:
+            logger.exception("incoming file policy failed")
+            accepted = False
+        if not accepted:
+            self._send_cancel(offer.transfer_id, "rejected")
+            return
+        with self._lock:
+            if offer.transfer_id in self._incoming:
+                self._send_accept(offer.transfer_id)
+                return
+            if len(self._incoming) >= self._max_incoming_transfers:
+                self._send_cancel(offer.transfer_id, "busy")
+                return
+            try:
+                transfer = IncomingTransfer.create(offer, self.download_dir)
+            except OSError:
+                self._send_cancel(offer.transfer_id, "unavailable")
+                return
             self._incoming[offer.transfer_id] = transfer
-        self._send(
-            Message(MessageType.FILE_ACCEPT, {"transfer_id": offer.transfer_id}),
-            Priority.NORMAL,
-        )
+            self._send_accept(offer.transfer_id)
         self._notify_incoming(transfer, "receiving")
 
     def _handle_accept(self, message: Message) -> None:
-        transfer = self._get_outgoing(message.metadata)
-        transfer.accept()
-        self._send_many(transfer.next_messages())
+        if message.body or set(message.metadata) != {"transfer_id"}:
+            raise FileProtocolError("file accept fields are invalid")
+        with self._lock:
+            transfer_id = _metadata_transfer_id(message.metadata)
+            transfer = self._outgoing.get(transfer_id)
+            if transfer is None:
+                return
+            transfer.accept()
+            messages = transfer.next_messages()
+            self._send_many(messages)
         self._notify_outgoing(transfer, "sending")
 
     def _handle_chunk(self, message: Message) -> None:
-        transfer = self._get_incoming(message.metadata)
-        index = message.metadata.get("index")
-        transfer.write_chunk(index, message.body)
-        self._send(Message(MessageType.FILE_ACK, transfer.ack_metadata()), Priority.NORMAL)
+        if set(message.metadata) != {"transfer_id", "index"}:
+            raise FileProtocolError("file chunk fields are invalid")
+        transfer_id = _metadata_transfer_id(message.metadata)
+        with self._lock:
+            completed = self._completed_incoming.get(transfer_id)
+            if completed is not None:
+                self._send_finish_status(transfer_id, completed[1])
+                return
+            transfer = self._incoming.get(transfer_id)
+            if transfer is None:
+                return
+            if transfer_id not in self._finalizing:
+                transfer.write_chunk(message.metadata["index"], message.body)
+            self._send(
+                Message(MessageType.FILE_ACK, transfer.ack_metadata()),
+                Priority.NORMAL,
+            )
         self._notify_incoming(transfer, "receiving")
 
     def _handle_ack(self, message: Message) -> None:
-        transfer = self._get_outgoing(message.metadata)
-        self._send_many(transfer.acknowledge(message.metadata))
+        if message.body or set(message.metadata) != {
+            "transfer_id",
+            "base",
+            "span",
+            "bitmap",
+        }:
+            raise FileProtocolError("file ACK fields are invalid")
+        with self._lock:
+            transfer_id = _metadata_transfer_id(message.metadata)
+            transfer = self._outgoing.get(transfer_id)
+            if transfer is None:
+                return
+            messages = transfer.acknowledge(message.metadata)
+            self._send_many(messages)
         self._notify_outgoing(transfer, "sending")
 
     def _handle_finish(self, message: Message) -> None:
+        if message.body:
+            raise FileProtocolError("file finish cannot contain a body")
         transfer_id = _metadata_transfer_id(message.metadata)
         status = message.metadata.get("status")
         if status is not None:
+            if set(message.metadata) != {"transfer_id", "status"}:
+                raise FileProtocolError("file finish status fields are invalid")
             if status not in {"ok", "error"}:
                 raise FileProtocolError("file finish status is invalid")
             with self._lock:
                 transfer = self._outgoing.pop(transfer_id, None)
+                if transfer is not None:
+                    transfer.mark_completed()
             if transfer is not None:
                 self._notify_outgoing(transfer, "complete" if status == "ok" else "failed")
             return
 
         with self._lock:
+            if set(message.metadata) != {"transfer_id", "sha256"}:
+                raise FileProtocolError("file finish fields are invalid")
+            if transfer_id in self._completed_incoming:
+                self._send_finish_status(
+                    transfer_id,
+                    self._completed_incoming[transfer_id][1],
+                )
+                return
             transfer = self._incoming.get(transfer_id)
-        if transfer is None:
-            raise FileProtocolError("unknown incoming transfer")
-        if message.metadata.get("sha256") != transfer.offer.sha256:
-            raise FileProtocolError("file finish hash differs from offer")
-        future = self._executor.submit(transfer.finalize)
+            if transfer is None:
+                return
+            if transfer_id in self._finalizing:
+                return
+            if message.metadata["sha256"] != transfer.offer.sha256:
+                self._incoming.pop(transfer_id, None)
+                transfer.cancel()
+                self._remember_completed_locked(transfer, None, "error")
+                self._send_finish_status(transfer_id, "error")
+                self._notify_incoming(transfer, "failed")
+                return
+            future = self._executor.submit(transfer.finalize)
+            self._finalizing[transfer_id] = future
 
         def finalized(completion: Future[Path]) -> None:
+            notify: tuple[IncomingTransfer, str] | None = None
             try:
                 path = completion.result()
+            except FileTransferCancelled:
+                with self._lock:
+                    self._finalizing.pop(transfer_id, None)
+                    self._incoming.pop(transfer_id, None)
             except BaseException:
                 transfer.cancel()
-                self._send(
-                    Message(
-                        MessageType.FILE_FINISH,
-                        {"transfer_id": transfer_id, "status": "error"},
-                    ),
-                    Priority.NORMAL,
-                )
-                self._notify_incoming(transfer, "failed")
-            else:
-                self._send(
-                    Message(
-                        MessageType.FILE_FINISH,
-                        {"transfer_id": transfer_id, "status": "ok"},
-                    ),
-                    Priority.NORMAL,
-                )
-                self._notify(
-                    FileProgress(
-                        transfer_id,
-                        transfer.offer.name,
-                        "incoming",
-                        transfer.offer.size,
-                        transfer.offer.size,
-                        "complete",
-                        path,
-                    )
-                )
-            finally:
                 with self._lock:
-                    self._incoming.pop(transfer_id, None)
+                    self._finalizing.pop(transfer_id, None)
+                    active = self._incoming.pop(transfer_id, None) is transfer
+                    if active and not self._closed:
+                        self._remember_completed_locked(transfer, None, "error")
+                        self._send_finish_status(transfer_id, "error")
+                        notify = (transfer, "failed")
+            else:
+                with self._lock:
+                    self._finalizing.pop(transfer_id, None)
+                    active = self._incoming.pop(transfer_id, None) is transfer
+                    if active and not self._closed:
+                        self._remember_completed_locked(transfer, path, "ok")
+                        self._send_finish_status(transfer_id, "ok")
+                        notify = (transfer, "complete")
+            if notify is not None:
+                if notify[1] == "complete":
+                    self._notify(
+                        FileProgress(
+                            transfer_id,
+                            transfer.offer.name,
+                            "incoming",
+                            transfer.offer.size,
+                            transfer.offer.size,
+                            "complete",
+                            path,
+                        )
+                    )
+                else:
+                    self._notify_incoming(*notify)
 
         future.add_done_callback(finalized)
 
     def _handle_cancel(self, message: Message) -> None:
         transfer_id = _metadata_transfer_id(message.metadata)
+        direction = None
         with self._lock:
             transfer = self._outgoing.pop(transfer_id, None)
+            if transfer is not None:
+                direction = "outgoing"
             if transfer is None:
                 transfer = self._incoming.pop(transfer_id, None)
+                if transfer is not None:
+                    direction = "incoming"
         if transfer is not None:
-            transfer.cancel()
+            if direction == "outgoing":
+                self._notify_outgoing(transfer, "cancelled")
+                transfer.cancel()
+            else:
+                if transfer.cancel():
+                    self._notify_incoming(transfer, "cancelled")
 
     def _get_outgoing(self, metadata: Mapping[str, Any]) -> OutgoingTransfer:
         transfer_id = _metadata_transfer_id(metadata)
@@ -783,6 +1020,45 @@ class FileService:
                 else Priority.NORMAL
             )
             self._send(message, priority)
+
+    def _send_accept(self, transfer_id: str) -> None:
+        self._send(
+            Message(MessageType.FILE_ACCEPT, {"transfer_id": transfer_id}),
+            Priority.NORMAL,
+        )
+
+    def _send_cancel(self, transfer_id: str, reason: str) -> None:
+        self._send(
+            Message(
+                MessageType.FILE_CANCEL,
+                {"transfer_id": transfer_id, "reason": reason},
+            ),
+            Priority.NORMAL,
+        )
+
+    def _send_finish_status(self, transfer_id: str, status: str) -> None:
+        self._send(
+            Message(
+                MessageType.FILE_FINISH,
+                {"transfer_id": transfer_id, "status": status},
+            ),
+            Priority.NORMAL,
+        )
+
+    def _remember_completed_locked(
+        self,
+        transfer: IncomingTransfer,
+        path: Path | None,
+        status: str,
+    ) -> None:
+        self._completed_incoming[transfer.offer.transfer_id] = (
+            transfer.offer,
+            status,
+            path,
+        )
+        self._completed_incoming.move_to_end(transfer.offer.transfer_id)
+        while len(self._completed_incoming) > MAX_COMPLETED_TRANSFERS:
+            self._completed_incoming.popitem(last=False)
 
     def _send(self, message: Message, priority: Priority) -> None:
         self._bus.send(message, secure=True, priority=priority)

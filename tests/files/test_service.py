@@ -1,4 +1,5 @@
 import hashlib
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -9,6 +10,7 @@ from shooklink.files.service import (
     FileHashMismatch,
     FileOffer,
     FileProtocolError,
+    RETRANSMIT_TIMEOUT,
     FileService,
     IncomingTransfer,
     OutgoingTransfer,
@@ -113,6 +115,19 @@ def test_existing_destination_is_not_overwritten(tmp_path):
 
     assert final_path.name == "same (1).txt"
     assert (tmp_path / "same.txt").read_text(encoding="utf-8") == "old"
+
+
+def test_destination_created_during_transfer_is_not_overwritten(tmp_path):
+    data = b"remote"
+    transfer = IncomingTransfer.create(make_offer("race.txt", data), tmp_path)
+    transfer.write_chunk(0, data)
+    (tmp_path / "race.txt").write_text("local", encoding="utf-8")
+
+    final_path = transfer.finalize()
+
+    assert (tmp_path / "race.txt").read_text(encoding="utf-8") == "local"
+    assert final_path.name == "race (1).txt"
+    assert final_path.read_bytes() == data
 
 
 def test_selective_repeat_requeues_only_reported_holes_and_bounds_window(tmp_path):
@@ -291,6 +306,30 @@ def test_incoming_file_offer_requires_authenticated_transport(tmp_path):
     service.close()
 
 
+def test_incoming_offer_count_is_bounded(tmp_path):
+    bus = QueueBus()
+    service = FileService(
+        bus,
+        tmp_path / "downloads",
+        max_incoming_transfers=2,
+    )
+    for index in range(3):
+        offer = make_offer(
+            f"{index}.bin",
+            b"data",
+            transfer_id=f"{index + 1:032x}",
+        )
+        service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.FILE_ACCEPT,
+        MessageType.FILE_ACCEPT,
+        MessageType.FILE_CANCEL,
+    ]
+    assert bus.sent[-1][0].metadata["reason"] == "busy"
+    service.close()
+
+
 def test_two_services_complete_an_encrypted_file_transfer(tmp_path):
     source = tmp_path / "source.dat"
     data = (b"serial-windowed-transfer\n" * 2000) + bytes(range(256))
@@ -337,3 +376,248 @@ def test_two_services_complete_an_encrypted_file_transfer(tmp_path):
     assert transfer_id
     left.close()
     right.close()
+
+
+def test_service_drives_retransmission_timer_without_manual_poll(tmp_path):
+    source = tmp_path / "retry.bin"
+    source.write_bytes(b"retry me")
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    transfer_id = service.send_file(source).result(timeout=2)
+    bus.queue.clear()
+    service.handle_message(
+        Message(MessageType.FILE_ACCEPT, {"transfer_id": transfer_id})
+    )
+    bus.queue.clear()
+    deadline = time.monotonic() + RETRANSMIT_TIMEOUT + 1
+
+    while time.monotonic() < deadline:
+        if any(
+            item[0].message_type is MessageType.FILE_CHUNK
+            for item in bus.queue
+        ):
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("file chunk was not retransmitted automatically")
+    service.close()
+
+
+def test_service_retries_offer_and_finish_control_frames(tmp_path):
+    source = tmp_path / "control.bin"
+    source.write_bytes(b"control")
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    transfer_id = service.send_file(source).result(timeout=2)
+    bus.queue.clear()
+    deadline = time.monotonic() + RETRANSMIT_TIMEOUT + 1
+    while time.monotonic() < deadline and not bus.queue:
+        time.sleep(0.01)
+    assert bus.queue.popleft()[0].message_type is MessageType.FILE_OFFER
+
+    service.handle_message(Message(MessageType.FILE_ACCEPT, {"transfer_id": transfer_id}))
+    service.handle_message(
+        Message(
+            MessageType.FILE_ACK,
+            {
+                "transfer_id": transfer_id,
+                "base": 1,
+                "span": 0,
+                "bitmap": "0",
+            },
+        )
+    )
+    bus.queue.clear()
+    deadline = time.monotonic() + RETRANSMIT_TIMEOUT + 1
+    while time.monotonic() < deadline and not bus.queue:
+        time.sleep(0.01)
+    assert bus.queue.popleft()[0].message_type is MessageType.FILE_FINISH
+    service.close()
+
+
+def test_incoming_offer_policy_can_reject_without_reserving_a_file(tmp_path):
+    offer = make_offer("reject.bin", b"rejected")
+    bus = QueueBus()
+    downloads = tmp_path / "downloads"
+    service = FileService(bus, downloads, accept_offer=lambda _offer: False)
+
+    service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+
+    rejection = bus.sent[-1][0]
+    assert rejection.message_type is MessageType.FILE_CANCEL
+    assert rejection.metadata == {
+        "transfer_id": offer.transfer_id,
+        "reason": "rejected",
+    }
+    assert not downloads.exists()
+    service.close()
+
+
+def test_local_and_remote_cancel_emit_terminal_progress(tmp_path):
+    source = tmp_path / "cancel.bin"
+    source.write_bytes(b"cancel")
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    progress = []
+    service.add_progress_listener(progress.append)
+    outgoing_id = service.send_file(source).result(timeout=2)
+
+    service.cancel(outgoing_id)
+    assert progress[-1].transfer_id == outgoing_id
+    assert progress[-1].state == "cancelled"
+
+    incoming = make_offer("remote.bin", b"remote", transfer_id="8" * 32)
+    service.handle_message(Message(MessageType.FILE_OFFER, incoming.to_metadata()))
+    service.handle_message(
+        Message(MessageType.FILE_CANCEL, {"transfer_id": incoming.transfer_id})
+    )
+    assert progress[-1].transfer_id == incoming.transfer_id
+    assert progress[-1].state == "cancelled"
+    service.close()
+
+
+def test_cancel_during_final_hash_cannot_commit_or_report_success(tmp_path, monkeypatch):
+    from shooklink.files import service as service_module
+
+    data = b"finalize race"
+    offer = make_offer(
+        "race.bin",
+        data,
+        transfer_id="7" * 32,
+        chunk_size=len(data),
+    )
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+    service.handle_message(
+        Message(
+            MessageType.FILE_CHUNK,
+            {"transfer_id": offer.transfer_id, "index": 0},
+            data,
+        )
+    )
+    started = threading.Event()
+    release = threading.Event()
+    original_hash = service_module._sha256_path
+
+    def blocking_hash(path):
+        started.set()
+        release.wait(2)
+        return original_hash(path)
+
+    monkeypatch.setattr(service_module, "_sha256_path", blocking_hash)
+    service.handle_message(
+        Message(
+            MessageType.FILE_FINISH,
+            {"transfer_id": offer.transfer_id, "sha256": offer.sha256},
+        )
+    )
+    assert started.wait(1)
+
+    service.cancel(offer.transfer_id)
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not any((tmp_path / "downloads").glob("*.part")):
+            break
+        time.sleep(0.01)
+
+    assert not (tmp_path / "downloads" / "race.bin").exists()
+    assert not any(
+        message.message_type is MessageType.FILE_FINISH
+        and message.metadata.get("status") == "ok"
+        for message, _secure, _priority in bus.sent
+    )
+    service.close()
+
+
+def test_duplicate_finish_and_late_ack_are_idempotent(tmp_path):
+    data = b"duplicate"
+    offer = make_offer(
+        "duplicate.bin",
+        data,
+        transfer_id="6" * 32,
+        chunk_size=len(data),
+    )
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+    service.handle_message(
+        Message(
+            MessageType.FILE_CHUNK,
+            {"transfer_id": offer.transfer_id, "index": 0},
+            data,
+        )
+    )
+    finish = Message(
+        MessageType.FILE_FINISH,
+        {"transfer_id": offer.transfer_id, "sha256": offer.sha256},
+    )
+    service.handle_message(finish)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if any(
+            message.message_type is MessageType.FILE_FINISH
+            and message.metadata.get("status") == "ok"
+            for message, _secure, _priority in bus.sent
+        ):
+            break
+        time.sleep(0.01)
+    service.handle_message(finish)
+    statuses = [
+        message.metadata.get("status")
+        for message, _secure, _priority in bus.sent
+        if message.message_type is MessageType.FILE_FINISH
+        and "status" in message.metadata
+    ]
+    assert statuses == ["ok", "ok"]
+
+    service.handle_message(
+        Message(
+            MessageType.FILE_ACK,
+            {
+                "transfer_id": "5" * 32,
+                "base": 0,
+                "span": 0,
+                "bitmap": "0",
+            },
+        )
+    )
+    service.close()
+
+
+def test_cancelled_preparation_future_never_sends_offer(tmp_path, monkeypatch):
+    from shooklink.files import service as service_module
+
+    source = tmp_path / "slow.bin"
+    source.write_bytes(b"slow")
+    started = threading.Event()
+    release = threading.Event()
+    original_hash = service_module._sha256_path
+
+    def blocking_hash(path):
+        started.set()
+        release.wait(2)
+        return original_hash(path)
+
+    monkeypatch.setattr(service_module, "_sha256_path", blocking_hash)
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    future = service.send_file(source)
+    assert started.wait(1)
+
+    assert future.cancel()
+    release.set()
+    time.sleep(0.05)
+
+    assert bus.sent == []
+    service.close()
+
+
+def test_timestamp_and_windows_filename_edge_cases_are_safe(tmp_path):
+    with pytest.raises(ValueError, match="mtime"):
+        FileOffer("4" * 32, "time.bin", 0, 1 << 80, "0" * 64)
+
+    assert sanitize_filename("CON .txt").upper().split(".", 1)[0].strip() != "CON"
+    sanitized = sanitize_filename("bad\ud800name.txt")
+    sanitized.encode("utf-8")
