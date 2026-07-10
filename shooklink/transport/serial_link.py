@@ -75,6 +75,7 @@ class SerialLink:
         self._endpoint_close_error: BaseException | None = None
         self._finalizer_start_error: BaseException | None = None
         self._terminal_cause: BaseException | None = None
+        self._finalization_in_progress = False
         self._disconnect_notified = False
         self._disconnect_callback_thread_id: int | None = None
         self._reader_thread: threading.Thread | None = None
@@ -300,8 +301,9 @@ class SerialLink:
                 self._terminal_cause = error
                 self._stop_event.set()
                 self._multiplexer.close()
-            elif self._finalizer_thread is not None:
+            elif self._finalization_in_progress:
                 return
+            self._finalization_in_progress = True
             try:
                 self._finalizer_thread = threading.Thread(
                     target=self._finalize_stop,
@@ -316,6 +318,8 @@ class SerialLink:
                 if self._terminal_cause is None:
                     self._terminal_cause = start_error
                 use_synchronous_fallback = allow_synchronous_fallback
+                if not use_synchronous_fallback:
+                    self._finalization_in_progress = False
 
         if use_synchronous_fallback:
             self._finalize_stop()
@@ -332,6 +336,7 @@ class SerialLink:
                 self._endpoint_close_error = close_error
                 if self._terminal_cause is None:
                     self._terminal_cause = close_error
+            self._finalization_in_progress = False
             self._state = _LinkState.CLOSED
             callback_error = self._terminal_cause
             callback = None

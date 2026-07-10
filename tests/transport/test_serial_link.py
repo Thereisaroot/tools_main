@@ -354,6 +354,37 @@ def test_worker_error_finalizes_if_finalizer_thread_cannot_start(monkeypatch):
     assert link.wait_closed(1)
 
 
+def test_worker_fallback_owns_finalization_against_concurrent_close(monkeypatch):
+    endpoint = BlockingBrokenWriteEndpoint()
+    endpoint.connect(MemoryEndpoint())
+    disconnects = []
+    original_start = threading.Thread.start
+    failed_once = False
+
+    def failing_start(thread):
+        nonlocal failed_once
+        if thread.name == "shooklink-serial-finalizer" and not failed_once:
+            failed_once = True
+            raise RuntimeError("cannot start finalizer")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", failing_start)
+    link = SerialLink(endpoint, lambda frame: None, disconnects.append)
+    link.start()
+    link.send(OutboundItem(Priority.NORMAL, 1, b"fail"))
+    assert endpoint.close_started.wait(1)
+    close_errors = []
+    closer = threading.Thread(target=lambda: _capture_error(link.close, close_errors))
+    closer.start()
+    time.sleep(0.02)
+    endpoint.release_close.set()
+    closer.join(1)
+
+    assert close_errors == []
+    assert endpoint.close_calls == 1
+    assert len(disconnects) == 1
+
+
 def test_first_stop_owns_disconnect_cause_during_concurrent_close():
     endpoint = BlockingBrokenWriteEndpoint()
     endpoint.connect(MemoryEndpoint())
