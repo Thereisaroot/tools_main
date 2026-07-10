@@ -3,18 +3,31 @@
 from __future__ import annotations
 
 import sys
+from concurrent.futures import Future
+from pathlib import Path
+from typing import Protocol
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QCloseEvent, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import QUrl, Qt, Signal
+from PySide6.QtGui import (
+    QCloseEvent,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QKeySequence,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSpacerItem,
@@ -24,6 +37,7 @@ from PySide6.QtWidgets import (
 from serial.tools import list_ports
 
 from shooklink.chat.service import ChatMessage, ChatService
+from shooklink.files.service import FileProgress
 
 COMMON_BAUD_RATES = (
     115_200,
@@ -36,17 +50,79 @@ COMMON_BAUD_RATES = (
 )
 
 
+class FileUiService(Protocol):
+    download_dir: Path
+
+    def send_file(self, path: str | Path) -> Future[str]: ...
+
+    def cancel(self, transfer_id: str) -> None: ...
+
+    def add_progress_listener(self, listener) -> None: ...
+
+    def remove_progress_listener(self, listener) -> None: ...
+
+
+class FileDropZone(QFrame):
+    """Drop target that accepts one existing local file URL."""
+
+    file_dropped = Signal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("fileDropZone")
+        self.setAcceptDrops(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        label = QLabel("DROP A FILE HERE")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
+
+    @staticmethod
+    def local_file_path(mime_data) -> Path | None:
+        if not mime_data.hasUrls():
+            return None
+        urls = mime_data.urls()
+        if len(urls) != 1 or not urls[0].isLocalFile():
+            return None
+        path = Path(urls[0].toLocalFile())
+        return path if path.is_file() else None
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if self.local_file_path(event.mimeData()) is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        path = self.local_file_path(event.mimeData())
+        if path is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.file_dropped.emit(str(path))
+
+
 class MainWindow(QMainWindow):
     """Connection shell and chat interface shared by macOS and Windows."""
 
     connect_requested = Signal(str, int)
     incoming_message = Signal(object)
+    file_progress = Signal(object)
+    file_prepared = Signal(object)
 
-    def __init__(self, chat_service: ChatService) -> None:
+    def __init__(
+        self,
+        chat_service: ChatService,
+        file_service: FileUiService | None = None,
+    ) -> None:
         super().__init__()
         self._chat_service = chat_service
+        self._file_service = file_service
         self._shortcuts: list[QShortcut] = []
         self._connected = False
+        self._active_transfer_id: str | None = None
+        self._chat_listener = self.incoming_message.emit
+        self._file_listener = self.file_progress.emit
         self.setWindowTitle("ShookLink")
         self.setMinimumSize(760, 640)
         self.resize(920, 760)
@@ -54,7 +130,11 @@ class MainWindow(QMainWindow):
         self._install_shortcuts()
         self._refresh_ports()
         self.incoming_message.connect(self._show_received_message)
-        self._chat_service.add_message_listener(self.incoming_message.emit)
+        self.file_progress.connect(self._show_file_progress)
+        self.file_prepared.connect(self._file_was_prepared)
+        self._chat_service.add_message_listener(self._chat_listener)
+        if self._file_service is not None:
+            self._file_service.add_progress_listener(self._file_listener)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -102,6 +182,40 @@ class MainWindow(QMainWindow):
         connection_layout.setColumnStretch(0, 3)
         connection_layout.setColumnStretch(1, 1)
         layout.addWidget(connection)
+
+        file_panel = QFrame()
+        file_panel.setObjectName("panel")
+        file_layout = QGridLayout(file_panel)
+        file_layout.setContentsMargins(18, 14, 18, 14)
+        file_layout.setHorizontalSpacing(10)
+        self.file_drop_zone = FileDropZone()
+        self.file_drop_zone.file_dropped.connect(self._queue_file)
+        self.file_select_button = QPushButton("Choose File")
+        self.file_select_button.clicked.connect(self._select_file)
+        self.file_cancel_button = QPushButton("Cancel Transfer")
+        self.file_cancel_button.clicked.connect(self._cancel_file)
+        self.open_download_button = QPushButton("Open Downloads")
+        self.open_download_button.clicked.connect(self._open_download_folder)
+        self.file_progress_bar = QProgressBar()
+        self.file_progress_bar.setRange(0, 100)
+        self.file_progress_bar.setValue(0)
+        self.file_progress_bar.setTextVisible(False)
+        self.file_progress_label = QLabel("No active file transfer")
+        self.file_progress_label.setObjectName("fileProgress")
+        file_layout.addWidget(self.file_drop_zone, 0, 0, 2, 1)
+        file_layout.addWidget(self.file_select_button, 0, 1)
+        file_layout.addWidget(self.file_cancel_button, 0, 2)
+        file_layout.addWidget(self.open_download_button, 0, 3)
+        file_layout.addWidget(self.file_progress_bar, 1, 1, 1, 2)
+        file_layout.addWidget(self.file_progress_label, 1, 3)
+        file_layout.setColumnStretch(0, 2)
+        file_layout.setColumnStretch(3, 1)
+        files_enabled = self._file_service is not None
+        self.file_drop_zone.setEnabled(files_enabled)
+        self.file_select_button.setEnabled(files_enabled)
+        self.file_cancel_button.setEnabled(False)
+        self.open_download_button.setEnabled(files_enabled)
+        layout.addWidget(file_panel)
 
         received_label = QLabel("LAST RECEIVED")
         received_label.setObjectName("sectionLabel")
@@ -171,6 +285,10 @@ class MainWindow(QMainWindow):
             QFrame#panel {
                 background: #e7e3d9; border: 1px solid #c8c1b2; border-radius: 8px;
             }
+            QFrame#fileDropZone {
+                background: #dce6df; border: 1px dashed #6f8c82; border-radius: 6px;
+            }
+            QFrame#fileDropZone QLabel { color: #31564e; font-size: 10px; font-weight: 750; }
             QComboBox, QPlainTextEdit {
                 background: #fffdf8; border: 1px solid #b9b2a5; border-radius: 6px;
                 selection-background-color: #176b5b; selection-color: white;
@@ -191,6 +309,12 @@ class MainWindow(QMainWindow):
                 background: #b4482b; color: white; border-color: #b4482b;
             }
             QLabel#messageKind, QLabel#actionStatus { color: #66756f; }
+            QLabel#fileProgress { color: #526761; font-size: 11px; }
+            QProgressBar {
+                min-height: 8px; max-height: 8px; border: none; border-radius: 4px;
+                background: #cbc7bd;
+            }
+            QProgressBar::chunk { background: #176b5b; border-radius: 4px; }
             """
         )
         fixed_font = QFont("Menlo" if sys.platform == "darwin" else "Consolas")
@@ -235,6 +359,66 @@ class MainWindow(QMainWindow):
         self.action_status.clear()
         self.connect_requested.emit(port, baud)
 
+    def _select_file(self) -> None:
+        if self._file_service is None:
+            return
+        path, _selected_filter = QFileDialog.getOpenFileName(self, "Choose a file")
+        if path:
+            self._queue_file(path)
+
+    def _queue_file(self, path: str) -> None:
+        if self._file_service is None:
+            return
+        try:
+            future = self._file_service.send_file(path)
+        except Exception as error:
+            self.action_status.setText(str(error))
+            return
+        self.file_progress_label.setText(f"Preparing {Path(path).name}")
+        future.add_done_callback(self.file_prepared.emit)
+
+    def _file_was_prepared(self, future: Future[str]) -> None:
+        try:
+            self._active_transfer_id = future.result()
+        except Exception as error:
+            self.file_progress_label.setText(str(error))
+            self.file_cancel_button.setEnabled(False)
+            return
+        self.file_cancel_button.setEnabled(True)
+
+    def _cancel_file(self) -> None:
+        if self._file_service is None or self._active_transfer_id is None:
+            return
+        transfer_id = self._active_transfer_id
+        self._active_transfer_id = None
+        self._file_service.cancel(transfer_id)
+        self.file_progress_label.setText("Cancellation requested")
+        self.file_cancel_button.setEnabled(False)
+
+    def _open_download_folder(self) -> None:
+        if self._file_service is None:
+            return
+        self._file_service.download_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(self._file_service.download_dir.resolve()))
+        )
+
+    def _show_file_progress(self, progress: FileProgress) -> None:
+        self._active_transfer_id = progress.transfer_id
+        percent = 100 if progress.total == 0 else round(
+            100 * progress.transferred / progress.total
+        )
+        self.file_progress_bar.setValue(max(0, min(100, percent)))
+        self.file_progress_label.setText(
+            f"{progress.name} · {_format_bytes(progress.transferred)} / "
+            f"{_format_bytes(progress.total)} · "
+            f"{_format_bytes(progress.throughput_bps)}/s · {progress.state}"
+        )
+        finished = progress.state in {"complete", "failed", "cancelled"}
+        self.file_cancel_button.setEnabled(not finished)
+        if finished:
+            self._active_transfer_id = None
+
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
         self.connection_status.setText("Connected" if connected else "Disconnected")
@@ -272,8 +456,19 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(self._chat_service.last_text)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self._chat_service.remove_message_listener(self.incoming_message.emit)
+        self._chat_service.remove_message_listener(self._chat_listener)
+        if self._file_service is not None:
+            self._file_service.remove_progress_listener(self._file_listener)
         super().closeEvent(event)
 
 
-__all__ = ["COMMON_BAUD_RATES", "MainWindow"]
+def _format_bytes(value: float | int) -> str:
+    amount = float(value)
+    for suffix in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(amount) < 1024 or suffix == "TiB":
+            return f"{amount:.0f} {suffix}" if suffix == "B" else f"{amount:.1f} {suffix}"
+        amount /= 1024
+    raise AssertionError("unreachable")
+
+
+__all__ = ["COMMON_BAUD_RATES", "FileDropZone", "MainWindow"]
