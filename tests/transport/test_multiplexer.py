@@ -138,8 +138,10 @@ def test_tracked_stream_limit_requires_release_before_reuse():
     mux = Multiplexer(max_tracked_streams=2)
     mux.enqueue(OutboundItem(Priority.NORMAL, 1, b"a"))
     mux.enqueue(OutboundItem(Priority.NORMAL, 2, b"b"))
-    mux.pop()
-    mux.pop()
+    first = mux.pop()
+    second = mux.pop()
+    mux.task_done(first)
+    mux.task_done(second)
 
     assert mux.tracked_streams == 2
     with pytest.raises(QueueFullError, match="stream"):
@@ -157,8 +159,22 @@ def test_stream_cannot_be_released_while_it_has_queued_work():
     with pytest.raises(ValueError, match="queued"):
         mux.release_stream(7)
 
-    mux.pop()
+    item = mux.pop()
+    mux.task_done(item)
     mux.release_stream(7)
+    assert mux.tracked_streams == 0
+
+
+def test_stream_cannot_be_released_while_popped_item_is_in_flight():
+    mux = Multiplexer()
+    mux.enqueue(OutboundItem(Priority.NORMAL, 8, b"writing"))
+    item = mux.pop()
+
+    with pytest.raises(ValueError, match="in-flight"):
+        mux.release_stream(8)
+
+    mux.task_done(item)
+    mux.release_stream(8)
     assert mux.tracked_streams == 0
 
 

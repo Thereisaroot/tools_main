@@ -263,18 +263,21 @@ class SerialLink:
                     if self._multiplexer.closed:
                         raise MultiplexerClosed("outbound multiplexer was closed")
                     continue
-                if item.sequence is None:
-                    raise RuntimeError("multiplexer returned an item without a sequence")
-                frame = Frame(
-                    message_type=item.message_type,
-                    flags=item.flags,
-                    priority=int(item.priority),
-                    stream_id=item.stream_id,
-                    sequence=item.sequence,
-                    acknowledgement=item.acknowledgement,
-                    payload=item.payload,
-                )
-                self._write_all(encode_frame(frame))
+                try:
+                    if item.sequence is None:
+                        raise RuntimeError("multiplexer returned an item without a sequence")
+                    frame = Frame(
+                        message_type=item.message_type,
+                        flags=item.flags,
+                        priority=int(item.priority),
+                        stream_id=item.stream_id,
+                        sequence=item.sequence,
+                        acknowledgement=item.acknowledgement,
+                        payload=item.payload,
+                    )
+                    self._write_all(encode_frame(frame))
+                finally:
+                    self._multiplexer.task_done(item)
         except BaseException as error:
             if not self._stop_event.is_set():
                 self._request_stop(error, allow_synchronous_fallback=True)

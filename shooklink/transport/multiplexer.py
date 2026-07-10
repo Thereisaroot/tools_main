@@ -90,6 +90,7 @@ class Multiplexer:
         self._order = itertools.count()
         self._last_sequences: dict[int, int] = {}
         self._stream_priorities: dict[int, Priority] = {}
+        self._in_flight: dict[int, int] = {}
         self._max_items = max_items
         self._max_bytes = max_bytes
         self._max_priority_burst = max_priority_burst
@@ -234,7 +235,9 @@ class Multiplexer:
                     self._priority_streak += 1
                 else:
                     self._priority_streak = 0
-            return self._pop_priority_locked(selected_priority)
+            item = self._pop_priority_locked(selected_priority)
+            self._in_flight[item.stream_id] = self._in_flight.get(item.stream_id, 0) + 1
+            return item
 
     def empty(self) -> bool:
         with self._condition:
@@ -249,6 +252,7 @@ class Multiplexer:
             self._pointer_items.clear()
             self._last_sequences.clear()
             self._stream_priorities.clear()
+            self._in_flight.clear()
             self._queued_bytes = 0
             self._condition.notify_all()
 
@@ -259,8 +263,23 @@ class Multiplexer:
                 item.stream_id == stream_id for _priority, _order, item in self._queue
             ):
                 raise ValueError(f"stream {stream_id} still has queued work")
+            if self._in_flight.get(stream_id, 0):
+                raise ValueError(f"stream {stream_id} still has in-flight work")
             self._last_sequences.pop(stream_id, None)
             self._stream_priorities.pop(stream_id, None)
+
+    def task_done(self, item: OutboundItem) -> None:
+        _validate_item(item)
+        with self._condition:
+            count = self._in_flight.get(item.stream_id, 0)
+            if count == 0:
+                if self._closed:
+                    return
+                raise ValueError(f"stream {item.stream_id} has no in-flight work")
+            if count == 1:
+                del self._in_flight[item.stream_id]
+            else:
+                self._in_flight[item.stream_id] = count - 1
 
     def _ensure_open(self) -> None:
         if self._closed:
