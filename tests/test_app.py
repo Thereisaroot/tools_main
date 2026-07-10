@@ -141,7 +141,7 @@ def test_controller_autoconnects_only_when_saved_port_is_present(qtbot, tmp_path
 
     controller.close()
     assert core.close_calls == 1
-    assert executor.shutdown_calls == [(False, True)]
+    assert executor.shutdown_calls == [(True, True)]
     assert SettingsStore(tmp_path / "settings.json").load().peer_side == "left"
 
 

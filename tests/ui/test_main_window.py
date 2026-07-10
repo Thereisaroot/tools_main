@@ -295,6 +295,55 @@ def test_changed_peer_identity_is_blocked_in_connection_state(qtbot):
     assert not window.trust_button.isEnabled()
 
 
+def test_core_snapshot_gates_features_by_readiness_and_negotiation(qtbot, tmp_path):
+    bus = FakeBus(trusted=False)
+    files = FakeFileService(tmp_path / "downloads")
+    shell = FakeShellService()
+    input_service = FakeInputService()
+    window = MainWindow(ChatService(bus), files, shell, input_service)
+    qtbot.addWidget(window)
+
+    window.apply_core_snapshot(CoreSnapshot(0, CoreState.DISCONNECTED))
+    assert not window.send_plain_button.isEnabled()
+    assert not window.send_secure_button.isEnabled()
+    assert not window.file_select_button.isEnabled()
+    assert not window.open_shell_button.isEnabled()
+    assert not window.toggle_input_button.isEnabled()
+
+    window.apply_core_snapshot(
+        CoreSnapshot(
+            1,
+            CoreState.UNTRUSTED,
+            "peer",
+            "SHA256:peer",
+            TrustStatus.UNKNOWN,
+            features=frozenset({"chat", "files", "shell", "input"}),
+        )
+    )
+    assert window.send_plain_button.isEnabled()
+    assert not window.send_secure_button.isEnabled()
+    assert not window.file_select_button.isEnabled()
+
+    bus.trusted = True
+    window.apply_core_snapshot(
+        CoreSnapshot(
+            1,
+            CoreState.READY,
+            "peer",
+            "SHA256:peer",
+            TrustStatus.TRUSTED,
+            True,
+            True,
+            frozenset({"chat", "input"}),
+        )
+    )
+    assert window.send_plain_button.isEnabled()
+    assert window.send_secure_button.isEnabled()
+    assert not window.file_select_button.isEnabled()
+    assert not window.open_shell_button.isEnabled()
+    assert window.toggle_input_button.isEnabled()
+
+
 def test_file_drop_zone_accepts_local_files_only(tmp_path):
     local_path = tmp_path / "drop.txt"
     local_path.write_text("drop", encoding="utf-8")

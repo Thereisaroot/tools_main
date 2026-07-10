@@ -189,6 +189,8 @@ class MainWindow(QMainWindow):
         self._connecting = False
         self._connection_id = 0
         self._peer_fingerprint: str | None = None
+        self._secure_feature_available = True
+        self._input_feature_available = input_service is not None
         self._active_transfer_id: str | None = None
         self._file_transfers: OrderedDict[str, FileProgress] = OrderedDict()
         self._active_shell_session: str | None = None
@@ -673,6 +675,7 @@ class MainWindow(QMainWindow):
         self.auto_edge_checkbox.setEnabled(
             self._input_service is not None and not active
         )
+        self.toggle_input_button.setEnabled(self._input_feature_available)
 
     def _show_input_emergency(self, action: str) -> None:
         if action == "exit":
@@ -888,10 +891,48 @@ class MainWindow(QMainWindow):
             and not snapshot.local_approved
             and snapshot.fingerprint is not None
         )
+        features = snapshot.features
+        plain_available = (
+            snapshot.state
+            in {CoreState.UNTRUSTED, CoreState.CHANGED, CoreState.READY}
+            and "chat" in features
+        )
+        protected_available = snapshot.state is CoreState.READY
+        self._secure_feature_available = (
+            protected_available and "chat" in features
+        )
+        file_available = bool(
+            self._file_service is not None
+            and protected_available
+            and "files" in features
+        )
+        shell_available = bool(
+            self._shell_service is not None
+            and protected_available
+            and "shell" in features
+        )
+        self._input_feature_available = bool(
+            self._input_service is not None
+            and protected_available
+            and "input" in features
+        )
+        self.send_plain_button.setEnabled(plain_available)
+        self.file_drop_zone.setEnabled(file_available)
+        self.file_select_button.setEnabled(file_available)
+        if not file_available:
+            self.file_cancel_button.setEnabled(False)
+        self.open_shell_button.setEnabled(shell_available)
+        self.terminate_shell_button.setEnabled(
+            shell_available and self._active_shell_session is not None
+        )
+        self.toggle_input_button.setEnabled(self._input_feature_available)
         self.refresh_secure_state()
 
     def refresh_secure_state(self) -> None:
-        self.send_secure_button.setEnabled(self._chat_service.secure_available)
+        self.send_secure_button.setEnabled(
+            self._secure_feature_available
+            and self._chat_service.secure_available
+        )
 
     def _send_plain(self) -> None:
         self._run_send(self._chat_service.send_plain)

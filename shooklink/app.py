@@ -162,7 +162,7 @@ class ApplicationController(QObject):
             pass
         self._save_preferences()
         self._core.close()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
     def _connect_requested(self, port: str, baud_rate: int) -> None:
         if self._closed:

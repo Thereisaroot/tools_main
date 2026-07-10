@@ -356,6 +356,7 @@ class ShookLinkCore:
                 raise CoreError("peer disconnected during approval")
             connection.trust_status = TrustStatus.TRUSTED
         self._send_trust(connection_id)
+        self._refresh_input_if_ready(connection_id)
         self._publish_current()
 
     def send(
@@ -702,6 +703,7 @@ class ShookLinkCore:
                 if current is not None and current.connection_id == connection_id:
                     current.input_bound = True
         self._send_trust(connection_id)
+        self._refresh_input_if_ready(connection_id)
         self._publish_current()
 
     def _dispatch(self, message: Message, feature: str | None) -> None:
@@ -791,6 +793,23 @@ class ShookLinkCore:
                 listener(snapshot)
             except Exception:
                 logger.exception("core state listener failed")
+
+    def _refresh_input_if_ready(self, connection_id: int) -> None:
+        with self._lock:
+            connection = self._connection
+            refresh = bool(
+                self.input is not None
+                and connection is not None
+                and connection.connection_id == connection_id
+                and connection.input_bound
+                and self._trusted_locked()
+            )
+        if not refresh or self.input is None:
+            return
+        try:
+            self.input.connection_changed(True)
+        except Exception:
+            logger.exception("input capture could not refresh after trust")
 
     def _local_features(self) -> frozenset[str]:
         if self.input is None:

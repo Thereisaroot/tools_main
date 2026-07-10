@@ -155,7 +155,7 @@ class FakeProcessFactory:
         return process
 
 
-def build_core(tmp_path, name):
+def build_core(tmp_path, name, *, auto_edge_enabled=False):
     backend = FakeInputBackend()
     processes = FakeProcessFactory()
     core = ShookLinkCore(
@@ -165,6 +165,7 @@ def build_core(tmp_path, name):
         local_peer_id=name,
         input_backend=backend,
         process_factory=processes,
+        auto_edge_enabled=auto_edge_enabled,
     )
     return core, backend, processes
 
@@ -589,5 +590,39 @@ def test_trust_waits_until_local_hello_has_been_queued(tmp_path):
         )
     finally:
         release_local_hello.set()
+        left.close()
+        right.close()
+
+
+def test_ready_transition_starts_persisted_auto_edge_capture(tmp_path):
+    left, left_input, _ = build_core(
+        tmp_path,
+        "left-auto-edge",
+        auto_edge_enabled=True,
+    )
+    right, right_input, _ = build_core(
+        tmp_path,
+        "right-auto-edge",
+        auto_edge_enabled=True,
+    )
+    left_endpoint, right_endpoint = endpoint_pair()
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        assert not left_input.capture_running
+        assert not right_input.capture_running
+
+        approve_pair(left, right)
+
+        assert wait_for(
+            lambda: left_input.capture_running
+            and right_input.capture_running
+        )
+    finally:
         left.close()
         right.close()
