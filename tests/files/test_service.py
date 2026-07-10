@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from shooklink.files.service import (
+    CHUNK_SIZE,
+    WINDOW_SIZE,
     FileHashMismatch,
     FileOffer,
     FileProtocolError,
@@ -492,6 +494,58 @@ def test_source_startup_failure_cleans_sender_and_reliably_cancels_peer(
     service.poll(now=time.monotonic() + RETRANSMIT_TIMEOUT * 3)
 
     assert bus.sent == []
+    service.close()
+
+
+def test_mid_transfer_source_failure_cleans_sender_and_reliably_cancels_peer(
+    tmp_path,
+):
+    source = tmp_path / "source-mid-transfer.bin"
+    source.write_bytes(b"x" * (CHUNK_SIZE * (WINDOW_SIZE + 1)))
+    bus = QueueBus()
+    service = FileService(
+        bus,
+        tmp_path / "downloads",
+        max_outgoing_transfers=1,
+    )
+    progress = []
+    service.add_progress_listener(progress.append)
+    transfer_id = service.send_file(source).result(timeout=2)
+    service.handle_message(
+        Message(MessageType.FILE_ACCEPT, {"transfer_id": transfer_id})
+    )
+    source.write_bytes(b"")
+    bus.sent.clear()
+
+    service.handle_message(
+        Message(
+            MessageType.FILE_ACK,
+            {
+                "transfer_id": transfer_id,
+                "base": WINDOW_SIZE,
+                "span": 0,
+                "bitmap": "0",
+            },
+        )
+    )
+
+    assert progress[-1].state == "failed"
+    assert [message.message_type for message, _secure, _priority in bus.sent] == [
+        MessageType.FILE_CANCEL
+    ]
+    with pytest.raises(FileTransferError, match="capacity"):
+        replacement = tmp_path / "replacement.bin"
+        replacement.write_bytes(b"replacement")
+        service.send_file(replacement)
+
+    service.handle_message(
+        Message(
+            MessageType.FILE_CANCEL,
+            {"transfer_id": transfer_id, "reason": "ack"},
+        )
+    )
+    replacement = tmp_path / "replacement.bin"
+    assert service.send_file(replacement).result(timeout=2)
     service.close()
 
 
@@ -1104,6 +1158,51 @@ def test_unacknowledged_cancellation_counts_against_outgoing_capacity(tmp_path):
         service.send_file(second)
 
     service.close()
+
+
+def test_cancel_reserves_capacity_before_reentrant_progress_listener(tmp_path):
+    first = tmp_path / "first-reentrant.bin"
+    second = tmp_path / "second-reentrant.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    service = FileService(
+        QueueBus(),
+        tmp_path / "downloads",
+        max_outgoing_transfers=1,
+    )
+    transfer_id = service.send_file(first).result(timeout=2)
+    errors = []
+
+    def listener(progress):
+        if progress.transfer_id == transfer_id and progress.state == "cancelled":
+            try:
+                service.send_file(second)
+            except Exception as error:
+                errors.append(error)
+
+    service.add_progress_listener(listener)
+    service.cancel(transfer_id)
+
+    assert len(errors) == 1
+    assert "capacity" in str(errors[0])
+    service.close()
+
+
+def test_reentrant_close_cannot_be_followed_by_pending_cancel_insertion(tmp_path):
+    source = tmp_path / "close-reentrant.bin"
+    source.write_bytes(b"source")
+    service = FileService(QueueBus(), tmp_path / "downloads")
+    transfer_id = service.send_file(source).result(timeout=2)
+
+    def listener(progress):
+        if progress.transfer_id == transfer_id and progress.state == "cancelled":
+            service.close()
+
+    service.add_progress_listener(listener)
+    service.cancel(transfer_id)
+
+    assert service._closed is True
+    assert service._pending_cancels == {}
 
 
 def test_prepared_transfer_keeps_capacity_reserved_until_registration(

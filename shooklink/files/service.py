@@ -844,6 +844,7 @@ class FileService:
                 direction = "outgoing"
                 self._outgoing.pop(transfer_id, None)
                 transfer.cancel()
+                self._queue_cancel_locked(transfer_id, direction)
                 self._notify_outgoing(transfer, "cancelled")
             else:
                 transfer = self._incoming.get(transfer_id)
@@ -852,8 +853,8 @@ class FileService:
                 direction = "incoming"
                 self._incoming.pop(transfer_id, None)
                 self._remember_cancelled_locked(transfer.offer.transfer_id, transfer.offer)
+                self._queue_cancel_locked(transfer_id, direction)
                 self._notify_incoming(transfer, "cancelled")
-            self._queue_cancel_locked(transfer_id, direction)
 
     def close(self) -> None:
         self._timer_stop.set()
@@ -1061,7 +1062,14 @@ class FileService:
             transfer = self._outgoing.get(transfer_id)
             if transfer is None:
                 return
-            messages = transfer.acknowledge(message.metadata)
+            try:
+                messages = transfer.acknowledge(message.metadata)
+            except (OSError, FileTransferError):
+                self._outgoing.pop(transfer_id, None)
+                transfer.cancel()
+                self._queue_cancel_locked(transfer_id, "outgoing")
+                self._notify_outgoing(transfer, "failed")
+                return
             self._send_many(messages)
             if self._outgoing.get(transfer_id) is transfer:
                 self._notify_outgoing(transfer, "sending")
