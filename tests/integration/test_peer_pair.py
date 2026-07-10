@@ -470,3 +470,124 @@ def test_peer_approval_is_scoped_to_the_current_connection(tmp_path):
     finally:
         left.close()
         right.close()
+
+
+def test_secure_sequence_reservation_encryption_and_enqueue_are_serialized(tmp_path):
+    left, *_ = build_core(tmp_path, "left-concurrent")
+    right, *_ = build_core(tmp_path, "right-concurrent")
+    left_endpoint, right_endpoint = endpoint_pair()
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+
+    received = []
+    right.chat.add_message_listener(received.append)
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        approve_pair(left, right)
+        connection = left._connection
+        assert connection is not None
+        original_encrypt = connection.secure_session.encrypt
+        first_encrypt_started = threading.Event()
+        release_first_encrypt = threading.Event()
+
+        def delayed_encrypt(
+            stream_id,
+            sequence,
+            plaintext,
+            *,
+            associated_data=b"",
+        ):
+            if stream_id == int(MessageType.CHAT_SECURE) * 4 + int(Priority.NORMAL):
+                if not first_encrypt_started.is_set():
+                    first_encrypt_started.set()
+                    assert release_first_encrypt.wait(2)
+            return original_encrypt(
+                stream_id,
+                sequence,
+                plaintext,
+                associated_data=associated_data,
+            )
+
+        connection.secure_session.encrypt = delayed_encrypt
+        errors = []
+
+        def send(text):
+            try:
+                left.chat.send_secure(text)
+            except BaseException as error:
+                errors.append(error)
+
+        first = threading.Thread(target=send, args=("first",))
+        second = threading.Thread(target=send, args=("second",))
+        first.start()
+        assert first_encrypt_started.wait(1)
+        second.start()
+        time.sleep(0.02)
+        release_first_encrypt.set()
+        first.join(2)
+        second.join(2)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert wait_for(
+            lambda: [item.text for item in received] == ["first", "second"]
+        )
+    finally:
+        left.close()
+        right.close()
+
+
+def test_trust_waits_until_local_hello_has_been_queued(tmp_path):
+    left, *_ = build_core(tmp_path, "left-hello-order")
+    right, *_ = build_core(tmp_path, "right-hello-order")
+    left_endpoint, right_endpoint = endpoint_pair()
+    left.connect_endpoint(left_endpoint)
+
+    original_send_internal = right._send_internal
+    local_hello_started = threading.Event()
+    release_local_hello = threading.Event()
+
+    def delay_local_hello(
+        connection_id,
+        message,
+        *,
+        secure,
+        priority,
+        allow_untrusted,
+    ):
+        if message.message_type is MessageType.HELLO:
+            local_hello_started.set()
+            assert release_local_hello.wait(2)
+        return original_send_internal(
+            connection_id,
+            message,
+            secure=secure,
+            priority=priority,
+            allow_untrusted=allow_untrusted,
+        )
+
+    right._send_internal = delay_local_hello
+    connector = threading.Thread(
+        target=right.connect_endpoint,
+        args=(right_endpoint,),
+    )
+    connector.start()
+    try:
+        assert local_hello_started.wait(1)
+        time.sleep(0.02)
+        release_local_hello.set()
+        connector.join(2)
+
+        assert not connector.is_alive()
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+    finally:
+        release_local_hello.set()
+        left.close()
+        right.close()

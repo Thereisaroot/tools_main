@@ -92,6 +92,8 @@ class _Connection:
     last_accepts_fingerprint: str | None = None
     trust_sent: bool = False
     input_bound: bool = False
+    local_hello_sent: bool = False
+    remote_hello_received: bool = False
 
 
 _FEATURE_BY_TYPE = {
@@ -185,6 +187,7 @@ class ShookLinkCore:
         self.local_peer_id = local_peer_id
         self.debug = bool(debug)
         self._lock = threading.RLock()
+        self._send_lock = threading.RLock()
         self._connection: _Connection | None = None
         self._next_connection_id = 1
         self._last_connection_id = 0
@@ -310,6 +313,17 @@ class ShookLinkCore:
                 priority=Priority.INTERACTIVE,
                 allow_untrusted=True,
             )
+            with self._lock:
+                current = self._connection
+                send_trust = bool(
+                    current is not None
+                    and current.connection_id == connection_id
+                    and current.remote_hello_received
+                )
+                if current is not None and current.connection_id == connection_id:
+                    current.local_hello_sent = True
+            if send_trust:
+                self._send_trust(connection_id)
         except BaseException:
             try:
                 link.close()
@@ -418,6 +432,24 @@ class ShookLinkCore:
         )
 
     def _send_internal(
+        self,
+        connection_id: int,
+        message: Message,
+        *,
+        secure: bool,
+        priority: Priority,
+        allow_untrusted: bool,
+    ) -> None:
+        with self._send_lock:
+            self._send_internal_serialized(
+                connection_id,
+                message,
+                secure=secure,
+                priority=priority,
+                allow_untrusted=allow_untrusted,
+            )
+
+    def _send_internal_serialized(
         self,
         connection_id: int,
         message: Message,
@@ -622,7 +654,14 @@ class ShookLinkCore:
                 return
             secure_session = connection.secure_session
         secure_session.receive_hello(message.body)
-        self._send_trust(connection_id)
+        with self._lock:
+            connection = self._connection
+            if connection is None or connection.connection_id != connection_id:
+                return
+            connection.remote_hello_received = True
+            send_trust = connection.local_hello_sent
+        if send_trust:
+            self._send_trust(connection_id)
 
     def _handle_trust(self, connection_id: int, message: Message) -> None:
         metadata = _validate_trust_metadata(message.metadata)
