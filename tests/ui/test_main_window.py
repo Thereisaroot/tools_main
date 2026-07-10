@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 from shooklink.chat.service import ChatService
 from shooklink.files.service import FileProgress
 from shooklink.protocol.messages import Message, MessageType
+from shooklink.shell.service import ShellOutput, ShellState
 from shooklink.ui.main_window import FileDropZone, MainWindow
 
 
@@ -54,6 +55,53 @@ class FakeFileService:
     def emit(self, progress):
         for listener in tuple(self.listeners):
             listener(progress)
+
+
+class FakeShellService:
+    def __init__(self):
+        self.allowed = False
+        self.outputs = []
+        self.states = []
+        self.opened = []
+        self.inputs = []
+        self.resizes = []
+        self.closed = []
+
+    def add_output_listener(self, listener):
+        self.outputs.append(listener)
+
+    def remove_output_listener(self, listener):
+        self.outputs.remove(listener)
+
+    def add_state_listener(self, listener):
+        self.states.append(listener)
+
+    def remove_state_listener(self, listener):
+        self.states.remove(listener)
+
+    def set_allow_remote_shell(self, allowed):
+        self.allowed = allowed
+
+    def open_remote(self, *, columns, rows):
+        self.opened.append((columns, rows))
+        return "a" * 32
+
+    def send_input(self, session_id, data):
+        self.inputs.append((session_id, data))
+
+    def resize(self, session_id, columns, rows):
+        self.resizes.append((session_id, columns, rows))
+
+    def close_session(self, session_id):
+        self.closed.append(session_id)
+
+    def emit_output(self, output):
+        for listener in tuple(self.outputs):
+            listener(output)
+
+    def emit_state(self, state):
+        for listener in tuple(self.states):
+            listener(state)
 
 
 def test_main_window_sends_korean_and_punctuation(qtbot):
@@ -150,9 +198,74 @@ def test_file_drop_progress_and_cancel_leave_chat_enabled(qtbot, tmp_path):
         )
     )
     assert window.file_progress_bar.value() == 50
+    assert "50%" in window.file_progress_label.text()
     assert "2.0 KiB/s" in window.file_progress_label.text()
     assert window.send_plain_button.isEnabled()
     assert window.send_secure_button.isEnabled()
 
     qtbot.mouseClick(window.file_cancel_button, Qt.MouseButton.LeftButton)
     assert files.cancelled == ["f" * 32]
+
+    final_path = tmp_path / "downloads" / path.name
+    files.emit(
+        FileProgress(
+            "f" * 32,
+            path.name,
+            "incoming",
+            10,
+            10,
+            "complete",
+            final_path,
+            1024.0,
+        )
+    )
+    assert str(final_path) in window.file_progress_label.text()
+
+
+def test_unrelated_completion_does_not_clear_active_transfer(qtbot, tmp_path):
+    files = FakeFileService(tmp_path / "downloads")
+    window = MainWindow(ChatService(FakeBus()), files)
+    qtbot.addWidget(window)
+    window.show()
+    first = FileProgress("1" * 32, "first", "outgoing", 1, 10, "sending")
+    second = FileProgress("2" * 32, "second", "outgoing", 1, 10, "sending")
+
+    files.emit(first)
+    files.emit(second)
+    files.emit(
+        FileProgress(
+            first.transfer_id,
+            first.name,
+            first.direction,
+            10,
+            10,
+            "complete",
+            tmp_path / "first",
+        )
+    )
+    qtbot.mouseClick(window.file_cancel_button, Qt.MouseButton.LeftButton)
+
+    assert files.cancelled == [second.transfer_id]
+
+
+def test_remote_shell_controls_open_terminal_and_forward_output(qtbot):
+    shell = FakeShellService()
+    window = MainWindow(ChatService(FakeBus()), None, shell)
+    qtbot.addWidget(window)
+    window.show()
+
+    qtbot.mouseClick(window.allow_shell_checkbox, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window.open_shell_button, Qt.MouseButton.LeftButton)
+    session_id = "a" * 32
+    shell.emit_state(ShellState(session_id, "outgoing", "active"))
+    shell.emit_output(ShellOutput(session_id, b"SHELL_OK"))
+
+    assert shell.allowed is True
+    assert shell.opened == [(100, 30)]
+    assert window.terminal_window is not None
+    qtbot.waitUntil(
+        lambda: "SHELL_OK" in window.terminal_window.terminal_view.toPlainText()
+    )
+
+    qtbot.mouseClick(window.terminate_shell_button, Qt.MouseButton.LeftButton)
+    assert shell.closed[-1] == session_id

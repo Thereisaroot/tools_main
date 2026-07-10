@@ -2,6 +2,6 @@ PySide6>=6.8,<7
 pyserial>=3.5,<4
 cryptography>=44,<47
 pyte>=0.8.2,<1
-pywinpty>=2.0.13,<3; sys_platform == "win32"
+pywinpty>=3.0.5,<4; sys_platform == "win32"
 pyobjc-framework-Quartz>=10.3,<13; sys_platform == "darwin"
 pyobjc-framework-Cocoa>=10.3,<13; sys_platform == "darwin"

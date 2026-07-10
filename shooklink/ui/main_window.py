@@ -19,6 +19,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -38,6 +39,8 @@ from serial.tools import list_ports
 
 from shooklink.chat.service import ChatMessage, ChatService
 from shooklink.files.service import FileProgress
+from shooklink.shell.service import ShellOutput, ShellState
+from shooklink.ui.terminal_window import TerminalWindow
 
 COMMON_BAUD_RATES = (
     115_200,
@@ -60,6 +63,26 @@ class FileUiService(Protocol):
     def add_progress_listener(self, listener) -> None: ...
 
     def remove_progress_listener(self, listener) -> None: ...
+
+
+class ShellUiService(Protocol):
+    def add_output_listener(self, listener) -> None: ...
+
+    def remove_output_listener(self, listener) -> None: ...
+
+    def add_state_listener(self, listener) -> None: ...
+
+    def remove_state_listener(self, listener) -> None: ...
+
+    def set_allow_remote_shell(self, allowed: bool) -> None: ...
+
+    def open_remote(self, *, columns: int, rows: int) -> str: ...
+
+    def send_input(self, session_id: str, data: bytes) -> None: ...
+
+    def resize(self, session_id: str, columns: int, rows: int) -> None: ...
+
+    def close_session(self, session_id: str) -> None: ...
 
 
 class FileDropZone(QFrame):
@@ -109,20 +132,29 @@ class MainWindow(QMainWindow):
     incoming_message = Signal(object)
     file_progress = Signal(object)
     file_prepared = Signal(object)
+    shell_output = Signal(object)
+    shell_state = Signal(object)
 
     def __init__(
         self,
         chat_service: ChatService,
         file_service: FileUiService | None = None,
+        shell_service: ShellUiService | None = None,
     ) -> None:
         super().__init__()
         self._chat_service = chat_service
         self._file_service = file_service
+        self._shell_service = shell_service
         self._shortcuts: list[QShortcut] = []
         self._connected = False
         self._active_transfer_id: str | None = None
+        self._file_transfers: dict[str, FileProgress] = {}
+        self._active_shell_session: str | None = None
+        self.terminal_window: TerminalWindow | None = None
         self._chat_listener = self.incoming_message.emit
         self._file_listener = self.file_progress.emit
+        self._shell_output_listener = self.shell_output.emit
+        self._shell_state_listener = self.shell_state.emit
         self.setWindowTitle("ShookLink")
         self.setMinimumSize(760, 640)
         self.resize(920, 760)
@@ -132,9 +164,14 @@ class MainWindow(QMainWindow):
         self.incoming_message.connect(self._show_received_message)
         self.file_progress.connect(self._show_file_progress)
         self.file_prepared.connect(self._file_was_prepared)
+        self.shell_output.connect(self._show_shell_output)
+        self.shell_state.connect(self._show_shell_state)
         self._chat_service.add_message_listener(self._chat_listener)
         if self._file_service is not None:
             self._file_service.add_progress_listener(self._file_listener)
+        if self._shell_service is not None:
+            self._shell_service.add_output_listener(self._shell_output_listener)
+            self._shell_service.add_state_listener(self._shell_state_listener)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -216,6 +253,33 @@ class MainWindow(QMainWindow):
         self.file_cancel_button.setEnabled(False)
         self.open_download_button.setEnabled(files_enabled)
         layout.addWidget(file_panel)
+
+        shell_panel = QFrame()
+        shell_panel.setObjectName("panel")
+        shell_layout = QHBoxLayout(shell_panel)
+        shell_layout.setContentsMargins(18, 13, 18, 13)
+        shell_layout.setSpacing(10)
+        shell_title = QLabel("REMOTE SHELL")
+        shell_title.setObjectName("sectionLabel")
+        self.allow_shell_checkbox = QCheckBox("Allow Remote Shell")
+        self.allow_shell_checkbox.toggled.connect(self._set_shell_permission)
+        self.open_shell_button = QPushButton("Open Remote Shell")
+        self.open_shell_button.clicked.connect(self._open_remote_shell)
+        self.terminate_shell_button = QPushButton("Terminate Session")
+        self.terminate_shell_button.clicked.connect(self._terminate_shell)
+        self.shell_status = QLabel("Disabled")
+        self.shell_status.setObjectName("shellStatus")
+        shell_layout.addWidget(shell_title)
+        shell_layout.addWidget(self.allow_shell_checkbox)
+        shell_layout.addStretch(1)
+        shell_layout.addWidget(self.shell_status)
+        shell_layout.addWidget(self.open_shell_button)
+        shell_layout.addWidget(self.terminate_shell_button)
+        shell_enabled = self._shell_service is not None
+        self.allow_shell_checkbox.setEnabled(shell_enabled)
+        self.open_shell_button.setEnabled(shell_enabled)
+        self.terminate_shell_button.setEnabled(False)
+        layout.addWidget(shell_panel)
 
         received_label = QLabel("LAST RECEIVED")
         received_label.setObjectName("sectionLabel")
@@ -310,6 +374,7 @@ class MainWindow(QMainWindow):
             }
             QLabel#messageKind, QLabel#actionStatus { color: #66756f; }
             QLabel#fileProgress { color: #526761; font-size: 11px; }
+            QLabel#shellStatus { color: #526761; font-size: 11px; }
             QProgressBar {
                 min-height: 8px; max-height: 8px; border: none; border-radius: 4px;
                 background: #cbc7bd;
@@ -403,21 +468,117 @@ class MainWindow(QMainWindow):
             QUrl.fromLocalFile(str(self._file_service.download_dir.resolve()))
         )
 
+    def _set_shell_permission(self, allowed: bool) -> None:
+        if self._shell_service is None:
+            return
+        self._shell_service.set_allow_remote_shell(allowed)
+        if self._active_shell_session is None:
+            self.shell_status.setText("Armed" if allowed else "Disabled")
+
+    def _open_remote_shell(self) -> None:
+        if self._shell_service is None:
+            return
+        try:
+            session_id = self._shell_service.open_remote(columns=100, rows=30)
+        except Exception as error:
+            self.shell_status.setText(str(error))
+            return
+        self._active_shell_session = session_id
+        self.shell_status.setText("Requesting")
+        terminal = TerminalWindow(
+            session_id,
+            lambda data, sid=session_id: self._shell_service.send_input(sid, data),
+            lambda columns, rows, sid=session_id: self._shell_service.resize(
+                sid, columns, rows
+            ),
+            lambda sid=session_id: self._shell_service.close_session(sid),
+        )
+        terminal.status_label.setText("Requesting remote shell")
+        self.terminal_window = terminal
+        terminal.show()
+        self.terminate_shell_button.setEnabled(True)
+
+    def _terminate_shell(self) -> None:
+        if self._shell_service is None or self._active_shell_session is None:
+            return
+        session_id = self._active_shell_session
+        self._shell_service.close_session(session_id)
+
+    def _show_shell_output(self, output: ShellOutput) -> None:
+        if (
+            self.terminal_window is not None
+            and self.terminal_window.session_id == output.session_id
+        ):
+            self.terminal_window.feed_output(output.data)
+
+    def _show_shell_state(self, state: ShellState) -> None:
+        if state.state in {"requesting", "active"}:
+            self._active_shell_session = state.session_id
+        if state.state == "active":
+            self.shell_status.setText(
+                "Executing remote shell"
+                if state.direction == "incoming"
+                else "Remote shell active"
+            )
+            self.terminate_shell_button.setEnabled(True)
+            if (
+                state.direction == "outgoing"
+                and self.terminal_window is not None
+                and self.terminal_window.session_id == state.session_id
+            ):
+                self.terminal_window.status_label.setText("Remote shell connected")
+            return
+        if state.state in {"denied", "exited"}:
+            self.shell_status.setText(
+                f"Denied: {state.reason}" if state.state == "denied" else "Shell exited"
+            )
+            if (
+                self.terminal_window is not None
+                and self.terminal_window.session_id == state.session_id
+            ):
+                self.terminal_window.mark_exited(state.exit_code)
+            if self._active_shell_session == state.session_id:
+                self._active_shell_session = None
+                self.terminate_shell_button.setEnabled(False)
+
     def _show_file_progress(self, progress: FileProgress) -> None:
-        self._active_transfer_id = progress.transfer_id
+        self._file_transfers[progress.transfer_id] = progress
+        finished = progress.state in {"complete", "failed", "cancelled"}
+        if not finished:
+            self._active_transfer_id = progress.transfer_id
+        elif self._active_transfer_id not in {None, progress.transfer_id}:
+            return
+        elif self._active_transfer_id == progress.transfer_id:
+            remaining = [
+                item
+                for item in self._file_transfers.values()
+                if item.state not in {"complete", "failed", "cancelled"}
+            ]
+            if remaining:
+                replacement = remaining[-1]
+                self._active_transfer_id = replacement.transfer_id
+                self._render_file_progress(replacement)
+                return
+            self._active_transfer_id = None
+        self._render_file_progress(progress)
+
+    def _render_file_progress(self, progress: FileProgress) -> None:
         percent = 100 if progress.total == 0 else round(
             100 * progress.transferred / progress.total
         )
         self.file_progress_bar.setValue(max(0, min(100, percent)))
         self.file_progress_label.setText(
-            f"{progress.name} · {_format_bytes(progress.transferred)} / "
+            f"{progress.name} · {percent}% · {_format_bytes(progress.transferred)} / "
             f"{_format_bytes(progress.total)} · "
             f"{_format_bytes(progress.throughput_bps)}/s · {progress.state}"
+            + (
+                f" · {progress.path}"
+                if progress.state == "complete" and progress.path is not None
+                else ""
+            )
         )
         finished = progress.state in {"complete", "failed", "cancelled"}
         self.file_cancel_button.setEnabled(not finished)
-        if finished:
-            self._active_transfer_id = None
 
     def set_connected(self, connected: bool) -> None:
         self._connected = connected
@@ -459,6 +620,11 @@ class MainWindow(QMainWindow):
         self._chat_service.remove_message_listener(self._chat_listener)
         if self._file_service is not None:
             self._file_service.remove_progress_listener(self._file_listener)
+        if self._shell_service is not None:
+            self._shell_service.remove_output_listener(self._shell_output_listener)
+            self._shell_service.remove_state_listener(self._shell_state_listener)
+        if self.terminal_window is not None:
+            self.terminal_window.close()
         super().closeEvent(event)
 
 
