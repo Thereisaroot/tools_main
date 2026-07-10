@@ -365,6 +365,19 @@ def test_concurrent_close_waits_for_endpoint_finalization_and_cause():
         link.close()
 
 
+def test_initiating_close_timeout_includes_blocking_endpoint_close():
+    endpoint = BlockingBrokenWriteEndpoint()
+    link = SerialLink(endpoint, lambda frame: None, lambda error: None)
+    started_at = time.monotonic()
+
+    with pytest.raises(LinkCloseTimeout):
+        link.close(timeout=0.05)
+
+    assert time.monotonic() - started_at < 0.15
+    endpoint.release_close.set()
+    link.close(timeout=1)
+
+
 def test_on_frame_callback_can_close_its_own_link():
     left_endpoint, right_endpoint = endpoint_pair()
     callback_errors = []

@@ -71,12 +71,12 @@ class SerialLink:
         self._stop_event = threading.Event()
         self._stop_finalized = threading.Event()
         self._state = _LinkState.NEW
-        self._endpoint_close_attempted = False
         self._endpoint_close_error: BaseException | None = None
         self._terminal_cause: BaseException | None = None
         self._disconnect_notified = False
         self._reader_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
+        self._finalizer_thread: threading.Thread | None = None
         self._started_threads: list[threading.Thread] = []
 
     @classmethod
@@ -147,6 +147,7 @@ class SerialLink:
 
         if startup_error is not None:
             self._request_stop(startup_error)
+            self._stop_finalized.wait(2.0)
             self.wait_closed(2.0)
             raise startup_error
 
@@ -259,6 +260,8 @@ class SerialLink:
             raise LinkClosedError("serial link closed during write")
 
     def _request_stop(self, error: BaseException | None) -> None:
+        callback = None
+        callback_error: BaseException | None = None
         with self._lifecycle_lock:
             if self._state in (_LinkState.STOPPING, _LinkState.CLOSED):
                 return
@@ -266,15 +269,33 @@ class SerialLink:
             self._terminal_cause = error
             self._stop_event.set()
             self._multiplexer.close()
-            should_close_endpoint = not self._endpoint_close_attempted
-            self._endpoint_close_attempted = True
-
-        close_error: BaseException | None = None
-        if should_close_endpoint:
             try:
-                self._endpoint.close()
-            except BaseException as endpoint_error:
-                close_error = endpoint_error
+                self._finalizer_thread = threading.Thread(
+                    target=self._finalize_stop,
+                    name="shooklink-serial-finalizer",
+                    daemon=True,
+                )
+                self._finalizer_thread.start()
+            except BaseException as start_error:
+                self._endpoint_close_error = start_error
+                if self._terminal_cause is None:
+                    self._terminal_cause = start_error
+                self._state = _LinkState.CLOSED
+                callback_error = self._terminal_cause
+                if not self._disconnect_notified:
+                    self._disconnect_notified = True
+                    callback = self._on_disconnect
+                self._stop_finalized.set()
+
+        if callback is not None:
+            self._invoke_disconnect(callback, callback_error)
+
+    def _finalize_stop(self) -> None:
+        close_error: BaseException | None = None
+        try:
+            self._endpoint.close()
+        except BaseException as endpoint_error:
+            close_error = endpoint_error
 
         with self._lifecycle_lock:
             if close_error is not None:
@@ -290,10 +311,17 @@ class SerialLink:
 
         self._stop_finalized.set()
         if callback is not None:
-            try:
-                callback(callback_error)
-            except BaseException:
-                logger.exception("serial disconnect callback failed")
+            self._invoke_disconnect(callback, callback_error)
+
+    @staticmethod
+    def _invoke_disconnect(
+        callback: Callable[[BaseException | None], None],
+        error: BaseException | None,
+    ) -> None:
+        try:
+            callback(error)
+        except BaseException:
+            logger.exception("serial disconnect callback failed")
 
 
 __all__ = [
