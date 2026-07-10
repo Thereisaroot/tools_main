@@ -1,0 +1,279 @@
+"""Primary ShookLink application window."""
+
+from __future__ import annotations
+
+import sys
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QCloseEvent, QFont, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPlainTextEdit,
+    QPushButton,
+    QSizePolicy,
+    QSpacerItem,
+    QVBoxLayout,
+    QWidget,
+)
+from serial.tools import list_ports
+
+from shooklink.chat.service import ChatMessage, ChatService
+
+COMMON_BAUD_RATES = (
+    115_200,
+    230_400,
+    460_800,
+    921_600,
+    1_000_000,
+    1_500_000,
+    2_000_000,
+)
+
+
+class MainWindow(QMainWindow):
+    """Connection shell and chat interface shared by macOS and Windows."""
+
+    connect_requested = Signal(str, int)
+    incoming_message = Signal(object)
+
+    def __init__(self, chat_service: ChatService) -> None:
+        super().__init__()
+        self._chat_service = chat_service
+        self._shortcuts: list[QShortcut] = []
+        self._connected = False
+        self.setWindowTitle("ShookLink")
+        self.setMinimumSize(760, 640)
+        self.resize(920, 760)
+        self._build_ui()
+        self._install_shortcuts()
+        self._refresh_ports()
+        self.incoming_message.connect(self._show_received_message)
+        self._chat_service.add_message_listener(self.incoming_message.emit)
+
+    def _build_ui(self) -> None:
+        root = QWidget(self)
+        root.setObjectName("root")
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(28, 24, 28, 28)
+        layout.setSpacing(18)
+
+        heading_row = QHBoxLayout()
+        title = QLabel("SHOOKLINK")
+        title.setObjectName("title")
+        subtitle = QLabel("SERIAL PEER LINK")
+        subtitle.setObjectName("subtitle")
+        heading_row.addWidget(title)
+        heading_row.addSpacing(12)
+        heading_row.addWidget(subtitle)
+        heading_row.addItem(
+            QSpacerItem(0, 0, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        )
+        self.connection_status = QLabel("Disconnected")
+        self.connection_status.setObjectName("connectionStatus")
+        heading_row.addWidget(self.connection_status)
+        layout.addLayout(heading_row)
+
+        connection = QFrame()
+        connection.setObjectName("panel")
+        connection_layout = QGridLayout(connection)
+        connection_layout.setContentsMargins(18, 16, 18, 16)
+        connection_layout.setHorizontalSpacing(12)
+        connection_layout.addWidget(QLabel("SERIAL PORT"), 0, 0)
+        connection_layout.addWidget(QLabel("BAUD"), 0, 1)
+        self.port_combo = QComboBox()
+        self.port_combo.setEditable(True)
+        self.port_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.baud_combo = QComboBox()
+        self.baud_combo.setEditable(True)
+        self.baud_combo.addItems([str(rate) for rate in COMMON_BAUD_RATES])
+        self.baud_combo.setCurrentText("115200")
+        self.connect_button = QPushButton("Connect")
+        self.connect_button.setObjectName("connectButton")
+        self.connect_button.clicked.connect(self._request_connection)
+        connection_layout.addWidget(self.port_combo, 1, 0)
+        connection_layout.addWidget(self.baud_combo, 1, 1)
+        connection_layout.addWidget(self.connect_button, 1, 2)
+        connection_layout.setColumnStretch(0, 3)
+        connection_layout.setColumnStretch(1, 1)
+        layout.addWidget(connection)
+
+        received_label = QLabel("LAST RECEIVED")
+        received_label.setObjectName("sectionLabel")
+        layout.addWidget(received_label)
+        self.received_view = QPlainTextEdit()
+        self.received_view.setObjectName("receivedView")
+        self.received_view.setReadOnly(True)
+        self.received_view.setPlaceholderText("Incoming text appears here")
+        self.received_view.setMinimumHeight(145)
+        layout.addWidget(self.received_view, 1)
+
+        copy_row = QHBoxLayout()
+        self.received_kind = QLabel("No message")
+        self.received_kind.setObjectName("messageKind")
+        copy_row.addWidget(self.received_kind)
+        copy_row.addStretch(1)
+        self.copy_last_button = QPushButton("Copy Last Message")
+        self.copy_secure_button = QPushButton("Copy Last Secure Message")
+        self.copy_last_button.clicked.connect(self._copy_last)
+        self.copy_secure_button.clicked.connect(self._copy_last_secure)
+        copy_row.addWidget(self.copy_last_button)
+        copy_row.addWidget(self.copy_secure_button)
+        layout.addLayout(copy_row)
+
+        editor_label = QLabel("MESSAGE")
+        editor_label.setObjectName("sectionLabel")
+        layout.addWidget(editor_label)
+        self.message_editor = QPlainTextEdit()
+        self.message_editor.setObjectName("messageEditor")
+        self.message_editor.setPlaceholderText("Write or paste text")
+        self.message_editor.setMinimumHeight(180)
+        self.message_editor.setTabChangesFocus(False)
+        layout.addWidget(self.message_editor, 2)
+
+        send_row = QHBoxLayout()
+        self.action_status = QLabel("")
+        self.action_status.setObjectName("actionStatus")
+        send_row.addWidget(self.action_status)
+        send_row.addStretch(1)
+        self.send_plain_button = QPushButton("Send Plain")
+        self.send_plain_button.setObjectName("plainButton")
+        self.send_secure_button = QPushButton("Send Secure")
+        self.send_secure_button.setObjectName("secureButton")
+        self.send_secure_button.setEnabled(self._chat_service.secure_available)
+        self.send_plain_button.clicked.connect(self._send_plain)
+        self.send_secure_button.clicked.connect(self._send_secure)
+        send_row.addWidget(self.send_plain_button)
+        send_row.addWidget(self.send_secure_button)
+        layout.addLayout(send_row)
+
+        self.setCentralWidget(root)
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget#root { background: #f2efe7; color: #172421; }
+            QLabel#title { color: #0b3d36; font-size: 23px; font-weight: 800; }
+            QLabel#subtitle { color: #b4482b; font-size: 11px; font-weight: 700; }
+            QLabel#sectionLabel, QFrame#panel QLabel {
+                color: #4f625d; font-size: 10px; font-weight: 700;
+            }
+            QLabel#connectionStatus {
+                background: #d9dfd4; color: #27443e; border-radius: 10px;
+                padding: 5px 11px; font-weight: 700;
+            }
+            QFrame#panel {
+                background: #e7e3d9; border: 1px solid #c8c1b2; border-radius: 8px;
+            }
+            QComboBox, QPlainTextEdit {
+                background: #fffdf8; border: 1px solid #b9b2a5; border-radius: 6px;
+                selection-background-color: #176b5b; selection-color: white;
+            }
+            QComboBox { min-height: 31px; padding: 0 9px; }
+            QPlainTextEdit { padding: 12px; font-size: 14px; }
+            QPlainTextEdit#receivedView { background: #172421; color: #e9f0e8; }
+            QPushButton {
+                min-height: 31px; padding: 0 14px; border: 1px solid #8f988f;
+                border-radius: 6px; background: #f8f5ed; font-weight: 650;
+            }
+            QPushButton:hover { background: #ebe5d9; }
+            QPushButton:disabled { color: #9b9a93; background: #e1ded6; }
+            QPushButton#connectButton, QPushButton#plainButton {
+                background: #176b5b; color: white; border-color: #176b5b;
+            }
+            QPushButton#secureButton {
+                background: #b4482b; color: white; border-color: #b4482b;
+            }
+            QLabel#messageKind, QLabel#actionStatus { color: #66756f; }
+            """
+        )
+        fixed_font = QFont("Menlo" if sys.platform == "darwin" else "Consolas")
+        fixed_font.setStyleHint(QFont.StyleHint.Monospace)
+        self.message_editor.setFont(fixed_font)
+        self.received_view.setFont(fixed_font)
+
+    def _install_shortcuts(self) -> None:
+        self._add_shortcut("Ctrl+Alt+V", self._send_plain)
+        self._add_shortcut("Ctrl+Shift+Alt+V", self._send_secure)
+        self._add_shortcut("Ctrl+Alt+C", self._copy_last)
+        self._add_shortcut("Ctrl+Shift+Alt+C", self._copy_last_secure)
+        if sys.platform == "darwin":
+            self._add_shortcut("Ctrl+V", self.message_editor.paste, self.message_editor)
+            self._add_shortcut("Ctrl+C", self.message_editor.copy, self.message_editor)
+            self._add_shortcut("Ctrl+A", self.message_editor.selectAll, self.message_editor)
+
+    def _add_shortcut(self, sequence: str, callback, parent=None) -> None:
+        shortcut = QShortcut(QKeySequence(sequence), parent or self)
+        shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        shortcut.activated.connect(callback)
+        self._shortcuts.append(shortcut)
+
+    def _refresh_ports(self) -> None:
+        current = self.port_combo.currentText()
+        ports = [port.device for port in list_ports.comports()]
+        self.port_combo.clear()
+        self.port_combo.addItems(ports)
+        if current:
+            self.port_combo.setCurrentText(current)
+
+    def _request_connection(self) -> None:
+        port = self.port_combo.currentText().strip()
+        try:
+            baud = int(self.baud_combo.currentText().strip())
+        except ValueError:
+            self.action_status.setText("Baud must be an integer")
+            return
+        if not port:
+            self.action_status.setText("Select a serial port")
+            return
+        self.action_status.clear()
+        self.connect_requested.emit(port, baud)
+
+    def set_connected(self, connected: bool) -> None:
+        self._connected = connected
+        self.connection_status.setText("Connected" if connected else "Disconnected")
+        self.connect_button.setText("Disconnect" if connected else "Connect")
+        self.port_combo.setEnabled(not connected)
+        self.baud_combo.setEnabled(not connected)
+
+    def refresh_secure_state(self) -> None:
+        self.send_secure_button.setEnabled(self._chat_service.secure_available)
+
+    def _send_plain(self) -> None:
+        self._run_send(self._chat_service.send_plain)
+
+    def _send_secure(self) -> None:
+        if not self.send_secure_button.isEnabled():
+            return
+        self._run_send(self._chat_service.send_secure)
+
+    def _run_send(self, sender) -> None:
+        try:
+            sender(self.message_editor.toPlainText())
+        except Exception as error:
+            self.action_status.setText(str(error))
+            return
+        self.action_status.setText("Queued")
+
+    def _show_received_message(self, message: ChatMessage) -> None:
+        self.received_view.setPlainText(message.text)
+        self.received_kind.setText("Secure" if message.secure else "Plain")
+
+    def _copy_last(self) -> None:
+        QApplication.clipboard().setText(self._chat_service.last_text)
+
+    def _copy_last_secure(self) -> None:
+        QApplication.clipboard().setText(self._chat_service.last_secure_text)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._chat_service.remove_message_listener(self.incoming_message.emit)
+        super().closeEvent(event)
+
+
+__all__ = ["COMMON_BAUD_RATES", "MainWindow"]
