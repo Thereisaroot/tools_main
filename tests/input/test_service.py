@@ -331,6 +331,63 @@ def test_cancelled_old_request_cannot_stop_replacement_session_capture():
     service.stop_control(reason="test_complete")
 
 
+def test_idle_refresh_rechecks_state_after_cancelled_request_cleanup_gap():
+    old_request_started = threading.Event()
+    release_old_request = threading.Event()
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+
+    class BlockingFirstRequestBus(FakeBus):
+        def send(self, message, *, secure=True, priority=Priority.NORMAL):
+            if (
+                message.message_type is MessageType.INPUT_REQUEST
+                and message.metadata["session_id"] == LOCAL_SESSION
+            ):
+                old_request_started.set()
+                assert release_old_request.wait(2)
+            super().send(message, secure=secure, priority=priority)
+
+    session_ids = iter((LOCAL_SESSION, "4" * 32))
+    bus = BlockingFirstRequestBus()
+    backend = FakeBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        session_factory=lambda: next(session_ids),
+    )
+    old_errors = []
+    old_requester = threading.Thread(
+        target=lambda: _capture_error(service.request_control, old_errors)
+    )
+    old_requester.start()
+    assert old_request_started.wait(1)
+    service.stop_control(reason="cancelled")
+    original_refresh = service._refresh_idle_capture
+
+    def delayed_refresh(*args, **kwargs):
+        refresh_started.set()
+        assert release_refresh.wait(2)
+        return original_refresh(*args, **kwargs)
+
+    service._refresh_idle_capture = delayed_refresh
+    release_old_request.set()
+    assert refresh_started.wait(1)
+
+    replacement_id = service.request_control()
+    assert service.handle_message(input_accept(replacement_id))
+    assert backend.capture_running is True
+    release_refresh.set()
+    old_requester.join(2)
+
+    assert not old_requester.is_alive()
+    assert isinstance(old_errors[0], InputUnavailable)
+    assert service.state is InputSessionState.CONTROLLING
+    assert backend.capture_running is True
+    service.stop_control(reason="test_complete")
+
+
 def test_disconnected_service_rejects_buffered_incoming_request():
     service, bus, _backend = start_being_controlled()
     service.stop_control(reason="reset")

@@ -130,6 +130,7 @@ class InputService:
         self._clock = clock
         self._session_factory = session_factory
         self._lock = threading.RLock()
+        self._capture_transition_lock = threading.RLock()
         self._state = InputSessionState.IDLE
         self._session_id: str | None = None
         self._allow_remote_input = False
@@ -253,12 +254,11 @@ class InputService:
             self._local_return_position = return_position
             self._local_session_topology = local_topology
             self._reset_edge_hold_locked()
-        if self._backend.capture_running:
-            try:
-                self._backend.stop_capture()
-            except BaseException:
-                self._clear_session(session_id)
-                raise
+        try:
+            self._stop_capture_if_running()
+        except BaseException:
+            self._clear_session(session_id)
+            raise
         try:
             self._send(
                 Message(
@@ -332,8 +332,7 @@ class InputService:
         with self._lock:
             self._connected = False
         self._finish_session(reason="disconnected", send_remote=False)
-        if self._backend.capture_running:
-            self._backend.stop_capture()
+        self._stop_capture_if_running()
 
     def close(self) -> None:
         with self._lock:
@@ -347,11 +346,10 @@ class InputService:
             self._finish_session(reason="closed", send_remote=False)
         except Exception:
             pass
-        if self._backend.capture_running:
-            try:
-                self._backend.stop_capture()
-            except Exception:
-                pass
+        try:
+            self._stop_capture_if_running()
+        except Exception:
+            pass
         try:
             self._backend.release_all()
         except Exception:
@@ -452,8 +450,7 @@ class InputService:
             self._send_busy(session_id, reason)
             return
         try:
-            if self._backend.capture_running:
-                self._backend.stop_capture()
+            self._stop_capture_if_running()
             self._backend.release_all()
         except Exception:
             with self._lock:
@@ -538,7 +535,7 @@ class InputService:
             self._last_motion_sequence = 0
             self._last_received_motion_sequence = 0
         try:
-            self._backend.start_capture(
+            self._start_capture(
                 self._captured_event,
                 self._emergency_stop,
                 suppress=True,
@@ -580,8 +577,7 @@ class InputService:
                     send_error = error
                     self._clear_session_locked()
         if cancelled or send_error is not None:
-            if self._backend.capture_running:
-                self._backend.stop_capture()
+            self._stop_capture_if_running()
             if send_error is not None:
                 self._safe_send(
                     Message(
@@ -1045,9 +1041,9 @@ class InputService:
                     self._pending_pointer = None
             return_position = self._local_return_position
             self._clear_session_locked()
-        if state is InputSessionState.CONTROLLING and self._backend.capture_running:
+        if state is InputSessionState.CONTROLLING:
             try:
-                self._backend.stop_capture()
+                self._stop_capture_if_running()
             except BaseException as error:
                 if cleanup_error is None:
                     cleanup_error = error
@@ -1105,33 +1101,45 @@ class InputService:
         self._reset_edge_hold_locked()
 
     def _refresh_idle_capture(self) -> None:
-        with self._lock:
-            should_capture = (
-                not self._closed
-                and self._connected
-                and self._bus.trusted
-                and self._auto_edge_enabled
-                and self._state is InputSessionState.IDLE
-                and self._backend.permission_status().capture_allowed
-            )
-            running = self._backend.capture_running
-        if should_capture and not running:
-            self._backend.start_capture(
-                self._captured_event,
-                self._emergency_stop,
-                suppress=False,
-            )
-        elif not should_capture and running:
-            self._backend.stop_capture()
+        with self._capture_transition_lock:
+            with self._lock:
+                if (
+                    self._state is not InputSessionState.IDLE
+                    or self._session_id is not None
+                ):
+                    return
+                should_capture = (
+                    not self._closed
+                    and self._connected
+                    and self._bus.trusted
+                    and self._auto_edge_enabled
+                    and self._backend.permission_status().capture_allowed
+                )
+                running = self._backend.capture_running
+            if should_capture and not running:
+                self._backend.start_capture(
+                    self._captured_event,
+                    self._emergency_stop,
+                    suppress=False,
+                )
+            elif not should_capture and running:
+                self._backend.stop_capture()
 
     def _refresh_idle_capture_if_idle(self) -> None:
-        with self._lock:
-            if (
-                self._state is not InputSessionState.IDLE
-                or self._session_id is not None
-            ):
-                return
         self._refresh_idle_capture()
+
+    def _start_capture(self, on_event, on_emergency, *, suppress: bool) -> None:
+        with self._capture_transition_lock:
+            self._backend.start_capture(
+                on_event,
+                on_emergency,
+                suppress=suppress,
+            )
+
+    def _stop_capture_if_running(self) -> None:
+        with self._capture_transition_lock:
+            if self._backend.capture_running:
+                self._backend.stop_capture()
 
     def _require_being_controlled(self, session_id: str) -> None:
         with self._lock:
