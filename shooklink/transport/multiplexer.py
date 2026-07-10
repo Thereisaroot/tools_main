@@ -16,6 +16,7 @@ UINT32_MAX = (1 << 32) - 1
 DEFAULT_MAX_ITEMS = 4_096
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_PRIORITY_BURST = 32
+DEFAULT_MAX_TRACKED_STREAMS = 4_096
 
 
 class MultiplexerClosed(RuntimeError):
@@ -73,6 +74,7 @@ class Multiplexer:
         max_items: int = DEFAULT_MAX_ITEMS,
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_priority_burst: int = DEFAULT_MAX_PRIORITY_BURST,
+        max_tracked_streams: int = DEFAULT_MAX_TRACKED_STREAMS,
     ) -> None:
         if type(max_items) is not int or max_items <= 0:
             raise ValueError("max_items must be positive")
@@ -80,6 +82,8 @@ class Multiplexer:
             raise ValueError("max_bytes must be positive")
         if type(max_priority_burst) is not int or max_priority_burst <= 0:
             raise ValueError("max_priority_burst must be positive")
+        if type(max_tracked_streams) is not int or max_tracked_streams <= 0:
+            raise ValueError("max_tracked_streams must be positive")
         self._condition = Condition()
         self._queue: list[tuple[int, int, OutboundItem]] = []
         self._pointer_items: dict[int, tuple[int, OutboundItem]] = {}
@@ -89,6 +93,7 @@ class Multiplexer:
         self._max_items = max_items
         self._max_bytes = max_bytes
         self._max_priority_burst = max_priority_burst
+        self._max_tracked_streams = max_tracked_streams
         self._queued_bytes = 0
         self._priority_streak = 0
         self._fair_priority_cursor = int(Priority.NORMAL)
@@ -109,10 +114,16 @@ class Multiplexer:
         with self._condition:
             return self._queued_bytes
 
+    @property
+    def tracked_streams(self) -> int:
+        with self._condition:
+            return self._tracked_stream_count_locked()
+
     def reserve_sequence(self, stream_id: int) -> int:
         _validate_uint("stream_id", stream_id, UINT32_MAX)
         with self._condition:
             self._ensure_open()
+            self._ensure_stream_capacity_locked(stream_id)
             return self._reserve_sequence_locked(stream_id)
 
     def _reserve_sequence_locked(self, stream_id: int) -> int:
@@ -129,6 +140,7 @@ class Multiplexer:
             self._ensure_open()
             self._validate_stream_priority_locked(item)
             self._ensure_capacity_locked(1, len(item.payload))
+            self._ensure_stream_capacity_locked(item.stream_id)
             if item.sequence is None:
                 item = replace(
                     item,
@@ -173,6 +185,7 @@ class Multiplexer:
                 item_delta,
                 len(item.payload) - previous_size,
             )
+            self._ensure_stream_capacity_locked(item.stream_id)
             if item.sequence is None:
                 item = replace(
                     item,
@@ -234,8 +247,20 @@ class Multiplexer:
             self._closed = True
             self._queue.clear()
             self._pointer_items.clear()
+            self._last_sequences.clear()
+            self._stream_priorities.clear()
             self._queued_bytes = 0
             self._condition.notify_all()
+
+    def release_stream(self, stream_id: int) -> None:
+        _validate_uint("stream_id", stream_id, UINT32_MAX)
+        with self._condition:
+            if stream_id in self._pointer_items or any(
+                item.stream_id == stream_id for _priority, _order, item in self._queue
+            ):
+                raise ValueError(f"stream {stream_id} still has queued work")
+            self._last_sequences.pop(stream_id, None)
+            self._stream_priorities.pop(stream_id, None)
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -254,6 +279,18 @@ class Multiplexer:
             raise QueueFullError("outbound item capacity is full")
         if self._queued_bytes + byte_delta > self._max_bytes:
             raise QueueFullError("outbound byte capacity is full")
+
+    def _ensure_stream_capacity_locked(self, stream_id: int) -> None:
+        if stream_id in self._last_sequences or stream_id in self._stream_priorities:
+            return
+        if self._tracked_stream_count_locked() >= self._max_tracked_streams:
+            raise QueueFullError("tracked stream capacity is full")
+
+    def _tracked_stream_count_locked(self) -> int:
+        return len(self._last_sequences) + sum(
+            stream_id not in self._last_sequences
+            for stream_id in self._stream_priorities
+        )
 
     def _record_explicit_sequence_locked(self, stream_id: int, sequence: int) -> None:
         previous = self._last_sequences.get(stream_id, 0)

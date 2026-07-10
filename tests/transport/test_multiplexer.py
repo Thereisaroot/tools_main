@@ -134,6 +134,45 @@ def test_queue_capacity_applies_backpressure_and_recovers_after_pop():
     assert mux.queued_bytes == 4
 
 
+def test_tracked_stream_limit_requires_release_before_reuse():
+    mux = Multiplexer(max_tracked_streams=2)
+    mux.enqueue(OutboundItem(Priority.NORMAL, 1, b"a"))
+    mux.enqueue(OutboundItem(Priority.NORMAL, 2, b"b"))
+    mux.pop()
+    mux.pop()
+
+    assert mux.tracked_streams == 2
+    with pytest.raises(QueueFullError, match="stream"):
+        mux.enqueue(OutboundItem(Priority.NORMAL, 3, b"c"))
+
+    mux.release_stream(1)
+    mux.enqueue(OutboundItem(Priority.NORMAL, 3, b"c"))
+    assert mux.tracked_streams == 2
+
+
+def test_stream_cannot_be_released_while_it_has_queued_work():
+    mux = Multiplexer()
+    mux.enqueue(OutboundItem(Priority.NORMAL, 7, b"queued"))
+
+    with pytest.raises(ValueError, match="queued"):
+        mux.release_stream(7)
+
+    mux.pop()
+    mux.release_stream(7)
+    assert mux.tracked_streams == 0
+
+
+def test_sequence_only_streams_are_bounded_and_close_clears_metadata():
+    mux = Multiplexer(max_tracked_streams=1)
+    assert mux.reserve_sequence(11) == 1
+
+    with pytest.raises(QueueFullError, match="stream"):
+        mux.reserve_sequence(12)
+
+    mux.close()
+    assert mux.tracked_streams == 0
+
+
 def test_pointer_replacement_does_not_consume_another_queue_slot():
     mux = Multiplexer(max_items=1, max_bytes=8)
     mux.enqueue_pointer(1, b"old")
