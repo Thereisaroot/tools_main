@@ -276,7 +276,27 @@ class InputService:
             self._clear_session(session_id)
             self._refresh_idle_capture()
             raise
-        self._notify_state(InputStateChange(InputSessionState.REQUESTING, session_id))
+        with self._lock:
+            active = (
+                not self._closed
+                and self._connected
+                and self._state is InputSessionState.REQUESTING
+                and self._session_id == session_id
+            )
+            if active:
+                self._notify_state(
+                    InputStateChange(InputSessionState.REQUESTING, session_id)
+                )
+        if not active:
+            self._safe_send(
+                Message(
+                    MessageType.INPUT_STOP,
+                    {"session_id": session_id, "reason": "cancelled"},
+                ),
+                Priority.INTERACTIVE,
+            )
+            self._refresh_idle_capture()
+            raise InputUnavailable("input request was cancelled")
         return session_id
 
     def stop_control(self, *, reason: str = "manual") -> None:
@@ -342,6 +362,9 @@ class InputService:
     def handle_message(self, message: Message) -> bool:
         if message.message_type not in _INPUT_TYPES:
             return False
+        with self._lock:
+            if self._closed or not self._connected:
+                return False
         if not self._bus.trusted:
             return False
         try:
@@ -398,6 +421,8 @@ class InputService:
                 status.inject_allowed,
             )
         if reason is not None:
+            if reason == "disconnected":
+                return
             self._send_busy(session_id, reason)
             return
         try:
@@ -422,6 +447,8 @@ class InputService:
                 self._pending_pointer = None
                 self._reset_edge_hold_locked()
         if reason is not None:
+            if reason == "disconnected":
+                return
             self._send_busy(session_id, reason)
             return
         try:
@@ -436,6 +463,15 @@ class InputService:
             self._notify_state(
                 InputStateChange(InputSessionState.IDLE, reason="unavailable")
             )
+            return
+        with self._lock:
+            active = (
+                not self._closed
+                and self._connected
+                and self._state is InputSessionState.BEING_CONTROLLED
+                and self._session_id == session_id
+            )
+        if not active:
             return
         try:
             self._send(
@@ -452,9 +488,25 @@ class InputService:
         except BaseException:
             self._finish_session(reason="accept_failed", send_remote=False)
             raise
-        self._notify_state(
-            InputStateChange(InputSessionState.BEING_CONTROLLED, session_id)
-        )
+        with self._lock:
+            active = (
+                not self._closed
+                and self._connected
+                and self._state is InputSessionState.BEING_CONTROLLED
+                and self._session_id == session_id
+            )
+            if active:
+                self._notify_state(
+                    InputStateChange(InputSessionState.BEING_CONTROLLED, session_id)
+                )
+        if not active:
+            self._safe_send(
+                Message(
+                    MessageType.INPUT_STOP,
+                    {"session_id": session_id, "reason": "disconnected"},
+                ),
+                Priority.INTERACTIVE,
+            )
 
     def _handle_accept(self, message: Message) -> None:
         _require_fields(message.metadata, {"session_id", "peer_id", "monitors"})
@@ -1086,6 +1138,8 @@ class InputService:
         session_id: str,
         inject_allowed: bool,
     ) -> str | None:
+        if self._closed or not self._connected:
+            return "disconnected"
         if not self._allow_remote_input or not inject_allowed:
             return "permission"
         if self._state is InputSessionState.IDLE:

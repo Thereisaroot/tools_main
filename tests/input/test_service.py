@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -19,6 +20,7 @@ from shooklink.input.service import (
     MOTION_INTERVAL_SECONDS,
     InputService,
     InputSessionState,
+    InputUnavailable,
 )
 from shooklink.input.topology import Monitor, Rect, Side
 from shooklink.protocol.messages import Message, MessageType
@@ -27,6 +29,13 @@ from shooklink.transport.multiplexer import Priority
 
 LOCAL_SESSION = "1" * 32
 REMOTE_SESSION = "2" * 32
+
+
+def _capture_error(callback, errors):
+    try:
+        callback()
+    except BaseException as error:
+        errors.append(error)
 
 
 class FakeClock:
@@ -235,6 +244,92 @@ def test_outgoing_request_accepts_topology_and_enters_absolute_pointer_mode():
     assert enter.message_type is MessageType.INPUT_ENTER
     assert (enter.metadata["x"], enter.metadata["y"]) == (0, 50)
     assert bus.sent[-1][2] is Priority.INTERACTIVE
+
+
+def test_cancelled_request_is_followed_by_stop_when_request_send_finishes_late():
+    request_started = threading.Event()
+    release_request = threading.Event()
+
+    class BlockingRequestBus(FakeBus):
+        def send(self, message, *, secure=True, priority=Priority.NORMAL):
+            if message.message_type is MessageType.INPUT_REQUEST:
+                request_started.set()
+                assert release_request.wait(2)
+            super().send(message, secure=secure, priority=priority)
+
+    bus = BlockingRequestBus()
+    service = InputService(
+        bus,
+        FakeBackend(),
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    errors = []
+    requester = threading.Thread(
+        target=lambda: _capture_error(service.request_control, errors)
+    )
+    requester.start()
+    assert request_started.wait(1)
+
+    service.stop_control(reason="cancelled")
+    release_request.set()
+    requester.join(2)
+
+    assert not requester.is_alive()
+    assert service.state is InputSessionState.IDLE
+    assert isinstance(errors[0], InputUnavailable)
+    assert [item[0].message_type for item in bus.sent][-2:] == [
+        MessageType.INPUT_REQUEST,
+        MessageType.INPUT_STOP,
+    ]
+
+
+def test_disconnected_service_rejects_buffered_incoming_request():
+    service, bus, _backend = start_being_controlled()
+    service.stop_control(reason="reset")
+    service.disconnect()
+    bus.sent.clear()
+
+    assert not service.handle_message(input_request())
+
+    assert service.state is InputSessionState.IDLE
+    assert bus.sent == []
+
+
+def test_late_incoming_accept_is_compensated_after_disconnect():
+    accept_started = threading.Event()
+    release_accept = threading.Event()
+
+    class BlockingAcceptBus(FakeBus):
+        def send(self, message, *, secure=True, priority=Priority.NORMAL):
+            if message.message_type is MessageType.INPUT_ACCEPT:
+                accept_started.set()
+                assert release_accept.wait(2)
+            super().send(message, secure=secure, priority=priority)
+
+    bus = BlockingAcceptBus()
+    service = InputService(
+        bus,
+        FakeBackend(),
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+    )
+    service.set_allow_remote_input(True)
+    receiver = threading.Thread(target=lambda: service.handle_message(input_request()))
+    receiver.start()
+    assert accept_started.wait(1)
+
+    service.disconnect()
+    release_accept.set()
+    receiver.join(2)
+
+    assert not receiver.is_alive()
+    assert service.state is InputSessionState.IDLE
+    assert [item[0].message_type for item in bus.sent][-2:] == [
+        MessageType.INPUT_ACCEPT,
+        MessageType.INPUT_STOP,
+    ]
 
 
 def test_allowed_incoming_request_accepts_and_injects_normalized_key():
