@@ -54,6 +54,13 @@ _STORE_LOCK = threading.RLock()
 LOCK_TIMEOUT_SECONDS = 10.0
 
 
+def _is_windows_lock_contention(error: OSError) -> bool:
+    winerror = getattr(error, "winerror", None)
+    if winerror is not None:
+        return winerror == 33  # ERROR_LOCK_VIOLATION
+    return error.errno in (errno.EACCES, errno.EAGAIN)
+
+
 class SecureSessionError(RuntimeError):
     """Base class for identity and secure-session failures."""
 
@@ -110,12 +117,15 @@ class _InterProcessFileLock:
     def __enter__(self) -> _InterProcessFileLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open("a+b")
-        if os.name == "posix":
-            self.path.chmod(0o600)
         try:
+            if os.name == "posix":
+                self.path.chmod(0o600)
             self._acquire()
         except Exception:
-            self._file.close()
+            try:
+                self._file.close()
+            except OSError:
+                pass
             self._file = None
             raise
         return self
@@ -136,7 +146,9 @@ class _InterProcessFileLock:
                 try:
                     msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
                     return
-                except OSError:
+                except OSError as error:
+                    if not _is_windows_lock_contention(error):
+                        raise
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"timed out locking {self.path}")
                     time.sleep(0.025)
@@ -157,6 +169,7 @@ class _InterProcessFileLock:
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
         if self._file is None:
             return
+        release_error: BaseException | None = None
         try:
             if os.name == "nt":
                 import msvcrt
@@ -167,9 +180,17 @@ class _InterProcessFileLock:
                 import fcntl
 
                 fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        except BaseException as error:
+            release_error = error
         finally:
-            self._file.close()
+            try:
+                self._file.close()
+            except BaseException as error:
+                if release_error is None:
+                    release_error = error
             self._file = None
+        if _exc_type is None and release_error is not None:
+            raise release_error
 
 
 def _public_bytes(public_key: Ed25519PublicKey | X25519PublicKey) -> bytes:
@@ -313,6 +334,8 @@ class TrustStore:
                     separators=(",", ":"),
                     sort_keys=True,
                 ).encode("utf-8")
+                if len(encoded) > MAX_TRUST_STORE_SIZE:
+                    raise ValueError("trust store update is too large")
                 _atomic_write(self.path, encoded)
 
 

@@ -1,9 +1,11 @@
+import errno
 import json
 import multiprocessing
 import os
 import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -300,6 +302,73 @@ def test_trust_store_is_atomic_and_tolerates_corrupt_data(tmp_path):
 
     assert json.loads(path.read_text(encoding="utf-8")) == {"peer": "fingerprint"}
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_oversized_trust_update_is_rejected_without_replacing_store(tmp_path):
+    path = tmp_path / "trusted-size.json"
+    trust = TrustStore(path)
+    trust.accept("existing", "fingerprint")
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError, match="too large"):
+        trust.accept("oversized", "x" * crypto.MAX_TRUST_STORE_SIZE)
+
+    assert path.read_bytes() == original
+    assert trust.check("existing", "fingerprint") is True
+
+
+def test_windows_lock_contention_classifier_distinguishes_permission_errors():
+    lock_violation = OSError(errno.EACCES, "locked")
+    lock_violation.winerror = 33
+    permission_denied = OSError(errno.EACCES, "denied")
+    permission_denied.winerror = 5
+
+    assert crypto._is_windows_lock_contention(lock_violation) is True
+    assert crypto._is_windows_lock_contention(permission_denied) is False
+    assert crypto._is_windows_lock_contention(OSError(errno.EAGAIN, "locked")) is True
+    assert crypto._is_windows_lock_contention(OSError(errno.EBADF, "bad fd")) is False
+
+
+def test_lock_setup_failure_closes_open_file(tmp_path, monkeypatch):
+    opened_files = []
+    real_open = Path.open
+
+    def tracked_open(path, *args, **kwargs):
+        opened_file = real_open(path, *args, **kwargs)
+        opened_files.append(opened_file)
+        return opened_file
+
+    def denied_chmod(_path, _mode):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+    monkeypatch.setattr(Path, "chmod", denied_chmod)
+    lock = crypto._InterProcessFileLock(tmp_path / "target")
+
+    with pytest.raises(PermissionError):
+        lock.__enter__()
+
+    assert opened_files and opened_files[0].closed
+    assert lock._file is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uses POSIX flock failure injection")
+def test_unlock_failure_does_not_mask_protected_exception(monkeypatch, tmp_path):
+    import fcntl
+
+    lock = crypto._InterProcessFileLock(tmp_path / "target")
+    lock.__enter__()
+    real_flock = fcntl.flock
+
+    def fail_unlock(descriptor, operation):
+        if operation == fcntl.LOCK_UN:
+            raise OSError("unlock failed")
+        return real_flock(descriptor, operation)
+
+    monkeypatch.setattr(fcntl, "flock", fail_unlock)
+
+    assert lock.__exit__(ValueError, ValueError("original"), None) is None
+    assert lock._file is None
 
 
 def test_concurrent_identity_creation_returns_persisted_winner(tmp_path, monkeypatch):
