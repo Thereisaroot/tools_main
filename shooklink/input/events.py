@@ -48,6 +48,7 @@ class KeyEvent:
     repeat: bool = False
     extended: bool = False
     injected: bool = False
+    self_injected: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.action, KeyAction):
@@ -67,6 +68,7 @@ class KeyEvent:
             ("repeat", self.repeat),
             ("extended", self.extended),
             ("injected", self.injected),
+            ("self_injected", self.self_injected),
         ):
             if not isinstance(value, bool):
                 raise TypeError(f"{name} must be a boolean")
@@ -77,12 +79,15 @@ class PointerMotionEvent:
     dx: int
     dy: int
     injected: bool = False
+    self_injected: bool = False
 
     def __post_init__(self) -> None:
         _validate_int("dx", self.dx)
         _validate_int("dy", self.dy)
         if not isinstance(self.injected, bool):
             raise TypeError("injected must be a boolean")
+        if not isinstance(self.self_injected, bool):
+            raise TypeError("self_injected must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,12 +95,15 @@ class PointerPositionEvent:
     x: int
     y: int
     injected: bool = False
+    self_injected: bool = False
 
     def __post_init__(self) -> None:
         _validate_int("x", self.x)
         _validate_int("y", self.y)
         if not isinstance(self.injected, bool):
             raise TypeError("injected must be a boolean")
+        if not isinstance(self.self_injected, bool):
+            raise TypeError("self_injected must be a boolean")
 
     @property
     def position(self) -> tuple[int, int]:
@@ -107,6 +115,7 @@ class MouseButtonEvent:
     button: MouseButton
     action: KeyAction
     injected: bool = False
+    self_injected: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.button, MouseButton):
@@ -115,6 +124,8 @@ class MouseButtonEvent:
             raise TypeError("mouse action must be a KeyAction")
         if not isinstance(self.injected, bool):
             raise TypeError("injected must be a boolean")
+        if not isinstance(self.self_injected, bool):
+            raise TypeError("self_injected must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,12 +133,15 @@ class WheelEvent:
     dx: int
     dy: int
     injected: bool = False
+    self_injected: bool = False
 
     def __post_init__(self) -> None:
         _validate_int("dx", self.dx)
         _validate_int("dy", self.dy)
         if not isinstance(self.injected, bool):
             raise TypeError("injected must be a boolean")
+        if not isinstance(self.self_injected, bool):
+            raise TypeError("self_injected must be a boolean")
 
 
 InputEvent = (

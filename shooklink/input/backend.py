@@ -102,7 +102,7 @@ class BaseInputBackend:
             (KeyEvent, MouseButtonEvent),
         ) and not hasattr(event, "injected"):
             raise TypeError("event must be a normalized input event")
-        if event.injected:
+        if event.self_injected:
             return True
         with self._backend_lock:
             if not self._capture_running:

@@ -235,6 +235,8 @@ def test_macos_callback_thread_restart_isolated_from_stale_cleanup(monkeypatch):
     quartz.kCGSessionEventTap = 1
     quartz.kCGHeadInsertEventTap = 2
     quartz.kCGEventTapOptionDefault = 3
+    quartz.kCGEventSourceStateCombinedSessionState = 4
+    quartz.CGEventSourceKeyState = lambda *_args: False
     quartz.CGEventTapCreate = lambda *_args: object()
     quartz.CFMachPortCreateRunLoopSource = lambda *_args: object()
     quartz.CGEventTapEnable = lambda *_args: None
@@ -299,11 +301,11 @@ def test_macos_new_generation_resets_modifier_key_tracking(monkeypatch):
         kCGEventSourceUserData = 4
         kCGKeyboardEventKeycode = 5
         kCGKeyboardEventAutorepeat = 6
-        kCGEventFlagMaskShift = 1 << 0
-        kCGEventFlagMaskControl = 1 << 1
-        kCGEventFlagMaskAlternate = 1 << 2
-        kCGEventFlagMaskCommand = 1 << 3
-        kCGEventFlagMaskAlphaShift = 1 << 4
+        kCGEventFlagMaskShift = 1 << 16
+        kCGEventFlagMaskControl = 1 << 17
+        kCGEventFlagMaskAlternate = 1 << 18
+        kCGEventFlagMaskCommand = 1 << 19
+        kCGEventFlagMaskAlphaShift = 1 << 20
 
         @staticmethod
         def CGEventGetIntegerValueField(_event, field):
@@ -319,7 +321,7 @@ def test_macos_new_generation_resets_modifier_key_tracking(monkeypatch):
 
         @staticmethod
         def CGEventGetFlags(_event):
-            return 0
+            return Quartz.kCGEventFlagMaskShift | 0x00000002
 
     event = backend._normalize_event(
         Quartz.kCGEventFlagsChanged,
@@ -330,3 +332,65 @@ def test_macos_new_generation_resets_modifier_key_tracking(monkeypatch):
     assert event.action is KeyAction.DOWN
     assert backend._modifier_keys_down == {56}
     backend.stop_capture()
+
+
+@pytest.mark.parametrize(
+    ("keycode", "usage"),
+    [
+        (56, 0xE1),
+        (60, 0xE5),
+        (59, 0xE0),
+        (62, 0xE4),
+        (58, 0xE2),
+        (61, 0xE6),
+        (55, 0xE3),
+        (54, 0xE7),
+    ],
+)
+def test_macos_first_release_of_preheld_modifier_is_up(keycode, usage):
+    backend = MacOSInputBackend()
+
+    class Quartz:
+        kCGEventKeyDown = 1
+        kCGEventKeyUp = 2
+        kCGEventFlagsChanged = 3
+        kCGEventSourceStateCombinedSessionState = 4
+        kCGEventSourceUserData = 5
+        kCGKeyboardEventKeycode = 6
+        kCGKeyboardEventAutorepeat = 7
+        kCGEventFlagMaskShift = 1 << 16
+        kCGEventFlagMaskControl = 1 << 17
+        kCGEventFlagMaskAlternate = 1 << 18
+        kCGEventFlagMaskCommand = 1 << 19
+        kCGEventFlagMaskAlphaShift = 1 << 20
+
+        @staticmethod
+        def CGEventSourceKeyState(_state, candidate):
+            return candidate == keycode
+
+        @staticmethod
+        def CGEventGetIntegerValueField(_event, field):
+            return {
+                Quartz.kCGEventSourceUserData: 0,
+                Quartz.kCGKeyboardEventKeycode: keycode,
+                Quartz.kCGKeyboardEventAutorepeat: 0,
+            }[field]
+
+        @staticmethod
+        def CGEventKeyboardGetUnicodeString(*_args):
+            return 0, ""
+
+        @staticmethod
+        def CGEventGetFlags(_event):
+            return 0
+
+    backend._initialize_modifier_key_state(Quartz)
+    event = backend._normalize_event(
+        Quartz.kCGEventFlagsChanged,
+        object(),
+        Quartz,
+    )
+
+    assert event.action is KeyAction.UP
+    assert event.usage == usage
+    assert keycode not in backend._modifier_keys_down

@@ -23,6 +23,8 @@ from shooklink.input.events import (
 from shooklink.input.topology import Monitor, Rect
 
 INJECTION_MARKER = 0x53484F4F4B4C4E4B
+_LLKHF_INJECTED = 0x10
+_LLMHF_INJECTED = 0x01
 
 _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_KEYUP = 0x0002
@@ -513,6 +515,8 @@ class WindowsInputBackend(BaseInputBackend):
             if action is KeyAction.DOWN
             else ""
         )
+        self_injected = int(data.dwExtraInfo) == INJECTION_MARKER
+        injected = bool(data.flags & _LLKHF_INJECTED) or self_injected
         event = KeyEvent(
             action,
             usage,
@@ -523,7 +527,8 @@ class WindowsInputBackend(BaseInputBackend):
             location=_usage_location(usage),
             repeat=repeat,
             extended=extended,
-            injected=int(data.dwExtraInfo) == INJECTION_MARKER,
+            injected=injected,
+            self_injected=self_injected,
         )
         consumed = self.emit_captured(event)
         if consumed or self._capture_suppress:
@@ -549,7 +554,8 @@ class WindowsInputBackend(BaseInputBackend):
         if code < 0:
             return api.call_next(hook, code, message, pointer)
         data = api.mouse_data(pointer)
-        injected = int(data.dwExtraInfo) == INJECTION_MARKER
+        self_injected = int(data.dwExtraInfo) == INJECTION_MARKER
+        injected = bool(data.flags & _LLMHF_INJECTED) or self_injected
         event: InputEvent | None = None
         position = (int(data.pt.x), int(data.pt.y))
         if message == 0x0200:
@@ -558,20 +564,27 @@ class WindowsInputBackend(BaseInputBackend):
             event = PointerMotionEvent(
                 position[0] - previous[0],
                 position[1] - previous[1],
-                injected,
+                injected=injected,
+                self_injected=self_injected,
             )
         elif message in _WINDOWS_BUTTON_MESSAGES:
             button, action = _WINDOWS_BUTTON_MESSAGES[message]
             if message in (0x020B, 0x020C):
                 high = (int(data.mouseData) >> 16) & 0xFFFF
                 button = MouseButton.X1 if high == 1 else MouseButton.X2
-            event = MouseButtonEvent(button, action, injected)
+            event = MouseButtonEvent(
+                button,
+                action,
+                injected=injected,
+                self_injected=self_injected,
+            )
         elif message in (0x020A, 0x020E):
             delta = _signed_word((int(data.mouseData) >> 16) & 0xFFFF)
             event = WheelEvent(
                 delta if message == 0x020E else 0,
                 delta if message == 0x020A else 0,
-                injected,
+                injected=injected,
+                self_injected=self_injected,
             )
         if event is not None:
             consumed = self.emit_captured(event)

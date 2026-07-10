@@ -335,7 +335,8 @@ def test_windows_third_party_injected_keyboard_follows_capture_policy(
 
     assert result == expected_result
     assert len(captured) == 1
-    assert captured[0].injected is False
+    assert captured[0].injected is True
+    assert captured[0].self_injected is False
     assert captured[0].text == "a"
 
 
@@ -402,7 +403,8 @@ def test_windows_third_party_injected_mouse_follows_capture_policy():
 
     assert result == 77
     assert len(captured) == 1
-    assert captured[0].injected is False
+    assert captured[0].injected is True
+    assert captured[0].self_injected is False
 
 
 def test_windows_private_marker_mouse_is_self_filtered():

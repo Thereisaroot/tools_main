@@ -44,7 +44,14 @@ class MemoryBackend(BaseInputBackend):
         self.injected.append(event)
 
 
-def key(action, *, injected=False, modifiers=Modifiers.NONE, usage=4):
+def key(
+    action,
+    *,
+    injected=False,
+    self_injected=False,
+    modifiers=Modifiers.NONE,
+    usage=4,
+):
     return KeyEvent(
         action,
         usage=usage,
@@ -53,10 +60,11 @@ def key(action, *, injected=False, modifiers=Modifiers.NONE, usage=4):
         text="a",
         modifiers=modifiers,
         injected=injected,
+        self_injected=self_injected,
     )
 
 
-def test_backend_lifecycle_filters_injected_events_and_stops_idempotently():
+def test_backend_lifecycle_filters_only_self_injected_events():
     backend = MemoryBackend()
     captured = []
     emergency = []
@@ -64,8 +72,14 @@ def test_backend_lifecycle_filters_injected_events_and_stops_idempotently():
 
     backend.emit_captured(key(KeyAction.DOWN))
     backend.emit_captured(key(KeyAction.DOWN, injected=True))
+    backend.emit_captured(
+        key(KeyAction.DOWN, injected=True, self_injected=True)
+    )
 
-    assert captured == [key(KeyAction.DOWN)]
+    assert captured == [
+        key(KeyAction.DOWN),
+        key(KeyAction.DOWN, injected=True),
+    ]
     assert emergency == []
     assert backend.native_started == 1
     with pytest.raises(RuntimeError, match="already"):

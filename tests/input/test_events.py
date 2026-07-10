@@ -59,6 +59,26 @@ def test_key_event_preserves_physical_and_text_fields():
     assert event.repeat is True
 
 
+def test_injected_provenance_is_distinct_from_self_injection():
+    third_party = KeyEvent(
+        KeyAction.DOWN,
+        usage=0x04,
+        injected=True,
+        self_injected=False,
+    )
+    shooklink = MouseButtonEvent(
+        MouseButton.LEFT,
+        KeyAction.DOWN,
+        injected=True,
+        self_injected=True,
+    )
+
+    assert third_party.injected is True
+    assert third_party.self_injected is False
+    assert shooklink.injected is True
+    assert shooklink.self_injected is True
+
+
 @pytest.mark.parametrize(
     ("mac_keycode", "virtual_key", "usage"),
     [
@@ -165,6 +185,7 @@ def test_keypad_and_pointer_events_are_explicit():
         {"virtual_key": -1},
         {"text": "x" * 33},
         {"repeat": 1},
+        {"self_injected": 1},
     ],
 )
 def test_invalid_key_event_fields_are_rejected(kwargs):

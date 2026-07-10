@@ -127,6 +127,18 @@ _MAC_TO_USAGE = {
     126: 0x52,
 }
 _USAGE_TO_MAC = {usage: keycode for keycode, usage in _MAC_TO_USAGE.items()}
+_MAC_MODIFIER_KEYCODES = frozenset({54, 55, 56, 58, 59, 60, 61, 62})
+_MAC_MODIFIER_DEVICE_MASKS = {
+    59: 0x00000001,
+    56: 0x00000002,
+    60: 0x00000004,
+    55: 0x00000008,
+    54: 0x00000010,
+    58: 0x00000020,
+    61: 0x00000040,
+    62: 0x00002000,
+}
+_MAC_ALL_MODIFIER_DEVICE_MASKS = sum(_MAC_MODIFIER_DEVICE_MASKS.values())
 
 
 @dataclass(slots=True)
@@ -227,6 +239,22 @@ class MacOSInputBackend(BaseInputBackend):
     def _reset_capture_local_state(self) -> None:
         self._modifier_keys_down.clear()
 
+    def _initialize_modifier_key_state(
+        self,
+        quartz,
+        generation: _MacCaptureGeneration | None = None,
+    ) -> None:
+        held = {
+            keycode
+            for keycode in _MAC_MODIFIER_KEYCODES
+            if quartz.CGEventSourceKeyState(
+                quartz.kCGEventSourceStateCombinedSessionState,
+                keycode,
+            )
+        }
+        if generation is None or self._tap_generation is generation:
+            self._modifier_keys_down = held
+
     def _stop_native_capture(self) -> None:
         generation = self._tap_generation
         thread = generation.thread if generation is not None else self._tap_thread
@@ -289,6 +317,7 @@ class MacOSInputBackend(BaseInputBackend):
             import CoreFoundation
             import Quartz
 
+            self._initialize_modifier_key_state(Quartz, generation)
             event_types = (
                 Quartz.kCGEventKeyDown,
                 Quartz.kCGEventKeyUp,
@@ -390,7 +419,7 @@ class MacOSInputBackend(BaseInputBackend):
             event,
             quartz.kCGEventSourceUserData,
         )
-        injected = marker == INJECTION_MARKER
+        self_injected = marker == INJECTION_MARKER
         key_types = {
             quartz.kCGEventKeyDown,
             quartz.kCGEventKeyUp,
@@ -400,11 +429,13 @@ class MacOSInputBackend(BaseInputBackend):
             keycode = int(
                 quartz.CGEventGetIntegerValueField(event, quartz.kCGKeyboardEventKeycode)
             )
+            flags = int(quartz.CGEventGetFlags(event))
             if event_type == quartz.kCGEventFlagsChanged:
-                action = (
-                    KeyAction.UP
-                    if keycode in self._modifier_keys_down
-                    else KeyAction.DOWN
+                action = _mac_modifier_action(
+                    keycode,
+                    flags,
+                    self._modifier_keys_down,
+                    quartz,
                 )
                 if action is KeyAction.DOWN:
                     self._modifier_keys_down.add(keycode)
@@ -425,7 +456,7 @@ class MacOSInputBackend(BaseInputBackend):
                 scan_code=keycode,
                 virtual_key=keycode,
                 text=text,
-                modifiers=_mac_modifiers(quartz.CGEventGetFlags(event), quartz),
+                modifiers=_mac_modifiers(flags, quartz),
                 location=_usage_location(usage),
                 repeat=bool(
                     quartz.CGEventGetIntegerValueField(
@@ -433,7 +464,8 @@ class MacOSInputBackend(BaseInputBackend):
                         quartz.kCGKeyboardEventAutorepeat,
                     )
                 ),
-                injected=injected,
+                injected=self_injected,
+                self_injected=self_injected,
             )
         if event_type in {
             quartz.kCGEventMouseMoved,
@@ -444,7 +476,8 @@ class MacOSInputBackend(BaseInputBackend):
             return PointerMotionEvent(
                 int(quartz.CGEventGetIntegerValueField(event, quartz.kCGMouseEventDeltaX)),
                 int(quartz.CGEventGetIntegerValueField(event, quartz.kCGMouseEventDeltaY)),
-                injected,
+                injected=self_injected,
+                self_injected=self_injected,
             )
         if event_type == quartz.kCGEventScrollWheel:
             return WheelEvent(
@@ -460,7 +493,8 @@ class MacOSInputBackend(BaseInputBackend):
                         quartz.kCGScrollWheelEventPointDeltaAxis1,
                     )
                 ),
-                injected,
+                injected=self_injected,
+                self_injected=self_injected,
             )
         button = _mac_mouse_button(event_type, event, quartz)
         if button is not None:
@@ -474,7 +508,12 @@ class MacOSInputBackend(BaseInputBackend):
                 }
                 else KeyAction.UP
             )
-            return MouseButtonEvent(button, action, injected)
+            return MouseButtonEvent(
+                button,
+                action,
+                injected=self_injected,
+                self_injected=self_injected,
+            )
         return None
 
     def _inject_native(self, event: InputEvent) -> None:
@@ -531,6 +570,34 @@ class MacOSInputBackend(BaseInputBackend):
             INJECTION_MARKER,
         )
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, quartz_event)
+
+
+def _mac_modifier_action(
+    keycode: int,
+    flags: int,
+    keys_down: set[int],
+    quartz,
+) -> KeyAction:
+    device_mask = _MAC_MODIFIER_DEVICE_MASKS.get(keycode)
+    if device_mask is None:
+        return KeyAction.UP if keycode in keys_down else KeyAction.DOWN
+    if flags & _MAC_ALL_MODIFIER_DEVICE_MASKS:
+        is_down = bool(flags & device_mask)
+    elif keycode in keys_down:
+        is_down = False
+    else:
+        aggregate_mask = {
+            54: quartz.kCGEventFlagMaskCommand,
+            55: quartz.kCGEventFlagMaskCommand,
+            56: quartz.kCGEventFlagMaskShift,
+            58: quartz.kCGEventFlagMaskAlternate,
+            59: quartz.kCGEventFlagMaskControl,
+            60: quartz.kCGEventFlagMaskShift,
+            61: quartz.kCGEventFlagMaskAlternate,
+            62: quartz.kCGEventFlagMaskControl,
+        }[keycode]
+        is_down = bool(flags & aggregate_mask)
+    return KeyAction.DOWN if is_down else KeyAction.UP
 
 
 def _mac_modifiers(flags: int, quartz) -> Modifiers:
