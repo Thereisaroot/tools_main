@@ -248,6 +248,23 @@ def test_unrelated_completion_does_not_clear_active_transfer(qtbot, tmp_path):
     assert files.cancelled == [second.transfer_id]
 
 
+def test_cancelling_current_transfer_selects_remaining_active_transfer(qtbot, tmp_path):
+    files = FakeFileService(tmp_path / "downloads")
+    window = MainWindow(ChatService(FakeBus()), files)
+    qtbot.addWidget(window)
+    window.show()
+    first = FileProgress("1" * 32, "first", "outgoing", 1, 10, "sending")
+    second = FileProgress("2" * 32, "second", "outgoing", 1, 10, "sending")
+    files.emit(first)
+    files.emit(second)
+
+    qtbot.mouseClick(window.file_cancel_button, Qt.MouseButton.LeftButton)
+
+    assert files.cancelled == [second.transfer_id]
+    assert window._active_transfer_id == first.transfer_id
+    assert window.file_cancel_button.isEnabled()
+
+
 def test_remote_shell_controls_open_terminal_and_forward_output(qtbot):
     shell = FakeShellService()
     window = MainWindow(ChatService(FakeBus()), None, shell)

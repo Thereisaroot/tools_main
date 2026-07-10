@@ -455,10 +455,22 @@ class MainWindow(QMainWindow):
         if self._file_service is None or self._active_transfer_id is None:
             return
         transfer_id = self._active_transfer_id
-        self._active_transfer_id = None
         self._file_service.cancel(transfer_id)
-        self.file_progress_label.setText("Cancellation requested")
-        self.file_cancel_button.setEnabled(False)
+        if self._active_transfer_id == transfer_id:
+            remaining = [
+                item
+                for item in self._file_transfers.values()
+                if item.transfer_id != transfer_id
+                and item.state not in {"complete", "failed", "cancelled"}
+            ]
+            if remaining:
+                replacement = remaining[-1]
+                self._active_transfer_id = replacement.transfer_id
+                self._render_file_progress(replacement)
+            else:
+                self._active_transfer_id = None
+                self.file_progress_label.setText("Cancellation requested")
+                self.file_cancel_button.setEnabled(False)
 
     def _open_download_folder(self) -> None:
         if self._file_service is None:

@@ -476,6 +476,39 @@ def test_local_and_remote_cancel_emit_terminal_progress(tmp_path):
     service.close()
 
 
+def test_cancelled_incoming_transfer_cannot_be_resurrected_by_late_offer(tmp_path):
+    offer = make_offer("cancelled.bin", b"cancelled", transfer_id="3" * 32)
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    message = Message(MessageType.FILE_OFFER, offer.to_metadata())
+    service.handle_message(message)
+    service.handle_message(
+        Message(MessageType.FILE_CANCEL, {"transfer_id": offer.transfer_id})
+    )
+    bus.sent.clear()
+
+    service.handle_message(message)
+
+    assert bus.sent[-1][0].message_type is MessageType.FILE_CANCEL
+    assert bus.sent[-1][0].metadata["reason"] == "cancelled"
+    assert not any((tmp_path / "downloads").glob("*.part"))
+    service.close()
+
+
+def test_conflicting_duplicate_offer_is_explicitly_rejected(tmp_path):
+    first = make_offer("same.bin", b"first", transfer_id="2" * 32)
+    conflicting = make_offer("same.bin", b"other", transfer_id="2" * 32)
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    service.handle_message(Message(MessageType.FILE_OFFER, first.to_metadata()))
+
+    service.handle_message(Message(MessageType.FILE_OFFER, conflicting.to_metadata()))
+
+    assert bus.sent[-1][0].message_type is MessageType.FILE_CANCEL
+    assert bus.sent[-1][0].metadata["reason"] == "duplicate"
+    service.close()
+
+
 def test_cancel_during_final_hash_cannot_commit_or_report_success(tmp_path, monkeypatch):
     from shooklink.files import service as service_module
 

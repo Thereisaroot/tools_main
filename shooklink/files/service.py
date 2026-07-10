@@ -653,6 +653,7 @@ class FileService:
         self._completed_incoming: OrderedDict[
             str, tuple[FileOffer, str, Path | None]
         ] = OrderedDict()
+        self._cancelled_incoming: OrderedDict[str, FileOffer | None] = OrderedDict()
         self._listeners: list[Callable[[FileProgress], None]] = []
         self._progress_started: dict[str, float] = {}
         self._closed = False
@@ -765,6 +766,8 @@ class FileService:
             transfer.cancel()
         else:
             if transfer.cancel():
+                with self._lock:
+                    self._remember_cancelled_locked(transfer.offer.transfer_id, transfer.offer)
                 self._notify_incoming(transfer, "cancelled")
         self._send(
             Message(MessageType.FILE_CANCEL, {"transfer_id": transfer_id}),
@@ -781,6 +784,7 @@ class FileService:
             self._outgoing.clear()
             self._incoming.clear()
             self._completed_incoming.clear()
+            self._cancelled_incoming.clear()
         for transfer in transfers:
             transfer.cancel()
         if self._timer_thread is not threading.current_thread():
@@ -802,15 +806,24 @@ class FileService:
             raise FileProtocolError("file offer cannot contain a body")
         offer = FileOffer.from_metadata(message.metadata)
         with self._lock:
+            cancelled = self._cancelled_incoming.get(offer.transfer_id)
+            if offer.transfer_id in self._cancelled_incoming:
+                reason = "cancelled" if cancelled is None or cancelled == offer else "duplicate"
+                self._send_cancel(offer.transfer_id, reason)
+                return
             completed = self._completed_incoming.get(offer.transfer_id)
             if completed is not None:
                 if completed[0] == offer:
                     self._send_finish_status(offer.transfer_id, completed[1])
+                else:
+                    self._send_cancel(offer.transfer_id, "duplicate")
                 return
             existing = self._incoming.get(offer.transfer_id)
             if existing is not None:
                 if existing.offer == offer:
                     self._send_accept(offer.transfer_id)
+                else:
+                    self._send_cancel(offer.transfer_id, "duplicate")
                 return
             if offer.transfer_id in self._outgoing:
                 self._send_cancel(offer.transfer_id, "duplicate")
@@ -994,7 +1007,12 @@ class FileService:
                 transfer.cancel()
             else:
                 if transfer.cancel():
+                    with self._lock:
+                        self._remember_cancelled_locked(transfer.offer.transfer_id, transfer.offer)
                     self._notify_incoming(transfer, "cancelled")
+        elif message.metadata.get("reason") != "ack":
+            with self._lock:
+                self._remember_cancelled_locked(transfer_id, None)
 
     def _get_outgoing(self, metadata: Mapping[str, Any]) -> OutgoingTransfer:
         transfer_id = _metadata_transfer_id(metadata)
@@ -1059,6 +1077,16 @@ class FileService:
         self._completed_incoming.move_to_end(transfer.offer.transfer_id)
         while len(self._completed_incoming) > MAX_COMPLETED_TRANSFERS:
             self._completed_incoming.popitem(last=False)
+
+    def _remember_cancelled_locked(
+        self,
+        transfer_id: str,
+        offer: FileOffer | None,
+    ) -> None:
+        self._cancelled_incoming[transfer_id] = offer
+        self._cancelled_incoming.move_to_end(transfer_id)
+        while len(self._cancelled_incoming) > MAX_COMPLETED_TRANSFERS:
+            self._cancelled_incoming.popitem(last=False)
 
     def _send(self, message: Message, priority: Priority) -> None:
         self._bus.send(message, secure=True, priority=priority)
