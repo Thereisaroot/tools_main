@@ -11,12 +11,18 @@ from shooklink.ui.main_window import MainWindow
 
 
 class FakeBus:
-    def __init__(self, trusted=True):
+    def __init__(self, trusted=True, decrypted_body=None):
         self.trusted = trusted
+        self.decrypted_body = decrypted_body
         self.sent = []
 
     def send(self, message, *, secure=False):
         self.sent.append((message, secure))
+
+    def decrypt_secure(self, _message):
+        if not self.trusted or self.decrypted_body is None:
+            raise RuntimeError("secure payload was not authenticated")
+        return self.decrypted_body
 
 
 def test_main_window_sends_korean_and_punctuation(qtbot):
@@ -36,19 +42,20 @@ def test_main_window_sends_korean_and_punctuation(qtbot):
 
 
 def test_copy_actions_target_last_received_text(qtbot):
-    service = ChatService(FakeBus())
+    bus = FakeBus(decrypted_body=b"secure first")
+    service = ChatService(bus)
     window = MainWindow(service)
     qtbot.addWidget(window)
     window.show()
     clipboard = QApplication.clipboard()
 
+    service.handle_message(Message(MessageType.CHAT_SECURE, {}, b"ciphertext"))
     service.handle_message(Message(MessageType.CHAT_PLAIN, {}, b"plain last"))
-    qtbot.mouseClick(window.copy_last_button, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window.copy_secure_button, Qt.MouseButton.LeftButton)
     assert clipboard.text() == "plain last"
 
-    service.handle_message(Message(MessageType.CHAT_SECURE, {}, b"secure last"))
-    qtbot.mouseClick(window.copy_secure_button, Qt.MouseButton.LeftButton)
-    assert clipboard.text() == "secure last"
+    qtbot.mouseClick(window.copy_last_button, Qt.MouseButton.LeftButton)
+    assert clipboard.text() == "plain last"
 
 
 def test_editor_uses_native_copy_and_paste_shortcuts(qtbot):

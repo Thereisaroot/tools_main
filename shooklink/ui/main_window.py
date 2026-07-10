@@ -269,7 +269,7 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(self._chat_service.last_text)
 
     def _copy_last_secure(self) -> None:
-        QApplication.clipboard().setText(self._chat_service.last_secure_text)
+        QApplication.clipboard().setText(self._chat_service.last_text)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._chat_service.remove_message_listener(self.incoming_message.emit)

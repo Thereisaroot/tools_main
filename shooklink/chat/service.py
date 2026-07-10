@@ -30,6 +30,9 @@ class ChatBus(Protocol):
     def send(self, message: Message, *, secure: bool = False) -> None:
         """Queue a typed message for transport."""
 
+    def decrypt_secure(self, message: Message) -> bytes:
+        """Authenticate and decrypt an incoming secure message body."""
+
 
 @dataclass(frozen=True, slots=True)
 class ChatMessage:
@@ -45,7 +48,6 @@ class ChatService:
         self._lock = threading.RLock()
         self._listeners: list[Callable[[ChatMessage], None]] = []
         self._last_text = ""
-        self._last_secure_text = ""
 
     @property
     def secure_available(self) -> bool:
@@ -55,11 +57,6 @@ class ChatService:
     def last_text(self) -> str:
         with self._lock:
             return self._last_text
-
-    @property
-    def last_secure_text(self) -> str:
-        with self._lock:
-            return self._last_secure_text
 
     def add_message_listener(self, listener: Callable[[ChatMessage], None]) -> None:
         with self._lock:
@@ -89,21 +86,27 @@ class ChatService:
             MessageType.CHAT_SECURE,
         ):
             return False
-        if len(message.body) > MAX_CHAT_TEXT_BYTES:
+        body = message.body
+        secure = message.message_type is MessageType.CHAT_SECURE
+        if secure:
+            if not self.secure_available:
+                return False
+            try:
+                body = self._bus.decrypt_secure(message)
+            except Exception:
+                return False
+            if not isinstance(body, bytes):
+                return False
+        if len(body) > MAX_CHAT_TEXT_BYTES:
             return False
         try:
-            text = message.body.decode("utf-8")
+            text = body.decode("utf-8")
         except UnicodeDecodeError:
             return False
 
-        received = ChatMessage(
-            text=text,
-            secure=message.message_type is MessageType.CHAT_SECURE,
-        )
+        received = ChatMessage(text=text, secure=secure)
         with self._lock:
             self._last_text = text
-            if received.secure:
-                self._last_secure_text = text
             listeners = tuple(self._listeners)
         for listener in listeners:
             listener(received)

@@ -18,6 +18,9 @@ class _DisconnectedBus:
     def send(self, _message: Message, *, secure: bool = False) -> None:
         raise RuntimeError("connect a serial peer first")
 
+    def decrypt_secure(self, _message: Message) -> bytes:
+        raise RuntimeError("connect a trusted serial peer first")
+
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ShookLink serial peer client")
