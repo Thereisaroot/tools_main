@@ -167,6 +167,7 @@ class Multiplexer:
             else:
                 self._record_explicit_sequence_locked(item.stream_id, item.sequence)
             self._stream_priorities.setdefault(item.stream_id, item.priority)
+            self._seal_pointer_items_locked(item.priority)
             order = next(self._order)
             heapq.heappush(self._queue, (int(item.priority), order, item))
             self._queued_bytes += len(item.payload)
@@ -356,6 +357,16 @@ class Multiplexer:
         previous = self._last_sequences.get(stream_id, 0)
         if sequence > previous:
             self._last_sequences[stream_id] = sequence
+
+    def _seal_pointer_items_locked(self, priority: Priority) -> None:
+        sealed = [
+            (stream_id, order, item)
+            for stream_id, (order, item) in self._pointer_items.items()
+            if item.priority is priority
+        ]
+        for stream_id, order, item in sealed:
+            del self._pointer_items[stream_id]
+            heapq.heappush(self._queue, (int(priority), order, item))
 
     def _available_priorities_locked(self) -> list[int]:
         priorities = {entry[0] for entry in self._queue}

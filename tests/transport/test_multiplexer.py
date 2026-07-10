@@ -52,6 +52,32 @@ def test_interactive_pointer_coalescing_preserves_order_before_button():
     assert [mux.pop().payload, mux.pop().payload] == [b"latest", b"button"]
 
 
+def test_button_seals_preceding_pointer_before_later_motion_generation():
+    mux = Multiplexer()
+    mux.enqueue_pointer(
+        9,
+        b"move-before-button",
+        message_type=47,
+        priority=Priority.INTERACTIVE,
+    )
+    mux.enqueue(
+        OutboundItem(Priority.INTERACTIVE, 10, b"button", message_type=46)
+    )
+    mux.enqueue_pointer(
+        9,
+        b"move-after-button",
+        message_type=47,
+        priority=Priority.INTERACTIVE,
+    )
+
+    popped = [mux.pop(timeout=0) for _index in range(3)]
+    assert [None if item is None else item.payload for item in popped] == [
+        b"move-before-button",
+        b"button",
+        b"move-after-button",
+    ]
+
+
 def test_pointer_move_overtakes_file_but_not_interactive():
     mux = Multiplexer()
     mux.enqueue(OutboundItem(Priority.FILE, 1, b"file"))
