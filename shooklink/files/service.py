@@ -171,6 +171,13 @@ class _PendingChunk:
 @dataclass(slots=True)
 class _PendingCancel:
     last_sent_at: float
+    direction: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalTransfer:
+    status: str
+    offer: FileOffer | None
 
 
 def sanitize_filename(untrusted_name: str) -> str:
@@ -692,7 +699,7 @@ class FileService:
             str, tuple[FileOffer, str, Path | None]
         ] = OrderedDict()
         self._cancelled_incoming: OrderedDict[str, FileOffer | None] = OrderedDict()
-        self._terminal_status: dict[str, str] = {}
+        self._terminal_status: dict[str, _TerminalTransfer] = {}
         self._pending_cancels: dict[str, _PendingCancel] = {}
         self._preparing_count = 0
         self._listeners: list[Callable[[FileProgress], None]] = []
@@ -741,13 +748,15 @@ class FileService:
 
         def prepared(preparation: Future[OutgoingTransfer]) -> None:
             transfer: OutgoingTransfer | None = None
-            with self._lock:
-                self._preparing_count -= 1
+            slot_reserved = True
             if not result.set_running_or_notify_cancel():
                 try:
                     preparation.result().cancel()
                 except BaseException:
                     pass
+                finally:
+                    with self._lock:
+                        self._preparing_count -= 1
                 return
             try:
                 transfer = preparation.result()
@@ -756,15 +765,20 @@ class FileService:
                         transfer.cancel()
                         raise FileTransferError("file service is closed")
                     self._outgoing[transfer.offer.transfer_id] = transfer
+                    self._preparing_count -= 1
+                    slot_reserved = False
                     self._send(transfer.offer_message(), Priority.NORMAL)
                     self._notify_outgoing(transfer, "offered")
                     if self._outgoing.get(transfer.offer.transfer_id) is not transfer:
                         raise FileTransferCancelled("file transfer was cancelled while preparing")
                     result.set_result(transfer.offer.transfer_id)
             except BaseException as error:
-                if transfer is not None:
-                    with self._lock:
+                with self._lock:
+                    if slot_reserved:
+                        self._preparing_count -= 1
+                    if transfer is not None:
                         self._outgoing.pop(transfer.offer.transfer_id, None)
+                if transfer is not None:
                     transfer.cancel()
                 result.set_exception(error)
 
@@ -791,6 +805,9 @@ class FileService:
             body = self._bus.decrypt_secure(message)
         except Exception as error:
             raise FileProtocolError("file message authentication failed") from error
+        with self._lock:
+            if self._closed:
+                return False
         if not isinstance(body, bytes):
             raise FileProtocolError("file message decryption returned invalid data")
         handler(Message(message.message_type, message.metadata, body))
@@ -824,6 +841,7 @@ class FileService:
         with self._lock:
             transfer = self._outgoing.get(transfer_id)
             if transfer is not None:
+                direction = "outgoing"
                 self._outgoing.pop(transfer_id, None)
                 transfer.cancel()
                 self._notify_outgoing(transfer, "cancelled")
@@ -831,10 +849,11 @@ class FileService:
                 transfer = self._incoming.get(transfer_id)
                 if transfer is None or not transfer.cancel():
                     return
+                direction = "incoming"
                 self._incoming.pop(transfer_id, None)
                 self._remember_cancelled_locked(transfer.offer.transfer_id, transfer.offer)
                 self._notify_incoming(transfer, "cancelled")
-            self._queue_cancel_locked(transfer_id)
+            self._queue_cancel_locked(transfer_id, direction)
 
     def close(self) -> None:
         self._timer_stop.set()
@@ -878,82 +897,18 @@ class FileService:
             raise FileProtocolError("file offer cannot contain a body")
         offer = FileOffer.from_metadata(message.metadata)
         with self._lock:
-            cancelled = self._cancelled_incoming.get(offer.transfer_id)
-            if offer.transfer_id in self._cancelled_incoming:
-                self._cancelled_incoming.move_to_end(offer.transfer_id)
-                reason = "cancelled" if cancelled is None or cancelled == offer else "duplicate"
-                self._send_cancel(offer.transfer_id, reason)
-                return
-            terminal_status = self._terminal_status.get(offer.transfer_id)
-            if terminal_status == "cancelled":
-                self._send_cancel(offer.transfer_id, "cancelled")
-                return
-            completed = self._completed_incoming.get(offer.transfer_id)
-            if completed is not None:
-                self._completed_incoming.move_to_end(offer.transfer_id)
-                if completed[0] == offer:
-                    self._send_finish_status(offer.transfer_id, completed[1])
-                else:
-                    self._send_cancel(offer.transfer_id, "duplicate")
-                return
-            if terminal_status in {"ok", "error"}:
-                self._send_finish_status(offer.transfer_id, terminal_status)
-                return
-            existing = self._incoming.get(offer.transfer_id)
-            if existing is not None:
-                if existing.offer == offer:
-                    self._send_accept(offer.transfer_id)
-                else:
-                    self._send_cancel(offer.transfer_id, "duplicate")
-                return
-            if offer.transfer_id in self._outgoing:
-                self._send_cancel(offer.transfer_id, "duplicate")
-                return
-            if len(self._incoming) >= self._max_incoming_transfers:
-                self._send_cancel(offer.transfer_id, "busy")
-                return
-            if (
-                len(self._terminal_status) + len(self._incoming)
-                >= self._max_terminal_transfers
-            ):
-                self._send_cancel(offer.transfer_id, "capacity")
-                return
-            incoming_bytes = sum(item.offer.size for item in self._incoming.values())
-            if (
-                incoming_bytes + offer.size > self._max_incoming_bytes
-                or incoming_bytes + offer.size
-                > _available_disk_bytes(self.download_dir)
-            ):
-                self._send_cancel(offer.transfer_id, "capacity")
+            if self._offer_is_unavailable_locked(offer):
                 return
         try:
             accepted = bool(self._accept_offer(offer))
         except BaseException:
             logger.exception("incoming file policy failed")
             accepted = False
-        if not accepted:
-            self._send_cancel(offer.transfer_id, "rejected")
-            return
         with self._lock:
-            if offer.transfer_id in self._incoming:
-                self._send_accept(offer.transfer_id)
+            if self._offer_is_unavailable_locked(offer):
                 return
-            if len(self._incoming) >= self._max_incoming_transfers:
-                self._send_cancel(offer.transfer_id, "busy")
-                return
-            if (
-                len(self._terminal_status) + len(self._incoming)
-                >= self._max_terminal_transfers
-            ):
-                self._send_cancel(offer.transfer_id, "capacity")
-                return
-            incoming_bytes = sum(item.offer.size for item in self._incoming.values())
-            if (
-                incoming_bytes + offer.size > self._max_incoming_bytes
-                or incoming_bytes + offer.size
-                > _available_disk_bytes(self.download_dir)
-            ):
-                self._send_cancel(offer.transfer_id, "capacity")
+            if not accepted:
+                self._send_cancel(offer.transfer_id, "rejected")
                 return
             try:
                 transfer = IncomingTransfer.create(offer, self.download_dir)
@@ -964,6 +919,73 @@ class FileService:
             self._send_accept(offer.transfer_id)
         self._notify_incoming(transfer, "receiving")
 
+    def _offer_is_unavailable_locked(self, offer: FileOffer) -> bool:
+        if self._closed:
+            return True
+        cancelled = self._cancelled_incoming.get(offer.transfer_id)
+        if offer.transfer_id in self._cancelled_incoming:
+            self._cancelled_incoming.move_to_end(offer.transfer_id)
+            reason = "cancelled" if cancelled is None or cancelled == offer else "duplicate"
+            self._send_cancel(offer.transfer_id, reason)
+            return True
+        terminal = self._terminal_status.get(offer.transfer_id)
+        if terminal is not None and terminal.status == "cancelled":
+            reason = (
+                "cancelled"
+                if terminal.offer is None or terminal.offer == offer
+                else "duplicate"
+            )
+            self._send_cancel(offer.transfer_id, reason)
+            return True
+        completed = self._completed_incoming.get(offer.transfer_id)
+        if completed is not None:
+            self._completed_incoming.move_to_end(offer.transfer_id)
+            if completed[0] == offer:
+                self._send_finish_status(offer.transfer_id, completed[1])
+            else:
+                self._send_cancel(offer.transfer_id, "duplicate")
+            return True
+        if terminal is not None and terminal.status in {"ok", "error"}:
+            if terminal.offer == offer:
+                self._send_finish_status(offer.transfer_id, terminal.status)
+            else:
+                self._send_cancel(offer.transfer_id, "duplicate")
+            return True
+        existing = self._incoming.get(offer.transfer_id)
+        if existing is not None:
+            if existing.offer == offer:
+                self._send_accept(offer.transfer_id)
+            else:
+                self._send_cancel(offer.transfer_id, "duplicate")
+            return True
+        if offer.transfer_id in self._outgoing:
+            self._send_cancel(offer.transfer_id, "duplicate")
+            return True
+        pending_incoming_cancels = sum(
+            pending.direction == "incoming"
+            for pending in self._pending_cancels.values()
+        )
+        if (
+            len(self._incoming) + pending_incoming_cancels
+            >= self._max_incoming_transfers
+        ):
+            self._send_cancel(offer.transfer_id, "busy")
+            return True
+        if (
+            len(self._terminal_status) + len(self._incoming)
+            >= self._max_terminal_transfers
+        ):
+            self._send_cancel(offer.transfer_id, "capacity")
+            return True
+        incoming_bytes = sum(item.offer.size for item in self._incoming.values())
+        if (
+            incoming_bytes + offer.size > self._max_incoming_bytes
+            or incoming_bytes + offer.size > _available_disk_bytes(self.download_dir)
+        ):
+            self._send_cancel(offer.transfer_id, "capacity")
+            return True
+        return False
+
     def _handle_accept(self, message: Message) -> None:
         if message.body or set(message.metadata) != {"transfer_id"}:
             raise FileProtocolError("file accept fields are invalid")
@@ -972,8 +994,15 @@ class FileService:
             transfer = self._outgoing.get(transfer_id)
             if transfer is None:
                 return
-            transfer.accept()
-            messages = transfer.next_messages()
+            try:
+                transfer.accept()
+                messages = transfer.next_messages()
+            except (OSError, FileTransferError):
+                self._outgoing.pop(transfer_id, None)
+                transfer.cancel()
+                self._queue_cancel_locked(transfer_id, "outgoing")
+                self._notify_outgoing(transfer, "failed")
+                return
             self._send_many(messages)
             self._notify_outgoing(transfer, "sending")
 
@@ -984,7 +1013,10 @@ class FileService:
         with self._lock:
             if (
                 transfer_id in self._cancelled_incoming
-                or self._terminal_status.get(transfer_id) == "cancelled"
+                or (
+                    (terminal := self._terminal_status.get(transfer_id)) is not None
+                    and terminal.status == "cancelled"
+                )
             ):
                 self._send_cancel(transfer_id, "ack")
                 return
@@ -993,9 +1025,9 @@ class FileService:
                 self._completed_incoming.move_to_end(transfer_id)
                 self._send_finish_status(transfer_id, completed[1])
                 return
-            terminal_status = self._terminal_status.get(transfer_id)
-            if terminal_status in {"ok", "error"}:
-                self._send_finish_status(transfer_id, terminal_status)
+            terminal = self._terminal_status.get(transfer_id)
+            if terminal is not None and terminal.status in {"ok", "error"}:
+                self._send_finish_status(transfer_id, terminal.status)
                 return
             transfer = self._incoming.get(transfer_id)
             if transfer is None:
@@ -1058,7 +1090,10 @@ class FileService:
                 raise FileProtocolError("file finish fields are invalid")
             if (
                 transfer_id in self._cancelled_incoming
-                or self._terminal_status.get(transfer_id) == "cancelled"
+                or (
+                    (terminal := self._terminal_status.get(transfer_id)) is not None
+                    and terminal.status == "cancelled"
+                )
             ):
                 self._send_cancel(transfer_id, "ack")
                 return
@@ -1069,9 +1104,9 @@ class FileService:
                     self._completed_incoming[transfer_id][1],
                 )
                 return
-            terminal_status = self._terminal_status.get(transfer_id)
-            if terminal_status in {"ok", "error"}:
-                self._send_finish_status(transfer_id, terminal_status)
+            terminal = self._terminal_status.get(transfer_id)
+            if terminal is not None and terminal.status in {"ok", "error"}:
+                self._send_finish_status(transfer_id, terminal.status)
                 return
             transfer = self._incoming.get(transfer_id)
             if transfer is None:
@@ -1139,6 +1174,8 @@ class FileService:
         if reason is not None and not isinstance(reason, str):
             raise FileProtocolError("file cancel reason is invalid")
         with self._lock:
+            if self._closed:
+                return
             if reason == "ack":
                 self._pending_cancels.pop(transfer_id, None)
                 return
@@ -1157,10 +1194,13 @@ class FileService:
                     elif transfer.state == "completed":
                         self._send_finish_status(transfer_id, "ok")
                         return
-                elif self._terminal_status.get(transfer_id) in {"ok", "error"}:
+                elif (
+                    (terminal := self._terminal_status.get(transfer_id)) is not None
+                    and terminal.status in {"ok", "error"}
+                ):
                     self._send_finish_status(
                         transfer_id,
-                        self._terminal_status[transfer_id],
+                        terminal.status,
                     )
                     return
                 else:
@@ -1207,9 +1247,9 @@ class FileService:
             Priority.NORMAL,
         )
 
-    def _queue_cancel_locked(self, transfer_id: str) -> None:
+    def _queue_cancel_locked(self, transfer_id: str, direction: str) -> None:
         timestamp = time.monotonic()
-        self._pending_cancels[transfer_id] = _PendingCancel(timestamp)
+        self._pending_cancels[transfer_id] = _PendingCancel(timestamp, direction)
         self._send(
             Message(
                 MessageType.FILE_CANCEL,
@@ -1239,7 +1279,10 @@ class FileService:
             path,
         )
         self._completed_incoming.move_to_end(transfer.offer.transfer_id)
-        self._terminal_status[transfer.offer.transfer_id] = status
+        self._terminal_status[transfer.offer.transfer_id] = _TerminalTransfer(
+            status,
+            transfer.offer,
+        )
         while len(self._completed_incoming) > MAX_COMPLETED_TRANSFERS:
             self._completed_incoming.popitem(last=False)
 
@@ -1255,7 +1298,10 @@ class FileService:
             or len(self._terminal_status) + len(self._incoming)
             < self._max_terminal_transfers
         ):
-            self._terminal_status[transfer_id] = "cancelled"
+            self._terminal_status[transfer_id] = _TerminalTransfer(
+                "cancelled",
+                offer,
+            )
         while len(self._cancelled_incoming) > MAX_COMPLETED_TRANSFERS:
             self._cancelled_incoming.popitem(last=False)
     def _send(self, message: Message, priority: Priority) -> None:
@@ -1304,7 +1350,10 @@ class FileService:
                 self._progress_started.pop(progress.transfer_id, None)
             listeners = tuple(self._listeners)
         for listener in listeners:
-            listener(progress)
+            try:
+                listener(progress)
+            except Exception:
+                logger.exception("file progress listener failed")
 
 
 def _available_disk_bytes(path: Path) -> int:

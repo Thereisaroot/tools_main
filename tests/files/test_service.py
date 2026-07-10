@@ -2,6 +2,7 @@ import hashlib
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from shooklink.files.service import (
     FileHashMismatch,
     FileOffer,
     FileProtocolError,
+    FileTransferError,
     RETRANSMIT_TIMEOUT,
     FileService,
     IncomingTransfer,
@@ -39,6 +41,16 @@ class QueueBus:
         if not self.trusted or not self.authenticated:
             raise RuntimeError("file frame authentication failed")
         return message.body
+
+
+class InlineExecutor:
+    def submit(self, function, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(function(*args, **kwargs))
+        except BaseException as error:
+            future.set_exception(error)
+        return future
 
 
 def make_offer(name, data, *, transfer_id="a" * 32, chunk_size=8):
@@ -435,6 +447,54 @@ def test_service_retries_offer_and_finish_control_frames(tmp_path):
     service.close()
 
 
+@pytest.mark.parametrize("mutation", ["remove", "truncate"])
+def test_source_startup_failure_cleans_sender_and_reliably_cancels_peer(
+    tmp_path,
+    mutation,
+):
+    source = tmp_path / f"source-{mutation}.bin"
+    source.write_bytes(b"source payload")
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    progress = []
+    service.add_progress_listener(progress.append)
+    transfer_id = service.send_file(source).result(timeout=2)
+    if mutation == "remove":
+        source.unlink()
+    else:
+        source.write_bytes(b"")
+    bus.sent.clear()
+
+    service.handle_message(
+        Message(MessageType.FILE_ACCEPT, {"transfer_id": transfer_id})
+    )
+
+    assert progress[-1].state == "failed"
+    assert [message.message_type for message, _secure, _priority in bus.sent] == [
+        MessageType.FILE_CANCEL
+    ]
+    assert bus.sent[-1][0].metadata["transfer_id"] == transfer_id
+
+    bus.sent.clear()
+    service.poll(now=time.monotonic() + RETRANSMIT_TIMEOUT + 1)
+
+    assert [message.message_type for message, _secure, _priority in bus.sent] == [
+        MessageType.FILE_CANCEL
+    ]
+
+    service.handle_message(
+        Message(
+            MessageType.FILE_CANCEL,
+            {"transfer_id": transfer_id, "reason": "ack"},
+        )
+    )
+    bus.sent.clear()
+    service.poll(now=time.monotonic() + RETRANSMIT_TIMEOUT * 3)
+
+    assert bus.sent == []
+    service.close()
+
+
 def test_incoming_offer_policy_can_reject_without_reserving_a_file(tmp_path):
     offer = make_offer("reject.bin", b"rejected")
     bus = QueueBus()
@@ -516,6 +576,57 @@ def test_cancel_control_retries_until_peer_acknowledges(tmp_path):
 
     service.poll(now=time.monotonic() + RETRANSMIT_TIMEOUT * 3)
     assert bus.sent == []
+    service.close()
+
+
+def test_serial_incoming_cancels_wait_for_ack_before_admitting_more(tmp_path):
+    bus = QueueBus()
+    service = FileService(
+        bus,
+        tmp_path / "downloads",
+        max_incoming_transfers=2,
+        max_outgoing_transfers=1,
+    )
+    offers = [
+        make_offer(
+            f"cancel-{index}.bin",
+            b"x",
+            transfer_id=f"{index + 1:032x}",
+            chunk_size=1,
+        )
+        for index in range(3)
+    ]
+    for offer in offers[:2]:
+        service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+        assert bus.sent[-1][0].message_type is MessageType.FILE_ACCEPT
+        service.cancel(offer.transfer_id)
+
+    bus.sent.clear()
+    service.handle_message(Message(MessageType.FILE_OFFER, offers[2].to_metadata()))
+
+    assert bus.sent[-1][0].message_type is MessageType.FILE_CANCEL
+    assert bus.sent[-1][0].metadata["reason"] == "busy"
+    assert not any((tmp_path / "downloads").glob("*.part"))
+
+    bus.sent.clear()
+    service.poll(now=time.monotonic() + RETRANSMIT_TIMEOUT + 1)
+    retried_ids = {
+        message.metadata["transfer_id"]
+        for message, _secure, _priority in bus.sent
+        if message.message_type is MessageType.FILE_CANCEL
+    }
+    assert retried_ids == {offer.transfer_id for offer in offers[:2]}
+
+    service.handle_message(
+        Message(
+            MessageType.FILE_CANCEL,
+            {"transfer_id": offers[0].transfer_id, "reason": "ack"},
+        )
+    )
+    bus.sent.clear()
+    service.handle_message(Message(MessageType.FILE_OFFER, offers[2].to_metadata()))
+
+    assert bus.sent[-1][0].message_type is MessageType.FILE_ACCEPT
     service.close()
 
 
@@ -773,6 +884,52 @@ def test_progress_listener_can_close_service_from_completion_thread(tmp_path):
     assert errors == []
 
 
+def test_progress_listener_exception_does_not_abandon_offered_transfer(
+    tmp_path,
+    caplog,
+):
+    source = tmp_path / "listener-error.bin"
+    source.write_bytes(b"listener")
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    observed = []
+
+    def failing_listener(progress):
+        if progress.state == "offered":
+            raise RuntimeError("listener failed")
+
+    service.add_progress_listener(failing_listener)
+    service.add_progress_listener(observed.append)
+    caplog.set_level("ERROR", logger="shooklink.files.service")
+
+    try:
+        transfer_id = service.send_file(source).result(timeout=2)
+        offer = next(
+            message
+            for message, _secure, _priority in bus.sent
+            if message.message_type is MessageType.FILE_OFFER
+        )
+        assert offer.metadata["transfer_id"] == transfer_id
+        assert observed[-1].state == "offered"
+        assert not any(
+            message.message_type is MessageType.FILE_CANCEL
+            for message, _secure, _priority in bus.sent
+        )
+
+        bus.sent.clear()
+        service.handle_message(
+            Message(MessageType.FILE_ACCEPT, {"transfer_id": transfer_id})
+        )
+
+        assert any(
+            message.message_type is MessageType.FILE_CHUNK
+            for message, _secure, _priority in bus.sent
+        )
+        assert "file progress listener failed" in caplog.text
+    finally:
+        service.close()
+
+
 def test_closed_service_rejects_incoming_offer_without_creating_partial_file(tmp_path):
     offer = make_offer("closed.bin", b"closed", transfer_id="b" * 32)
     bus = QueueBus()
@@ -786,6 +943,148 @@ def test_closed_service_rejects_incoming_offer_without_creating_partial_file(tmp
     )
     assert bus.sent == []
     assert not list(download_dir.glob("*.part"))
+
+
+def test_close_during_offer_decrypt_cannot_accept_or_create_partial_file(tmp_path):
+    class BlockingDecryptBus(QueueBus):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def decrypt_secure(self, message):
+            self.decrypt_calls.append(message)
+            self.started.set()
+            assert self.release.wait(2)
+            return message.body
+
+    offer = make_offer("decrypt-close.bin", b"closed", transfer_id="c" * 32)
+    bus = BlockingDecryptBus()
+    download_dir = tmp_path / "downloads"
+    service = FileService(bus, download_dir)
+    results = []
+    worker = threading.Thread(
+        target=lambda: results.append(
+            service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+        )
+    )
+    worker.start()
+    assert bus.started.wait(1)
+
+    service.close()
+    bus.release.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert results == [False]
+    assert bus.sent == []
+    assert not list(download_dir.glob("*.part"))
+
+
+def test_close_after_cancel_decrypt_cannot_repopulate_terminal_state(
+    tmp_path,
+    monkeypatch,
+):
+    bus = QueueBus()
+    service = FileService(bus, tmp_path / "downloads")
+    entered_handler = threading.Event()
+    release_handler = threading.Event()
+    original_handler = service._handle_cancel
+
+    def blocking_handler(message):
+        entered_handler.set()
+        assert release_handler.wait(2)
+        original_handler(message)
+
+    monkeypatch.setattr(service, "_handle_cancel", blocking_handler)
+    worker = threading.Thread(
+        target=service.handle_message,
+        args=(
+            Message(
+                MessageType.FILE_CANCEL,
+                {"transfer_id": "f" * 32, "reason": "cancelled"},
+            ),
+        ),
+    )
+    worker.start()
+    assert entered_handler.wait(1)
+
+    service.close()
+    release_handler.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert bus.sent == []
+    assert service._terminal_status == {}
+
+
+def test_close_during_offer_policy_cannot_accept_or_leak_partial_file(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_policy(_offer):
+        started.set()
+        assert release.wait(2)
+        return True
+
+    offer = make_offer("policy-close.bin", b"closed", transfer_id="b" * 32)
+    bus = QueueBus()
+    download_dir = tmp_path / "downloads"
+    service = FileService(bus, download_dir, accept_offer=blocking_policy)
+    worker = threading.Thread(
+        target=service.handle_message,
+        args=(Message(MessageType.FILE_OFFER, offer.to_metadata()),),
+    )
+    worker.start()
+    assert started.wait(1)
+
+    service.close()
+    release.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert bus.sent == []
+    assert not list(download_dir.glob("*.part"))
+
+
+def test_cancel_during_offer_policy_prevents_accept_and_partial_file(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_policy(_offer):
+        started.set()
+        assert release.wait(2)
+        return True
+
+    offer = make_offer("policy-cancel.bin", b"cancelled", transfer_id="a" * 32)
+    bus = QueueBus()
+    download_dir = tmp_path / "downloads"
+    service = FileService(bus, download_dir, accept_offer=blocking_policy)
+    worker = threading.Thread(
+        target=service.handle_message,
+        args=(Message(MessageType.FILE_OFFER, offer.to_metadata()),),
+    )
+    worker.start()
+    assert started.wait(1)
+
+    service.handle_message(
+        Message(
+            MessageType.FILE_CANCEL,
+            {"transfer_id": offer.transfer_id, "reason": "cancelled"},
+        )
+    )
+    release.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert not any(
+        message.message_type is MessageType.FILE_ACCEPT
+        for message, _secure, _priority in bus.sent
+    )
+    assert bus.sent[-1][0].message_type is MessageType.FILE_CANCEL
+    assert bus.sent[-1][0].metadata["reason"] == "cancelled"
+    assert not list(download_dir.glob("*.part"))
+    service.close()
 
 
 def test_unacknowledged_cancellation_counts_against_outgoing_capacity(tmp_path):
@@ -805,6 +1104,51 @@ def test_unacknowledged_cancellation_counts_against_outgoing_capacity(tmp_path):
         service.send_file(second)
 
     service.close()
+
+
+def test_prepared_transfer_keeps_capacity_reserved_until_registration(
+    tmp_path,
+    monkeypatch,
+):
+    from shooklink.files import service as service_module
+
+    entered_transition = threading.Event()
+    release_transition = threading.Event()
+
+    class BlockingTransitionFuture(Future):
+        created = 0
+
+        def __init__(self):
+            super().__init__()
+            self._blocks_transition = self.__class__.created == 0
+            self.__class__.created += 1
+
+        def set_running_or_notify_cancel(self):
+            if self._blocks_transition:
+                entered_transition.set()
+                assert release_transition.wait(2)
+            return super().set_running_or_notify_cancel()
+
+    monkeypatch.setattr(service_module, "Future", BlockingTransitionFuture)
+    first = tmp_path / "first-capacity.bin"
+    second = tmp_path / "second-capacity.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    service = FileService(
+        QueueBus(),
+        tmp_path / "downloads",
+        max_outgoing_transfers=1,
+    )
+    result = service.send_file(first)
+    assert entered_transition.wait(1)
+
+    try:
+        with pytest.raises(FileTransferError, match="capacity"):
+            service.send_file(second)
+    finally:
+        release_transition.set()
+        result.result(timeout=2)
+        service.close()
 
 
 def test_exact_terminal_registry_refuses_new_ids_when_its_bound_is_reached(tmp_path):
@@ -828,6 +1172,57 @@ def test_exact_terminal_registry_refuses_new_ids_when_its_bound_is_reached(tmp_p
 
     assert bus.sent[-1][0].message_type is MessageType.FILE_CANCEL
     assert bus.sent[-1][0].metadata["reason"] == "capacity"
+    service.close()
+
+
+def test_terminal_registry_retains_offer_identity_after_detail_eviction(
+    tmp_path,
+    monkeypatch,
+):
+    from shooklink.files import service as service_module
+
+    monkeypatch.setattr(service_module, "MAX_COMPLETED_TRANSFERS", 1)
+    bus = QueueBus()
+    service = FileService(
+        bus,
+        tmp_path / "downloads",
+        executor=InlineExecutor(),
+    )
+    first = make_offer("first.bin", b"first", transfer_id="d" * 32)
+    second = make_offer("second.bin", b"second", transfer_id="e" * 32)
+
+    for offer, data in ((first, b"first"), (second, b"second")):
+        service.handle_message(Message(MessageType.FILE_OFFER, offer.to_metadata()))
+        service.handle_message(
+            Message(
+                MessageType.FILE_CHUNK,
+                {"transfer_id": offer.transfer_id, "index": 0},
+                data,
+            )
+        )
+        service.handle_message(
+            Message(
+                MessageType.FILE_FINISH,
+                {"transfer_id": offer.transfer_id, "sha256": offer.sha256},
+            )
+        )
+
+    bus.sent.clear()
+    service.handle_message(Message(MessageType.FILE_OFFER, first.to_metadata()))
+    same_offer_reply = bus.sent[-1][0]
+
+    conflicting = make_offer(
+        "conflict.bin",
+        b"different",
+        transfer_id=first.transfer_id,
+    )
+    service.handle_message(Message(MessageType.FILE_OFFER, conflicting.to_metadata()))
+    conflicting_reply = bus.sent[-1][0]
+
+    assert same_offer_reply.message_type is MessageType.FILE_FINISH
+    assert same_offer_reply.metadata["status"] == "ok"
+    assert conflicting_reply.message_type is MessageType.FILE_CANCEL
+    assert conflicting_reply.metadata["reason"] == "duplicate"
     service.close()
 
 
