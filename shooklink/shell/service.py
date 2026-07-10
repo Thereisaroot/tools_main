@@ -15,6 +15,7 @@ from shooklink.shell.process import TerminalProcess
 from shooklink.transport.multiplexer import Priority
 
 _SESSION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+MAX_SHELL_IO_BYTES = 48 * 1024
 _SHELL_TYPES = frozenset(
     {
         MessageType.SHELL_OPEN,
@@ -55,6 +56,7 @@ class ProcessFactory(Protocol):
         self,
         on_output: Callable[[bytes], None],
         on_exit: Callable[[int | None], None],
+        term: str,
     ) -> TerminalProcess: ...
 
 
@@ -79,6 +81,7 @@ class _ShellSession:
     direction: str
     state: str
     process: TerminalProcess | None = None
+    pending_size: tuple[int, int] | None = None
 
 
 class ShellService:
@@ -182,6 +185,7 @@ class ShellService:
                         "columns": columns,
                         "rows": rows,
                         "term": term,
+                        "utf8": True,
                     },
                 ),
                 Priority.INTERACTIVE,
@@ -225,14 +229,31 @@ class ShellService:
         if not isinstance(data, bytes):
             raise TypeError("shell input must be bytes")
         self._require_outgoing_session(session_id)
-        self._send(
-            Message(MessageType.SHELL_INPUT, {"session_id": session_id}, data),
-            Priority.INTERACTIVE,
-        )
+        for offset in range(0, len(data), MAX_SHELL_IO_BYTES):
+            self._send(
+                Message(
+                    MessageType.SHELL_INPUT,
+                    {"session_id": session_id},
+                    data[offset : offset + MAX_SHELL_IO_BYTES],
+                ),
+                Priority.INTERACTIVE,
+            )
 
     def resize(self, session_id: str, columns: int, rows: int) -> None:
         _validate_terminal_size(columns, rows)
-        self._require_outgoing_session(session_id)
+        _validate_session_id(session_id)
+        with self._lock:
+            if (
+                self._session is None
+                or self._session.session_id != session_id
+                or self._session.direction != "outgoing"
+            ):
+                raise ShellUnavailable("remote shell is not active")
+            if self._session.state == "requesting":
+                self._session.pending_size = (columns, rows)
+                return
+            if self._session.state != "active":
+                raise ShellUnavailable("remote shell is not active")
         self._send(
             Message(
                 MessageType.SHELL_RESIZE,
@@ -272,7 +293,18 @@ class ShellService:
     def _handle_open(self, message: Message) -> None:
         session_id = _session_id(message.metadata)
         columns, rows = _terminal_size(message.metadata)
-        _validate_term(message.metadata.get("term"))
+        if set(message.metadata) != {
+            "session_id",
+            "columns",
+            "rows",
+            "term",
+            "utf8",
+        }:
+            raise ShellProtocolError("shell open fields are invalid")
+        term = message.metadata.get("term")
+        _validate_term(term)
+        if message.metadata.get("utf8") is not True:
+            raise ShellProtocolError("UTF-8 terminal support is required")
         if message.body:
             raise ShellProtocolError("shell open cannot contain a body")
         with self._lock:
@@ -295,23 +327,42 @@ class ShellService:
         process = self._process_factory(
             lambda data: self._process_output(session_id, data),
             lambda code: self._process_exit(session_id, code),
+            term,
         )
+        denied_reason = None
         with self._lock:
-            if self._session is not None:
-                self._send(
-                    Message(
-                        MessageType.SHELL_DENY,
-                        {"session_id": session_id, "reason": "busy"},
-                    ),
-                    Priority.INTERACTIVE,
+            if not self._allow_remote_shell:
+                denied_reason = "permission"
+            elif self._session is not None:
+                denied_reason = "busy"
+            else:
+                self._session = _ShellSession(
+                    session_id,
+                    "incoming",
+                    "active",
+                    process,
                 )
-                return
-            self._session = _ShellSession(
-                session_id,
-                "incoming",
-                "active",
-                process,
+        if denied_reason is not None:
+            process.terminate()
+            self._send(
+                Message(
+                    MessageType.SHELL_DENY,
+                    {"session_id": session_id, "reason": denied_reason},
+                ),
+                Priority.INTERACTIVE,
             )
+            return
+        try:
+            self._send(
+                Message(MessageType.SHELL_ACCEPT, {"session_id": session_id}),
+                Priority.INTERACTIVE,
+            )
+        except BaseException:
+            with self._lock:
+                if self._session is not None and self._session.session_id == session_id:
+                    self._session = None
+            process.terminate()
+            raise
         try:
             process.start(columns, rows)
         except BaseException:
@@ -321,16 +372,12 @@ class ShellService:
             process.terminate()
             self._send(
                 Message(
-                    MessageType.SHELL_DENY,
+                    MessageType.SHELL_EXIT,
                     {"session_id": session_id, "reason": "start_failed"},
                 ),
                 Priority.INTERACTIVE,
             )
             return
-        self._send(
-            Message(MessageType.SHELL_ACCEPT, {"session_id": session_id}),
-            Priority.INTERACTIVE,
-        )
         with self._lock:
             active = (
                 self._session is not None
@@ -344,6 +391,7 @@ class ShellService:
         session_id = _session_id(message.metadata)
         if message.body:
             raise ShellProtocolError("shell accept cannot contain a body")
+        pending_size = None
         with self._lock:
             if (
                 self._session is None
@@ -353,7 +401,11 @@ class ShellService:
             ):
                 raise ShellProtocolError("stale shell accept")
             self._session.state = "active"
+            pending_size = self._session.pending_size
+            self._session.pending_size = None
         self._notify_state(ShellState(session_id, "outgoing", "active"))
+        if pending_size is not None:
+            self.resize(session_id, *pending_size)
 
     def _handle_deny(self, message: Message) -> None:
         session_id = _session_id(message.metadata)
@@ -374,11 +426,15 @@ class ShellService:
 
     def _handle_input(self, message: Message) -> None:
         session_id = _session_id(message.metadata)
+        if len(message.body) > MAX_SHELL_IO_BYTES:
+            raise ShellProtocolError("shell input exceeds the frame budget")
         process = self._require_incoming_process(session_id)
         process.write(message.body)
 
     def _handle_output(self, message: Message) -> None:
         session_id = _session_id(message.metadata)
+        if len(message.body) > MAX_SHELL_IO_BYTES:
+            raise ShellProtocolError("shell output exceeds the frame budget")
         self._require_outgoing_session(session_id)
         output = ShellOutput(session_id, message.body)
         with self._lock:
@@ -421,10 +477,15 @@ class ShellService:
                 or self._session.direction != "incoming"
             ):
                 return
-        self._send(
-            Message(MessageType.SHELL_OUTPUT, {"session_id": session_id}, data),
-            Priority.NORMAL,
-        )
+        for offset in range(0, len(data), MAX_SHELL_IO_BYTES):
+            self._send(
+                Message(
+                    MessageType.SHELL_OUTPUT,
+                    {"session_id": session_id},
+                    data[offset : offset + MAX_SHELL_IO_BYTES],
+                ),
+                Priority.NORMAL,
+            )
 
     def _process_exit(self, session_id: str, exit_code: int | None) -> None:
         with self._lock:
@@ -480,14 +541,14 @@ class ShellService:
             listener(state)
 
 
-def _default_process_factory(on_output, on_exit) -> TerminalProcess:
+def _default_process_factory(on_output, on_exit, term: str) -> TerminalProcess:
     if sys.platform == "win32":
         from shooklink.shell.windows_conpty import WindowsConPtyProcess
 
-        return WindowsConPtyProcess(on_output, on_exit)
+        return WindowsConPtyProcess(on_output, on_exit, term=term)
     from shooklink.shell.unix_pty import UnixPtyProcess
 
-    return UnixPtyProcess(on_output, on_exit)
+    return UnixPtyProcess(on_output, on_exit, term=term)
 
 
 def _validate_session_id(session_id: str) -> None:
@@ -528,6 +589,7 @@ def _validate_term(term: Any) -> None:
 
 __all__ = [
     "ShellOutput",
+    "MAX_SHELL_IO_BYTES",
     "ShellProtocolError",
     "ShellService",
     "ShellState",

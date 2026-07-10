@@ -77,3 +77,37 @@ def test_remote_exit_does_not_send_a_second_close(qtbot):
     window.close()
 
     assert closed == []
+
+
+def test_large_paste_is_emitted_in_bounded_chunks(qtbot):
+    sent = []
+    window = TerminalWindow(
+        "d" * 32,
+        sent.append,
+        lambda columns, rows: None,
+        lambda: None,
+    )
+    qtbot.addWidget(window)
+    QApplication.clipboard().setText("x" * 100_000)
+
+    window.terminal_view.paste_to_remote()
+
+    assert all(len(chunk) <= 16 * 1024 for chunk in sent)
+    assert b"".join(sent) == b"x" * 100_000
+
+
+def test_rendered_qt_cursor_tracks_pyte_cursor(qtbot):
+    window = TerminalWindow(
+        "e" * 32,
+        lambda data: None,
+        lambda columns, rows: None,
+        lambda: None,
+    )
+    qtbot.addWidget(window)
+    window.show()
+
+    window.feed_output(b"abc\x1b[2D")
+
+    qtbot.waitUntil(lambda: window.terminal_view.toPlainText().startswith("abc"))
+    assert window.screen.cursor.x == 1
+    assert window.terminal_view.textCursor().positionInBlock() == 1

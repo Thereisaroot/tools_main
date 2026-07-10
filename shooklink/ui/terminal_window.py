@@ -8,12 +8,15 @@ from collections.abc import Callable
 import pyte
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import (
+    QColor,
     QCloseEvent,
     QContextMenuEvent,
     QFont,
     QKeyEvent,
     QKeySequence,
     QResizeEvent,
+    QTextCharFormat,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -54,6 +57,25 @@ _KEY_SEQUENCES = {
     Qt.Key.Key_Tab: b"\t",
     Qt.Key.Key_Backtab: b"\x1b[Z",
     Qt.Key.Key_Escape: b"\x1b",
+}
+MAX_TERMINAL_INPUT_CHUNK = 16 * 1024
+_ANSI_COLORS = {
+    "black": "#1a1f1e",
+    "red": "#d75f5f",
+    "green": "#5faf87",
+    "brown": "#d7af5f",
+    "blue": "#5f87d7",
+    "magenta": "#af87d7",
+    "cyan": "#5fafaf",
+    "white": "#d8e7df",
+    "brightblack": "#68736f",
+    "brightred": "#ff8787",
+    "brightgreen": "#87d7af",
+    "brightbrown": "#ffdf87",
+    "brightblue": "#87afff",
+    "brightmagenta": "#d7afff",
+    "brightcyan": "#87d7d7",
+    "brightwhite": "#ffffff",
 }
 
 
@@ -128,7 +150,11 @@ class TerminalView(QPlainTextEdit):
     def paste_to_remote(self) -> None:
         text = QApplication.clipboard().text()
         if text:
-            self.input_bytes.emit(text.encode("utf-8"))
+            encoded = text.encode("utf-8")
+            for offset in range(0, len(encoded), MAX_TERMINAL_INPUT_CHUNK):
+                self.input_bytes.emit(
+                    encoded[offset : offset + MAX_TERMINAL_INPUT_CHUNK]
+                )
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -228,6 +254,35 @@ class TerminalWindow(QMainWindow):
 
     def _render(self) -> None:
         self.terminal_view.setPlainText("\n".join(self.screen.display))
+        document = self.terminal_view.document()
+        for row, cells in self.screen.buffer.items():
+            block = document.findBlockByNumber(row)
+            if not block.isValid():
+                continue
+            for column, cell in cells.items():
+                if column >= self.screen.columns:
+                    continue
+                character_format = _character_format(cell)
+                if character_format is None:
+                    continue
+                cursor = QTextCursor(document)
+                cursor.setPosition(block.position() + column)
+                cursor.movePosition(
+                    QTextCursor.MoveOperation.Right,
+                    QTextCursor.MoveMode.KeepAnchor,
+                    1,
+                )
+                cursor.mergeCharFormat(character_format)
+        cursor_row = min(self.screen.cursor.y, max(0, document.blockCount() - 1))
+        block = document.findBlockByNumber(cursor_row)
+        if block.isValid():
+            cursor = QTextCursor(block)
+            cursor.movePosition(
+                QTextCursor.MoveOperation.Right,
+                QTextCursor.MoveMode.MoveAnchor,
+                min(self.screen.cursor.x, max(0, block.length() - 1)),
+            )
+            self.terminal_view.setTextCursor(cursor)
 
     def _mark_exited(self, exit_code: int | None) -> None:
         self._remote_exited = True
@@ -240,4 +295,45 @@ class TerminalWindow(QMainWindow):
         super().closeEvent(event)
 
 
-__all__ = ["TerminalView", "TerminalWindow"]
+def _character_format(cell) -> QTextCharFormat | None:
+    if not any(
+        (
+            cell.fg != "default",
+            cell.bg != "default",
+            cell.bold,
+            cell.italics,
+            cell.underscore,
+            cell.strikethrough,
+            cell.reverse,
+        )
+    ):
+        return None
+    foreground = _terminal_color(cell.fg, "#d8e7df")
+    background = _terminal_color(cell.bg, "#0d1715")
+    if cell.reverse:
+        foreground, background = background, foreground
+    character_format = QTextCharFormat()
+    character_format.setForeground(foreground)
+    character_format.setBackground(background)
+    character_format.setFontWeight(QFont.Weight.Bold if cell.bold else QFont.Weight.Normal)
+    character_format.setFontItalic(cell.italics)
+    character_format.setFontUnderline(cell.underscore)
+    character_format.setFontStrikeOut(cell.strikethrough)
+    return character_format
+
+
+def _terminal_color(value: str, fallback: str) -> QColor:
+    if value == "default":
+        return QColor(fallback)
+    if value in _ANSI_COLORS:
+        return QColor(_ANSI_COLORS[value])
+    if len(value) == 6 and all(character in "0123456789abcdef" for character in value):
+        return QColor(f"#{value}")
+    return QColor(fallback)
+
+
+__all__ = [
+    "MAX_TERMINAL_INPUT_CHUNK",
+    "TerminalView",
+    "TerminalWindow",
+]

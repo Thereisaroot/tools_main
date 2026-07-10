@@ -26,11 +26,15 @@ class UnixPtyProcess:
         on_exit: Callable[[int | None], None],
         *,
         command: Sequence[str] | None = None,
+        term: str = "xterm-256color",
     ) -> None:
         shell = os.environ.get("SHELL", "/bin/sh")
         self.command = list(command) if command is not None else [shell, "-l"]
         if not self.command:
             raise ValueError("terminal command cannot be empty")
+        if not isinstance(term, str) or not term:
+            raise ValueError("terminal type must be a non-empty string")
+        self.term = term
         self._on_output = on_output
         self._on_exit = on_exit
         self._lock = threading.RLock()
@@ -51,7 +55,7 @@ class UnixPtyProcess:
         master_fd, slave_fd = pty.openpty()
         _set_window_size(slave_fd, columns, rows)
         environment = os.environ.copy()
-        environment.setdefault("TERM", "xterm-256color")
+        environment["TERM"] = self.term
         environment.setdefault("COLORTERM", "truecolor")
         file_actions = [
             (os.POSIX_SPAWN_DUP2, slave_fd, 0),

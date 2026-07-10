@@ -56,14 +56,18 @@ class FakeProcess:
 class FakeProcessFactory:
     def __init__(self):
         self.processes = []
+        self.terms = []
 
-    def __call__(self, on_output, on_exit):
+    def __call__(self, on_output, on_exit, term="xterm-256color"):
         process = FakeProcess(on_output, on_exit)
         self.processes.append(process)
+        self.terms.append(term)
         return process
 
 
 def shell_message(message_type, session_id="a" * 32, body=b"", **metadata):
+    if message_type is MessageType.SHELL_OPEN:
+        metadata.setdefault("utf8", True)
     return Message(message_type, {"session_id": session_id, **metadata}, body)
 
 
@@ -208,3 +212,104 @@ def test_shell_state_listeners_receive_request_active_and_exit():
         ("exited", session_id),
     ]
     assert states[-1].exit_code == 0
+
+
+def test_permission_revocation_during_process_creation_prevents_start():
+    bus = FakeBus()
+    holder = {}
+
+    class RevokingFactory(FakeProcessFactory):
+        def __call__(self, on_output, on_exit, term="xterm"):
+            process = super().__call__(on_output, on_exit, term)
+            holder["service"].set_allow_remote_shell(False)
+            return process
+
+    factory = RevokingFactory()
+    service = ShellService(bus, factory)
+    holder["service"] = service
+    service.set_allow_remote_shell(True)
+
+    service.handle_message(
+        shell_message(MessageType.SHELL_OPEN, columns=80, rows=24, term="xterm")
+    )
+
+    assert factory.processes[-1].started == []
+    assert bus.sent[-1][0].message_type is MessageType.SHELL_DENY
+    assert bus.sent[-1][0].metadata["reason"] == "permission"
+
+
+def test_shell_accept_precedes_output_emitted_synchronously_by_start():
+    bus = FakeBus()
+
+    class EagerFactory(FakeProcessFactory):
+        def __call__(self, on_output, on_exit, term="xterm"):
+            process = super().__call__(on_output, on_exit, term)
+            original_start = process.start
+
+            def start(columns, rows):
+                original_start(columns, rows)
+                process.emit_output(b"initial prompt")
+
+            process.start = start
+            return process
+
+    service = ShellService(bus, EagerFactory())
+    service.set_allow_remote_shell(True)
+
+    service.handle_message(
+        shell_message(MessageType.SHELL_OPEN, columns=80, rows=24, term="xterm")
+    )
+
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.SHELL_ACCEPT,
+        MessageType.SHELL_OUTPUT,
+    ]
+
+
+def test_initial_resize_is_queued_while_shell_request_is_pending():
+    bus = FakeBus()
+    service = ShellService(bus, FakeProcessFactory())
+    session_id = service.open_remote(columns=80, rows=24)
+
+    service.resize(session_id, 120, 40)
+    service.handle_message(shell_message(MessageType.SHELL_ACCEPT, session_id))
+
+    assert bus.sent[0][0].metadata["utf8"] is True
+    assert bus.sent[-1][0] == shell_message(
+        MessageType.SHELL_RESIZE,
+        session_id,
+        columns=120,
+        rows=40,
+    )
+
+
+def test_negotiated_terminal_type_reaches_process_factory():
+    bus = FakeBus()
+    factory = FakeProcessFactory()
+    service = ShellService(bus, factory)
+    service.set_allow_remote_shell(True)
+
+    service.handle_message(
+        shell_message(
+            MessageType.SHELL_OPEN,
+            columns=80,
+            rows=24,
+            term="screen-256color",
+        )
+    )
+
+    assert factory.terms == ["screen-256color"]
+
+
+def test_large_shell_input_is_split_to_frame_safe_chunks():
+    bus = FakeBus()
+    service = ShellService(bus, FakeProcessFactory())
+    session_id = service.open_remote(columns=80, rows=24)
+    service.handle_message(shell_message(MessageType.SHELL_ACCEPT, session_id))
+    bus.sent.clear()
+
+    service.send_input(session_id, b"x" * 100_000)
+
+    assert len(bus.sent) == 3
+    assert all(len(item[0].body) <= 48 * 1024 for item in bus.sent)
+    assert b"".join(item[0].body for item in bus.sent) == b"x" * 100_000
