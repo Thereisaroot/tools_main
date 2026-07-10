@@ -1,2 +1,1 @@
 """ShookLink wire protocol primitives."""
-

@@ -187,4 +187,3 @@ def test_parser_bounds_unterminated_input_and_recovers():
     frames = parser.feed(b"\x00" + valid)
 
     assert [frame.payload for frame in frames] == [b"recovered"]
-
