@@ -23,4 +23,3 @@ shooklink = "shooklink.app:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
