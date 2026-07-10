@@ -193,7 +193,10 @@ class SerialLink:
                 continue
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             thread.join(remaining)
-        return not self.threads_alive
+        return not any(
+            thread is not current and thread.is_alive()
+            for thread in threads
+        )
 
     def _ensure_active(self) -> None:
         with self._lifecycle_lock:

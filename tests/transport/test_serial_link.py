@@ -326,6 +326,58 @@ def test_close_failure_is_reported_to_callback_and_caller():
     assert isinstance(disconnects[0], OSError)
 
 
+def test_on_frame_callback_can_close_its_own_link():
+    left_endpoint, right_endpoint = endpoint_pair()
+    callback_errors = []
+    callback_finished = threading.Event()
+    holder = {}
+
+    def on_frame(_frame):
+        try:
+            holder["right"].close()
+        except BaseException as error:
+            callback_errors.append(error)
+        finally:
+            callback_finished.set()
+
+    left = SerialLink(left_endpoint, lambda frame: None, lambda error: None)
+    right = SerialLink(right_endpoint, on_frame, lambda error: None)
+    holder["right"] = right
+    left.start()
+    right.start()
+    left.send(OutboundItem(Priority.NORMAL, 1, b"close peer"))
+
+    assert callback_finished.wait(2)
+    assert callback_errors == []
+    assert right.wait_closed(1)
+    left.close()
+
+
+def test_on_disconnect_callback_can_close_its_own_link():
+    endpoint = BrokenWriteEndpoint()
+    endpoint.connect(MemoryEndpoint())
+    callback_errors = []
+    callback_finished = threading.Event()
+    holder = {}
+
+    def on_disconnect(_error):
+        try:
+            holder["link"].close()
+        except BaseException as error:
+            callback_errors.append(error)
+        finally:
+            callback_finished.set()
+
+    link = SerialLink(endpoint, lambda frame: None, on_disconnect)
+    holder["link"] = link
+    link.start()
+    link.send(OutboundItem(Priority.NORMAL, 1, b"fail"))
+
+    assert callback_finished.wait(2)
+    assert callback_errors == []
+    assert link.wait_closed(1)
+
+
 def _capture_error(callback, errors):
     try:
         callback()
