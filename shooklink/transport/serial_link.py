@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable
+from enum import Enum, auto
 from typing import Protocol
 
 from shooklink.protocol.framing import Frame, FrameParser, encode_frame
@@ -14,9 +16,27 @@ from shooklink.transport.multiplexer import (
     OutboundItem,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class LinkClosedError(RuntimeError):
     """Raised when a serial link cannot accept more work."""
+
+
+class LinkCloseError(RuntimeError):
+    """Raised when the serial endpoint cannot be closed cleanly."""
+
+
+class LinkCloseTimeout(LinkCloseError):
+    """Raised when serial worker threads do not stop before the deadline."""
+
+
+class _LinkState(Enum):
+    NEW = auto()
+    STARTING = auto()
+    ACTIVE = auto()
+    STOPPING = auto()
+    CLOSED = auto()
 
 
 class SerialEndpoint(Protocol):
@@ -39,7 +59,7 @@ class SerialLink:
         read_size: int = 4096,
         multiplexer: Multiplexer | None = None,
     ) -> None:
-        if read_size <= 0:
+        if type(read_size) is not int or read_size <= 0:
             raise ValueError("read_size must be positive")
         self._endpoint = endpoint
         self._on_frame = on_frame
@@ -49,12 +69,14 @@ class SerialLink:
         self._parser = FrameParser()
         self._lifecycle_lock = threading.RLock()
         self._stop_event = threading.Event()
-        self._started = False
-        self._closed = False
-        self._endpoint_closed = False
+        self._state = _LinkState.NEW
+        self._endpoint_close_attempted = False
+        self._endpoint_close_error: BaseException | None = None
+        self._terminal_cause: BaseException | None = None
         self._disconnect_notified = False
         self._reader_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
+        self._started_threads: list[threading.Thread] = []
 
     @classmethod
     def open_port(
@@ -86,21 +108,23 @@ class SerialLink:
 
     @property
     def threads_alive(self) -> bool:
-        threads = (self._reader_thread, self._writer_thread)
-        return any(thread is not None and thread.is_alive() for thread in threads)
+        with self._lifecycle_lock:
+            threads = tuple(self._started_threads)
+        return any(thread.is_alive() for thread in threads)
 
     @property
     def closed(self) -> bool:
         with self._lifecycle_lock:
-            return self._closed
+            return self._state in (_LinkState.STOPPING, _LinkState.CLOSED)
 
     def start(self) -> None:
+        startup_error: BaseException | None = None
         with self._lifecycle_lock:
-            if self._started:
+            if self._state is not _LinkState.NEW:
+                if self._state in (_LinkState.STOPPING, _LinkState.CLOSED):
+                    raise LinkClosedError("serial link is closed")
                 raise RuntimeError("serial link can only be started once")
-            if self._closed:
-                raise LinkClosedError("serial link is closed")
-            self._started = True
+            self._state = _LinkState.STARTING
             self._reader_thread = threading.Thread(
                 target=self._read_loop,
                 name="shooklink-serial-reader",
@@ -111,51 +135,70 @@ class SerialLink:
                 name="shooklink-serial-writer",
                 daemon=True,
             )
-            reader = self._reader_thread
-            writer = self._writer_thread
-        writer.start()
-        reader.start()
+            try:
+                self._writer_thread.start()
+                self._started_threads.append(self._writer_thread)
+                self._reader_thread.start()
+                self._started_threads.append(self._reader_thread)
+                self._state = _LinkState.ACTIVE
+            except BaseException as error:
+                startup_error = error
+
+        if startup_error is not None:
+            self._request_stop(startup_error)
+            self.wait_closed(2.0)
+            raise startup_error
 
     def reserve_sequence(self, stream_id: int) -> int:
-        with self._lifecycle_lock:
-            if not self._started or self._closed:
-                raise LinkClosedError("serial link is not active")
+        self._ensure_active()
         try:
             return self._multiplexer.reserve_sequence(stream_id)
         except MultiplexerClosed as error:
             raise LinkClosedError("serial link is closed") from error
 
     def send(self, item: OutboundItem) -> OutboundItem:
-        with self._lifecycle_lock:
-            if not self._started or self._closed:
-                raise LinkClosedError("serial link is not active")
+        self._ensure_active()
         try:
             return self._multiplexer.enqueue(item)
         except MultiplexerClosed as error:
             raise LinkClosedError("serial link is closed") from error
 
     def send_pointer(self, stream_id: int, payload: bytes, **metadata) -> OutboundItem:
-        with self._lifecycle_lock:
-            if not self._started or self._closed:
-                raise LinkClosedError("serial link is not active")
+        self._ensure_active()
         try:
             return self._multiplexer.enqueue_pointer(stream_id, payload, **metadata)
         except MultiplexerClosed as error:
             raise LinkClosedError("serial link is closed") from error
 
-    def close(self) -> None:
+    def close(self, timeout: float = 2.0) -> None:
+        if timeout < 0:
+            raise ValueError("timeout cannot be negative")
         self._request_stop(None)
-        self.wait_closed(2.0)
+        if not self.wait_closed(timeout):
+            raise LinkCloseTimeout("serial worker threads did not stop")
+        with self._lifecycle_lock:
+            close_error = self._endpoint_close_error
+        if close_error is not None:
+            raise LinkCloseError(str(close_error)) from close_error
 
     def wait_closed(self, timeout: float | None = None) -> bool:
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout cannot be negative")
         deadline = None if timeout is None else time.monotonic() + timeout
         current = threading.current_thread()
-        for thread in (self._writer_thread, self._reader_thread):
-            if thread is None or thread is current:
+        with self._lifecycle_lock:
+            threads = tuple(self._started_threads)
+        for thread in threads:
+            if thread is current:
                 continue
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             thread.join(remaining)
         return not self.threads_alive
+
+    def _ensure_active(self) -> None:
+        with self._lifecycle_lock:
+            if self._state is not _LinkState.ACTIVE:
+                raise LinkClosedError("serial link is not active")
 
     def _read_loop(self) -> None:
         try:
@@ -207,34 +250,46 @@ class SerialLink:
             raise LinkClosedError("serial link closed during write")
 
     def _request_stop(self, error: BaseException | None) -> None:
-        endpoint_to_close = None
         with self._lifecycle_lock:
-            if not self._closed:
-                self._closed = True
-                self._stop_event.set()
-                self._multiplexer.close()
-            if not self._endpoint_closed:
-                self._endpoint_closed = True
-                endpoint_to_close = self._endpoint
+            if self._state in (_LinkState.STOPPING, _LinkState.CLOSED):
+                return
+            self._state = _LinkState.STOPPING
+            self._terminal_cause = error
+            self._stop_event.set()
+            self._multiplexer.close()
+            should_close_endpoint = not self._endpoint_close_attempted
+            self._endpoint_close_attempted = True
 
         close_error: BaseException | None = None
-        if endpoint_to_close is not None:
+        if should_close_endpoint:
             try:
-                endpoint_to_close.close()
+                self._endpoint.close()
             except BaseException as endpoint_error:
                 close_error = endpoint_error
 
-        callback = None
-        callback_error = error if error is not None else close_error
         with self._lifecycle_lock:
+            if close_error is not None:
+                self._endpoint_close_error = close_error
+                if self._terminal_cause is None:
+                    self._terminal_cause = close_error
+            self._state = _LinkState.CLOSED
+            callback_error = self._terminal_cause
+            callback = None
             if not self._disconnect_notified:
                 self._disconnect_notified = True
                 callback = self._on_disconnect
+
         if callback is not None:
             try:
                 callback(callback_error)
             except BaseException:
-                pass
+                logger.exception("serial disconnect callback failed")
 
 
-__all__ = ["LinkClosedError", "SerialEndpoint", "SerialLink"]
+__all__ = [
+    "LinkCloseError",
+    "LinkCloseTimeout",
+    "LinkClosedError",
+    "SerialEndpoint",
+    "SerialLink",
+]

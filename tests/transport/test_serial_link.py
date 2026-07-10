@@ -4,7 +4,12 @@ import time
 import pytest
 
 from shooklink.transport.multiplexer import OutboundItem, Priority
-from shooklink.transport.serial_link import LinkClosedError, SerialLink
+from shooklink.transport.serial_link import (
+    LinkCloseError,
+    LinkCloseTimeout,
+    LinkClosedError,
+    SerialLink,
+)
 
 
 class MemoryEndpoint:
@@ -61,6 +66,41 @@ class BrokenWriteEndpoint(MemoryEndpoint):
         raise OSError("write failed")
 
 
+class BlockingBrokenWriteEndpoint(BrokenWriteEndpoint):
+    def __init__(self):
+        super().__init__()
+        self.close_started = threading.Event()
+        self.release_close = threading.Event()
+
+    def close(self):
+        self.close_started.set()
+        self.release_close.wait(1)
+        super().close()
+
+
+class StuckReadEndpoint(MemoryEndpoint):
+    def __init__(self):
+        super().__init__()
+        self.read_started = threading.Event()
+        self.release_read = threading.Event()
+
+    def read(self, _size):
+        self.read_started.set()
+        self.release_read.wait(2)
+        return b""
+
+    def close(self):
+        with self._condition:
+            self.close_calls += 1
+            self._closed = True
+
+
+class FailingCloseEndpoint(MemoryEndpoint):
+    def close(self):
+        super().close()
+        raise OSError("close failed")
+
+
 def endpoint_pair(**kwargs):
     left = MemoryEndpoint(**kwargs)
     right = MemoryEndpoint(**kwargs)
@@ -89,7 +129,7 @@ def test_links_exchange_fragmented_frames_and_sequence_per_stream():
     right.start()
 
     left.send(OutboundItem(Priority.NORMAL, 4, b"first", message_type=10))
-    left.send(OutboundItem(Priority.INTERACTIVE, 4, b"second", message_type=45))
+    left.send(OutboundItem(Priority.NORMAL, 4, b"second", message_type=45))
     left.send(OutboundItem(Priority.NORMAL, 9, b"other", message_type=11))
 
     assert wait_for(lambda: len(received) == 3)
@@ -121,9 +161,11 @@ def test_explicit_sequence_is_preserved_for_retransmission():
     right.start()
 
     left.send(OutboundItem(Priority.FILE, 7, b"retry", message_type=22, sequence=99))
+    left.send(OutboundItem(Priority.FILE, 7, b"next", message_type=22))
 
-    assert wait_for(lambda: len(received) == 1)
+    assert wait_for(lambda: len(received) == 2)
     assert received[0].sequence == 99
+    assert received[1].sequence == 100
     left.close()
     right.close()
 
@@ -174,3 +216,118 @@ def test_start_is_single_use():
         link.start()
 
     link.close()
+
+
+def test_concurrent_start_and_close_never_join_unstarted_thread(monkeypatch):
+    endpoint, _peer = endpoint_pair()
+    disconnects = []
+    link = SerialLink(endpoint, lambda frame: None, disconnects.append)
+    original_start = threading.Thread.start
+    reader_waiting = threading.Event()
+    release_reader = threading.Event()
+    errors = []
+
+    def delayed_start(thread):
+        if thread.name == "shooklink-serial-reader":
+            reader_waiting.set()
+            release_reader.wait(1)
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", delayed_start)
+    starter = threading.Thread(
+        target=lambda: _capture_error(link.start, errors),
+        name="test-link-starter",
+    )
+    original_start(starter)
+    assert reader_waiting.wait(1)
+    closer = threading.Thread(
+        target=lambda: _capture_error(link.close, errors),
+        name="test-link-closer",
+    )
+    original_start(closer)
+    time.sleep(0.02)
+    release_reader.set()
+    starter.join(1)
+    closer.join(1)
+
+    assert errors == []
+    assert disconnects == [None]
+    assert not link.threads_alive
+
+
+def test_thread_start_failure_rolls_back_and_closes_endpoint(monkeypatch):
+    endpoint, _peer = endpoint_pair()
+    disconnects = []
+    link = SerialLink(endpoint, lambda frame: None, disconnects.append)
+    original_start = threading.Thread.start
+
+    def failing_start(thread):
+        if thread.name == "shooklink-serial-reader":
+            raise RuntimeError("cannot start reader")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", failing_start)
+
+    with pytest.raises(RuntimeError, match="cannot start reader"):
+        link.start()
+
+    assert link.wait_closed(1)
+    assert endpoint.close_calls == 1
+    assert isinstance(disconnects[0], RuntimeError)
+    with pytest.raises(LinkClosedError):
+        link.send(OutboundItem(Priority.NORMAL, 1, b"late"))
+
+
+def test_first_stop_owns_disconnect_cause_during_concurrent_close():
+    endpoint = BlockingBrokenWriteEndpoint()
+    endpoint.connect(MemoryEndpoint())
+    disconnects = []
+    link = SerialLink(endpoint, lambda frame: None, disconnects.append)
+    link.start()
+    link.send(OutboundItem(Priority.NORMAL, 1, b"fail"))
+    assert endpoint.close_started.wait(1)
+    close_errors = []
+    closer = threading.Thread(target=lambda: _capture_error(link.close, close_errors))
+    closer.start()
+    time.sleep(0.02)
+    endpoint.release_close.set()
+    closer.join(1)
+
+    assert close_errors == []
+    assert len(disconnects) == 1
+    assert isinstance(disconnects[0], OSError)
+    assert str(disconnects[0]) == "write failed"
+
+
+def test_close_reports_worker_timeout_and_can_finish_after_unblock():
+    endpoint = StuckReadEndpoint()
+    endpoint.connect(MemoryEndpoint())
+    link = SerialLink(endpoint, lambda frame: None, lambda error: None)
+    link.start()
+    assert endpoint.read_started.wait(1)
+
+    with pytest.raises(LinkCloseTimeout):
+        link.close(timeout=0.05)
+
+    endpoint.release_read.set()
+    assert link.wait_closed(1)
+
+
+def test_close_failure_is_reported_to_callback_and_caller():
+    endpoint = FailingCloseEndpoint()
+    endpoint.connect(MemoryEndpoint())
+    disconnects = []
+    link = SerialLink(endpoint, lambda frame: None, disconnects.append)
+    link.start()
+
+    with pytest.raises(LinkCloseError, match="close failed"):
+        link.close()
+
+    assert isinstance(disconnects[0], OSError)
+
+
+def _capture_error(callback, errors):
+    try:
+        callback()
+    except BaseException as error:
+        errors.append(error)

@@ -9,12 +9,21 @@ from dataclasses import dataclass, replace
 from enum import IntEnum
 from threading import Condition
 
+from shooklink.protocol.framing import MAX_PAYLOAD_SIZE
+
 UINT8_MAX = (1 << 8) - 1
 UINT32_MAX = (1 << 32) - 1
+DEFAULT_MAX_ITEMS = 4_096
+DEFAULT_MAX_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_PRIORITY_BURST = 32
 
 
 class MultiplexerClosed(RuntimeError):
     """Raised when work is submitted after a multiplexer closes."""
+
+
+class QueueFullError(RuntimeError):
+    """Raised when bounded outbound capacity is exhausted."""
 
 
 class Priority(IntEnum):
@@ -53,21 +62,52 @@ def _validate_item(item: OutboundItem) -> None:
         _validate_uint("sequence", item.sequence, UINT32_MAX)
     if not isinstance(item.payload, bytes):
         raise TypeError("payload must be bytes")
+    if len(item.payload) > MAX_PAYLOAD_SIZE:
+        raise ValueError(f"payload cannot exceed {MAX_PAYLOAD_SIZE} bytes")
 
 
 class Multiplexer:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_items: int = DEFAULT_MAX_ITEMS,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        max_priority_burst: int = DEFAULT_MAX_PRIORITY_BURST,
+    ) -> None:
+        if type(max_items) is not int or max_items <= 0:
+            raise ValueError("max_items must be positive")
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        if type(max_priority_burst) is not int or max_priority_burst <= 0:
+            raise ValueError("max_priority_burst must be positive")
         self._condition = Condition()
         self._queue: list[tuple[int, int, OutboundItem]] = []
         self._pointer_items: dict[int, tuple[int, OutboundItem]] = {}
         self._order = itertools.count()
         self._last_sequences: dict[int, int] = {}
+        self._stream_priorities: dict[int, Priority] = {}
+        self._max_items = max_items
+        self._max_bytes = max_bytes
+        self._max_priority_burst = max_priority_burst
+        self._queued_bytes = 0
+        self._priority_streak = 0
+        self._fair_priority_cursor = int(Priority.NORMAL)
         self._closed = False
 
     @property
     def closed(self) -> bool:
         with self._condition:
             return self._closed
+
+    @property
+    def queued_items(self) -> int:
+        with self._condition:
+            return len(self._queue) + len(self._pointer_items)
+
+    @property
+    def queued_bytes(self) -> int:
+        with self._condition:
+            return self._queued_bytes
 
     def reserve_sequence(self, stream_id: int) -> int:
         _validate_uint("stream_id", stream_id, UINT32_MAX)
@@ -87,13 +127,19 @@ class Multiplexer:
         _validate_item(item)
         with self._condition:
             self._ensure_open()
+            self._validate_stream_priority_locked(item)
+            self._ensure_capacity_locked(1, len(item.payload))
             if item.sequence is None:
                 item = replace(
                     item,
                     sequence=self._reserve_sequence_locked(item.stream_id),
                 )
+            else:
+                self._record_explicit_sequence_locked(item.stream_id, item.sequence)
+            self._stream_priorities.setdefault(item.stream_id, item.priority)
             order = next(self._order)
             heapq.heappush(self._queue, (int(item.priority), order, item))
+            self._queued_bytes += len(item.payload)
             self._condition.notify()
             return item
 
@@ -119,12 +165,24 @@ class Multiplexer:
         _validate_item(item)
         with self._condition:
             self._ensure_open()
+            self._validate_stream_priority_locked(item)
+            previous = self._pointer_items.get(stream_id)
+            previous_size = 0 if previous is None else len(previous[1].payload)
+            item_delta = 1 if previous is None else 0
+            self._ensure_capacity_locked(
+                item_delta,
+                len(item.payload) - previous_size,
+            )
             if item.sequence is None:
                 item = replace(
                     item,
                     sequence=self._reserve_sequence_locked(item.stream_id),
                 )
+            else:
+                self._record_explicit_sequence_locked(item.stream_id, item.sequence)
+            self._stream_priorities.setdefault(item.stream_id, item.priority)
             self._pointer_items[stream_id] = (next(self._order), item)
+            self._queued_bytes += len(item.payload) - previous_size
             self._condition.notify()
             return item
 
@@ -146,25 +204,24 @@ class Multiplexer:
             if self._closed:
                 return None
 
-            pointer_stream: int | None = None
-            pointer_order: int | None = None
-            pointer_item: OutboundItem | None = None
-            if self._pointer_items:
-                pointer_stream, (pointer_order, pointer_item) = min(
-                    self._pointer_items.items(),
-                    key=lambda entry: entry[1][0],
-                )
-
-            if self._queue and (
-                pointer_item is None
-                or self._queue[0][0] <= int(pointer_item.priority)
+            available = self._available_priorities_locked()
+            best_priority = min(available)
+            lower_priorities = [
+                priority for priority in available if priority > best_priority
+            ]
+            if (
+                lower_priorities
+                and self._priority_streak >= self._max_priority_burst
             ):
-                return heapq.heappop(self._queue)[2]
-
-            if pointer_stream is None or pointer_order is None or pointer_item is None:
-                return None
-            del self._pointer_items[pointer_stream]
-            return pointer_item
+                selected_priority = self._next_fair_priority(lower_priorities)
+                self._priority_streak = 0
+            else:
+                selected_priority = best_priority
+                if lower_priorities:
+                    self._priority_streak += 1
+                else:
+                    self._priority_streak = 0
+            return self._pop_priority_locked(selected_priority)
 
     def empty(self) -> bool:
         with self._condition:
@@ -177,11 +234,71 @@ class Multiplexer:
             self._closed = True
             self._queue.clear()
             self._pointer_items.clear()
+            self._queued_bytes = 0
             self._condition.notify_all()
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise MultiplexerClosed("multiplexer is closed")
+
+    def _validate_stream_priority_locked(self, item: OutboundItem) -> None:
+        priority = self._stream_priorities.get(item.stream_id)
+        if priority is not None and priority is not item.priority:
+            raise ValueError(
+                f"stream {item.stream_id} priority cannot change from "
+                f"{priority.name} to {item.priority.name}"
+            )
+
+    def _ensure_capacity_locked(self, item_delta: int, byte_delta: int) -> None:
+        if self.queued_items + item_delta > self._max_items:
+            raise QueueFullError("outbound item capacity is full")
+        if self._queued_bytes + byte_delta > self._max_bytes:
+            raise QueueFullError("outbound byte capacity is full")
+
+    def _record_explicit_sequence_locked(self, stream_id: int, sequence: int) -> None:
+        previous = self._last_sequences.get(stream_id, 0)
+        if sequence > previous:
+            self._last_sequences[stream_id] = sequence
+
+    def _available_priorities_locked(self) -> list[int]:
+        priorities = {entry[0] for entry in self._queue}
+        if self._pointer_items:
+            priorities.add(int(Priority.MOTION))
+        return sorted(priorities)
+
+    def _next_fair_priority(self, available: list[int]) -> int:
+        selected = next(
+            (
+                priority
+                for priority in available
+                if priority >= self._fair_priority_cursor
+            ),
+            available[0],
+        )
+        self._fair_priority_cursor = selected + 1
+        if self._fair_priority_cursor > int(Priority.FILE):
+            self._fair_priority_cursor = int(Priority.NORMAL)
+        return selected
+
+    def _pop_priority_locked(self, priority: int) -> OutboundItem:
+        candidates: list[tuple[int, str, int, OutboundItem]] = []
+        for index, (item_priority, order, item) in enumerate(self._queue):
+            if item_priority == priority:
+                candidates.append((order, "queue", index, item))
+        if priority == int(Priority.MOTION):
+            for stream_id, (order, item) in self._pointer_items.items():
+                candidates.append((order, "pointer", stream_id, item))
+        _order, source, key, item = min(candidates, key=lambda candidate: candidate[0])
+        if source == "queue":
+            last = self._queue.pop()
+            if key < len(self._queue):
+                self._queue[key] = last
+                heapq.heapify(self._queue)
+        else:
+            del self._pointer_items[key]
+        self._queued_bytes -= len(item.payload)
+        self._condition.notify_all()
+        return item
 
 
 __all__ = [
@@ -189,4 +306,5 @@ __all__ = [
     "MultiplexerClosed",
     "OutboundItem",
     "Priority",
+    "QueueFullError",
 ]
