@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from shooklink.transport.multiplexer import OutboundItem, Priority
+from shooklink.transport.multiplexer import Multiplexer, OutboundItem, Priority
 from shooklink.transport.serial_link import (
     LinkCloseError,
     LinkCloseTimeout,
@@ -132,6 +132,49 @@ def wait_for(predicate, timeout=2):
             return True
         time.sleep(0.005)
     return predicate()
+
+
+def test_start_rejects_a_preclosed_multiplexer_and_closes_the_endpoint():
+    endpoint = MemoryEndpoint()
+    multiplexer = Multiplexer()
+    multiplexer.close()
+    disconnects = []
+    link = SerialLink(
+        endpoint,
+        lambda frame: None,
+        disconnects.append,
+        multiplexer=multiplexer,
+    )
+
+    with pytest.raises(LinkClosedError):
+        link.start()
+
+    assert link.wait_closed(1)
+    assert endpoint.closed
+    assert len(disconnects) == 1
+    assert isinstance(disconnects[0], LinkClosedError)
+
+
+def test_externally_closed_multiplexer_stops_the_link_without_spinning():
+    endpoint = MemoryEndpoint()
+    endpoint.connect(endpoint)
+    multiplexer = Multiplexer()
+    disconnects = []
+    link = SerialLink(
+        endpoint,
+        lambda frame: None,
+        disconnects.append,
+        multiplexer=multiplexer,
+    )
+    link.start()
+
+    multiplexer.close()
+
+    assert wait_for(lambda: link.closed)
+    assert link.wait_closed(1)
+    assert endpoint.closed
+    assert len(disconnects) == 1
+    assert disconnects[0] is not None
 
 
 def test_links_exchange_fragmented_frames_and_sequence_per_stream():

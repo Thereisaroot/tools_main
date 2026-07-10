@@ -130,24 +130,27 @@ class SerialLink:
                     raise LinkClosedError("serial link is closed")
                 raise RuntimeError("serial link can only be started once")
             self._state = _LinkState.STARTING
-            self._reader_thread = threading.Thread(
-                target=self._read_loop,
-                name="shooklink-serial-reader",
-                daemon=True,
-            )
-            self._writer_thread = threading.Thread(
-                target=self._write_loop,
-                name="shooklink-serial-writer",
-                daemon=True,
-            )
-            try:
-                self._writer_thread.start()
-                self._started_threads.append(self._writer_thread)
-                self._reader_thread.start()
-                self._started_threads.append(self._reader_thread)
-                self._state = _LinkState.ACTIVE
-            except BaseException as error:
-                startup_error = error
+            if self._multiplexer.closed:
+                startup_error = LinkClosedError("outbound multiplexer is closed")
+            else:
+                self._reader_thread = threading.Thread(
+                    target=self._read_loop,
+                    name="shooklink-serial-reader",
+                    daemon=True,
+                )
+                self._writer_thread = threading.Thread(
+                    target=self._write_loop,
+                    name="shooklink-serial-writer",
+                    daemon=True,
+                )
+                try:
+                    self._writer_thread.start()
+                    self._started_threads.append(self._writer_thread)
+                    self._reader_thread.start()
+                    self._started_threads.append(self._reader_thread)
+                    self._state = _LinkState.ACTIVE
+                except BaseException as error:
+                    startup_error = error
 
         if startup_error is not None:
             self._request_stop(
@@ -156,6 +159,7 @@ class SerialLink:
             )
             self._stop_finalized.wait(2.0)
             self.wait_closed(2.0)
+            self._disconnect_callback_completed.wait(2.0)
             raise startup_error
 
     def reserve_sequence(self, stream_id: int) -> int:
@@ -256,6 +260,8 @@ class SerialLink:
             while not self._stop_event.is_set():
                 item = self._multiplexer.pop(timeout=0.1)
                 if item is None:
+                    if self._multiplexer.closed:
+                        raise MultiplexerClosed("outbound multiplexer was closed")
                     continue
                 if item.sequence is None:
                     raise RuntimeError("multiplexer returned an item without a sequence")
