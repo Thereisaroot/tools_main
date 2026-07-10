@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import os
 import stat
 import threading
@@ -26,6 +27,30 @@ def _connected_sessions(tmp_path):
     bob.receive_hello(alice.create_hello())
     alice.receive_hello(bob.create_hello())
     return alice, bob
+
+
+def _coordinate_atomic_write(barrier):
+    real_atomic_write = crypto._atomic_write
+
+    def coordinated_write(*args, **kwargs):
+        try:
+            barrier.wait(timeout=0.3)
+        except threading.BrokenBarrierError:
+            pass
+        return real_atomic_write(*args, **kwargs)
+
+    crypto._atomic_write = coordinated_write
+
+
+def _create_identity_process(path, barrier, result_queue):
+    _coordinate_atomic_write(barrier)
+    identity = IdentityStore(path).load_or_create()
+    result_queue.put(identity.public_bytes)
+
+
+def _accept_trust_process(path, peer_id, fingerprint, barrier):
+    _coordinate_atomic_write(barrier)
+    TrustStore(path).accept(peer_id, fingerprint)
 
 
 def test_identity_is_persistent_and_private(tmp_path):
@@ -307,6 +332,33 @@ def test_concurrent_identity_creation_returns_persisted_winner(tmp_path, monkeyp
     assert {identity.public_bytes for identity in identities} == {persisted.public_bytes}
 
 
+def test_cross_process_identity_creation_returns_persisted_winner(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    path = tmp_path / "identity-process.key"
+    process_count = 3
+    barrier = context.Barrier(process_count)
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_create_identity_process,
+            args=(path, barrier, result_queue),
+        )
+        for _index in range(process_count)
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+    results = [result_queue.get(timeout=2) for _index in range(process_count)]
+    result_queue.close()
+    result_queue.join_thread()
+
+    persisted = IdentityStore(path).load_or_create()
+    assert set(results) == {persisted.public_bytes}
+
+
 def test_concurrent_trust_updates_preserve_both_peers(tmp_path, monkeypatch):
     path = tmp_path / "trusted.json"
     real_atomic_write = crypto._atomic_write
@@ -341,3 +393,25 @@ def test_concurrent_trust_updates_preserve_both_peers(tmp_path, monkeypatch):
         "alice": "fingerprint-a",
         "bob": "fingerprint-b",
     }
+
+
+def test_cross_process_trust_updates_preserve_every_peer(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    path = tmp_path / "trusted-process.json"
+    peers = [(f"peer-{index}", f"fingerprint-{index}") for index in range(3)]
+    barrier = context.Barrier(len(peers))
+    processes = [
+        context.Process(
+            target=_accept_trust_process,
+            args=(path, peer_id, fingerprint, barrier),
+        )
+        for peer_id, fingerprint in peers
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    assert json.loads(path.read_text(encoding="utf-8")) == dict(peers)

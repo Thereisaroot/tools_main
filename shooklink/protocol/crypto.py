@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
 import struct
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -49,6 +51,7 @@ REPLAY_WINDOW_MASK = (1 << REPLAY_WINDOW_SIZE) - 1
 MAX_TRACKED_STREAMS = 1_024
 MAX_TRUST_STORE_SIZE = 1 << 20
 _STORE_LOCK = threading.RLock()
+LOCK_TIMEOUT_SECONDS = 10.0
 
 
 class SecureSessionError(RuntimeError):
@@ -97,6 +100,76 @@ class _ReplayWindow:
             self.highest = sequence
             return
         self.bitmap |= 1 << (self.highest - sequence)
+
+
+class _InterProcessFileLock:
+    def __init__(self, target_path: Path) -> None:
+        self.path = target_path.with_name(f"{target_path.name}.lock")
+        self._file = None
+
+    def __enter__(self) -> _InterProcessFileLock:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("a+b")
+        if os.name == "posix":
+            self.path.chmod(0o600)
+        try:
+            self._acquire()
+        except Exception:
+            self._file.close()
+            self._file = None
+            raise
+        return self
+
+    def _acquire(self) -> None:
+        if self._file is None:
+            raise RuntimeError("lock file is not open")
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        if os.name == "nt":
+            import msvcrt
+
+            self._file.seek(0, os.SEEK_END)
+            if self._file.tell() == 0:
+                self._file.write(b"\x00")
+                self._file.flush()
+            while True:
+                self._file.seek(0)
+                try:
+                    msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+                    return
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"timed out locking {self.path}")
+                    time.sleep(0.025)
+
+        import fcntl
+
+        while True:
+            try:
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out locking {self.path}")
+                time.sleep(0.025)
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        if self._file is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._file.seek(0)
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
 
 
 def _public_bytes(public_key: Ed25519PublicKey | X25519PublicKey) -> bytes:
@@ -162,30 +235,31 @@ class IdentityStore:
 
     def load_or_create(self) -> Identity:
         with _STORE_LOCK:
-            if self.path.exists():
-                try:
-                    with self.path.open("rb") as identity_file:
-                        private_bytes = identity_file.read(33)
-                    if len(private_bytes) != 32:
-                        raise ValueError("wrong key size")
-                    private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
-                except (OSError, ValueError) as error:
-                    raise SecureSessionError("invalid identity file") from error
-                if os.name == "posix":
-                    self.path.chmod(0o600)
-                return Identity.from_private_key(private_key)
+            with _InterProcessFileLock(self.path):
+                if self.path.exists():
+                    try:
+                        with self.path.open("rb") as identity_file:
+                            private_bytes = identity_file.read(33)
+                        if len(private_bytes) != 32:
+                            raise ValueError("wrong key size")
+                        private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+                    except (OSError, ValueError) as error:
+                        raise SecureSessionError("invalid identity file") from error
+                    if os.name == "posix":
+                        self.path.chmod(0o600)
+                    return Identity.from_private_key(private_key)
 
-            private_key = Ed25519PrivateKey.generate()
-            private_bytes = private_key.private_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PrivateFormat.Raw,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
-            try:
-                _atomic_write(self.path, private_bytes)
-            except OSError as error:
-                raise SecureSessionError("could not store identity") from error
-            return Identity.from_private_key(private_key)
+                private_key = Ed25519PrivateKey.generate()
+                private_bytes = private_key.private_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PrivateFormat.Raw,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+                try:
+                    _atomic_write(self.path, private_bytes)
+                except OSError as error:
+                    raise SecureSessionError("could not store identity") from error
+                return Identity.from_private_key(private_key)
 
 
 class TrustStore:
@@ -230,15 +304,16 @@ class TrustStore:
     def accept(self, peer_id: str, fingerprint: str) -> None:
         self._validate(peer_id, fingerprint)
         with _STORE_LOCK:
-            trusted = self._load()
-            trusted[peer_id] = fingerprint
-            encoded = json.dumps(
-                trusted,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-            _atomic_write(self.path, encoded)
+            with _InterProcessFileLock(self.path):
+                trusted = self._load()
+                trusted[peer_id] = fingerprint
+                encoded = json.dumps(
+                    trusted,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                _atomic_write(self.path, encoded)
 
 
 class SecureSession:
