@@ -274,7 +274,7 @@ class InputService:
             )
         except BaseException:
             self._clear_session(session_id)
-            self._refresh_idle_capture()
+            self._refresh_idle_capture_if_idle()
             raise
         with self._lock:
             active = (
@@ -295,7 +295,7 @@ class InputService:
                 ),
                 Priority.INTERACTIVE,
             )
-            self._refresh_idle_capture()
+            self._refresh_idle_capture_if_idle()
             raise InputUnavailable("input request was cancelled")
         return session_id
 
@@ -1123,6 +1123,15 @@ class InputService:
             )
         elif not should_capture and running:
             self._backend.stop_capture()
+
+    def _refresh_idle_capture_if_idle(self) -> None:
+        with self._lock:
+            if (
+                self._state is not InputSessionState.IDLE
+                or self._session_id is not None
+            ):
+                return
+        self._refresh_idle_capture()
 
     def _require_being_controlled(self, session_id: str) -> None:
         with self._lock:

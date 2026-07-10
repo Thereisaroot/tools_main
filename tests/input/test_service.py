@@ -285,6 +285,52 @@ def test_cancelled_request_is_followed_by_stop_when_request_send_finishes_late()
     ]
 
 
+def test_cancelled_old_request_cannot_stop_replacement_session_capture():
+    old_request_started = threading.Event()
+    release_old_request = threading.Event()
+
+    class BlockingFirstRequestBus(FakeBus):
+        def send(self, message, *, secure=True, priority=Priority.NORMAL):
+            if (
+                message.message_type is MessageType.INPUT_REQUEST
+                and message.metadata["session_id"] == LOCAL_SESSION
+            ):
+                old_request_started.set()
+                assert release_old_request.wait(2)
+            super().send(message, secure=secure, priority=priority)
+
+    session_ids = iter((LOCAL_SESSION, "3" * 32))
+    bus = BlockingFirstRequestBus()
+    backend = FakeBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        session_factory=lambda: next(session_ids),
+    )
+    old_errors = []
+    old_requester = threading.Thread(
+        target=lambda: _capture_error(service.request_control, old_errors)
+    )
+    old_requester.start()
+    assert old_request_started.wait(1)
+    service.stop_control(reason="cancelled")
+
+    replacement_id = service.request_control()
+    assert service.handle_message(input_accept(replacement_id))
+    assert backend.capture_running is True
+    release_old_request.set()
+    old_requester.join(2)
+
+    assert not old_requester.is_alive()
+    assert isinstance(old_errors[0], InputUnavailable)
+    assert service.state is InputSessionState.CONTROLLING
+    assert service.active_session_id == replacement_id
+    assert backend.capture_running is True
+    service.stop_control(reason="test_complete")
+
+
 def test_disconnected_service_rejects_buffered_incoming_request():
     service, bus, _backend = start_being_controlled()
     service.stop_control(reason="reset")
