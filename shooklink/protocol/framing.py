@@ -42,7 +42,7 @@ def cobs_encode(data: bytes) -> bytes:
     code_index = 0
     code = 1
 
-    for value in data:
+    for index, value in enumerate(data):
         if value == 0:
             encoded[code_index] = code
             code_index = len(encoded)
@@ -54,6 +54,8 @@ def cobs_encode(data: bytes) -> bytes:
         code += 1
         if code == 0xFF:
             encoded[code_index] = code
+            if index == len(data) - 1:
+                return bytes(encoded)
             code_index = len(encoded)
             encoded.append(0)
             code = 1
@@ -129,6 +131,11 @@ def encode_frame(frame: Frame) -> bytes:
 
 def decode_frame(packet: bytes) -> Frame:
     """Decode and validate one COBS packet without its delimiter."""
+    if not isinstance(packet, bytes):
+        raise TypeError("encoded frame must be bytes")
+    if len(packet) > MAX_ENCODED_FRAME_SIZE:
+        raise FrameDecodeError("encoded frame exceeds the maximum size")
+
     try:
         decoded = cobs_decode(packet)
     except FrameDecodeError:

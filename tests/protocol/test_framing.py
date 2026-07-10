@@ -3,6 +3,7 @@ import zlib
 
 import pytest
 
+import shooklink.protocol.framing as framing
 from shooklink.protocol.framing import (
     HEADER,
     MAGIC,
@@ -69,6 +70,15 @@ def test_cobs_round_trip(payload):
     assert encoded
     assert b"\x00" not in encoded
     assert cobs_decode(encoded) == payload
+
+
+def test_cobs_uses_canonical_254_byte_blocks():
+    block = b"a" * 254
+
+    assert cobs_encode(b"a" * 253) == b"\xfe" + b"a" * 253
+    assert cobs_encode(block) == b"\xff" + block
+    assert cobs_encode(block + b"a") == b"\xff" + block + b"\x02a"
+    assert cobs_encode(block * 2) == (b"\xff" + block) * 2
 
 
 @pytest.mark.parametrize("packet", [b"", b"\x00", b"\x02", b"\x03a", b"\x01\x00"])
@@ -149,6 +159,16 @@ def test_decode_rejects_truncated_frame():
 
     with pytest.raises(FrameDecodeError):
         decode_frame(_packet_from_decoded(header))
+
+
+def test_decode_rejects_oversized_packet_before_cobs_allocation(monkeypatch):
+    def unexpected_decode(_packet):
+        pytest.fail("oversized packet reached cobs_decode")
+
+    monkeypatch.setattr(framing, "cobs_decode", unexpected_decode)
+
+    with pytest.raises(FrameDecodeError, match="encoded frame"):
+        framing.decode_frame(b"x" * (MAX_ENCODED_FRAME_SIZE + 1))
 
 
 def test_parser_handles_fragmentation_and_multiple_frames():
