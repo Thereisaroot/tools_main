@@ -13,6 +13,13 @@ from .events import (
     WheelEvent,
 )
 from .pointer import LogicalPointer, PointerTransition, TransitionKind
+from .service import (
+    InputProtocolError,
+    InputService,
+    InputSessionState,
+    InputStateChange,
+    InputUnavailable,
+)
 from .topology import EdgeSegment, Monitor, Rect, Side, Topology
 
 __all__ = [
@@ -22,6 +29,11 @@ __all__ = [
     "KeyEvent",
     "KeyLocation",
     "LogicalPointer",
+    "InputProtocolError",
+    "InputService",
+    "InputSessionState",
+    "InputStateChange",
+    "InputUnavailable",
     "Modifiers",
     "Monitor",
     "MouseButton",

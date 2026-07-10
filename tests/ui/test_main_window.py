@@ -9,6 +9,9 @@ from PySide6.QtWidgets import QApplication
 
 from shooklink.chat.service import ChatService
 from shooklink.files.service import FileProgress
+from shooklink.input.backend import PermissionStatus
+from shooklink.input.service import InputSessionState, InputStateChange
+from shooklink.input.topology import Side
 from shooklink.protocol.messages import Message, MessageType
 from shooklink.shell.service import ShellOutput, ShellState
 from shooklink.ui.main_window import FileDropZone, MainWindow
@@ -102,6 +105,53 @@ class FakeShellService:
     def emit_state(self, state):
         for listener in tuple(self.states):
             listener(state)
+
+
+class FakeInputService:
+    def __init__(self):
+        self.state = InputSessionState.IDLE
+        self.peer_side = Side.RIGHT
+        self.auto_edge_enabled = False
+        self.allowed = False
+        self.listeners = []
+        self.requests = 0
+        self.stops = []
+        self.connection_changes = []
+
+    def permission_status(self):
+        return PermissionStatus(True, True, "ready")
+
+    def add_state_listener(self, listener):
+        self.listeners.append(listener)
+
+    def remove_state_listener(self, listener):
+        self.listeners.remove(listener)
+
+    def set_allow_remote_input(self, allowed):
+        self.allowed = allowed
+
+    def set_peer_side(self, side):
+        self.peer_side = side if isinstance(side, Side) else Side(side)
+
+    def set_auto_edge_enabled(self, enabled):
+        self.auto_edge_enabled = enabled
+
+    def request_control(self):
+        self.requests += 1
+        self.emit(InputStateChange(InputSessionState.REQUESTING, "1" * 32))
+        return "1" * 32
+
+    def stop_control(self, *, reason="manual"):
+        self.stops.append(reason)
+        self.emit(InputStateChange(InputSessionState.IDLE, reason=reason))
+
+    def connection_changed(self, connected):
+        self.connection_changes.append(connected)
+
+    def emit(self, change):
+        self.state = change.state
+        for listener in tuple(self.listeners):
+            listener(change)
 
 
 def test_main_window_sends_korean_and_punctuation(qtbot):
@@ -307,3 +357,60 @@ def test_remote_shell_controls_open_terminal_and_forward_output(qtbot):
 
     qtbot.mouseClick(window.terminate_shell_button, Qt.MouseButton.LeftButton)
     assert shell.closed[-1] == session_id
+
+
+def test_input_share_controls_state_and_leave_chat_file_actions_enabled(qtbot, tmp_path):
+    files = FakeFileService(tmp_path / "downloads")
+    input_service = FakeInputService()
+    window = MainWindow(
+        ChatService(FakeBus()),
+        files,
+        None,
+        input_service,
+    )
+    qtbot.addWidget(window)
+    window.show()
+
+    assert window.input_permission_status.text() == "ready"
+    assert window.peer_side_combo.currentText() == "Right"
+    qtbot.mouseClick(window.allow_input_checkbox, Qt.MouseButton.LeftButton)
+    window.peer_side_combo.setCurrentText("Left")
+    qtbot.mouseClick(window.auto_edge_checkbox, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window.toggle_input_button, Qt.MouseButton.LeftButton)
+
+    assert input_service.allowed is True
+    assert input_service.peer_side is Side.LEFT
+    assert input_service.auto_edge_enabled is True
+    assert input_service.requests == 1
+    assert window.input_status.text() == "Requesting remote control"
+
+    input_service.emit(
+        InputStateChange(InputSessionState.CONTROLLING, "1" * 32)
+    )
+    qtbot.waitUntil(lambda: window.input_status.text() == "Controlling remote")
+    assert window.send_plain_button.isEnabled()
+    assert window.send_secure_button.isEnabled()
+    assert window.file_select_button.isEnabled()
+
+    window.set_connected(True)
+    window.set_connected(False)
+    assert input_service.connection_changes == [True, False]
+
+    qtbot.mouseClick(window.toggle_input_button, Qt.MouseButton.LeftButton)
+    assert input_service.stops == ["manual"]
+
+
+def test_being_controlled_state_is_visible_and_listener_is_removed_on_close(qtbot):
+    input_service = FakeInputService()
+    window = MainWindow(ChatService(FakeBus()), None, None, input_service)
+    qtbot.addWidget(window)
+    window.show()
+
+    input_service.emit(
+        InputStateChange(InputSessionState.BEING_CONTROLLED, "2" * 32)
+    )
+    qtbot.waitUntil(lambda: window.input_status.text() == "Being controlled")
+    assert "Ctrl+Alt+Shift" in window.input_emergency_help.text()
+
+    window.close()
+    assert input_service.listeners == []

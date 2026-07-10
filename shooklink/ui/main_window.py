@@ -40,6 +40,9 @@ from serial.tools import list_ports
 
 from shooklink.chat.service import ChatMessage, ChatService
 from shooklink.files.service import FileProgress
+from shooklink.input.backend import PermissionStatus
+from shooklink.input.service import InputSessionState, InputStateChange
+from shooklink.input.topology import Side
 from shooklink.shell.service import ShellOutput, ShellState
 from shooklink.ui.terminal_window import TerminalWindow
 
@@ -84,6 +87,30 @@ class ShellUiService(Protocol):
     def resize(self, session_id: str, columns: int, rows: int) -> None: ...
 
     def close_session(self, session_id: str) -> None: ...
+
+
+class InputUiService(Protocol):
+    state: InputSessionState
+    peer_side: Side
+    auto_edge_enabled: bool
+
+    def permission_status(self) -> PermissionStatus: ...
+
+    def add_state_listener(self, listener) -> None: ...
+
+    def remove_state_listener(self, listener) -> None: ...
+
+    def set_allow_remote_input(self, allowed: bool) -> None: ...
+
+    def set_peer_side(self, side: Side | str) -> None: ...
+
+    def set_auto_edge_enabled(self, enabled: bool) -> None: ...
+
+    def request_control(self) -> str: ...
+
+    def stop_control(self, *, reason: str = "manual") -> None: ...
+
+    def connection_changed(self, connected: bool) -> None: ...
 
 
 class FileDropZone(QFrame):
@@ -135,17 +162,20 @@ class MainWindow(QMainWindow):
     file_prepared = Signal(object)
     shell_output = Signal(object)
     shell_state = Signal(object)
+    input_state = Signal(object)
 
     def __init__(
         self,
         chat_service: ChatService,
         file_service: FileUiService | None = None,
         shell_service: ShellUiService | None = None,
+        input_service: InputUiService | None = None,
     ) -> None:
         super().__init__()
         self._chat_service = chat_service
         self._file_service = file_service
         self._shell_service = shell_service
+        self._input_service = input_service
         self._shortcuts: list[QShortcut] = []
         self._connected = False
         self._active_transfer_id: str | None = None
@@ -156,6 +186,7 @@ class MainWindow(QMainWindow):
         self._file_listener = self.file_progress.emit
         self._shell_output_listener = self.shell_output.emit
         self._shell_state_listener = self.shell_state.emit
+        self._input_state_listener = self.input_state.emit
         self.setWindowTitle("ShookLink")
         self.setMinimumSize(760, 640)
         self.resize(920, 760)
@@ -167,12 +198,15 @@ class MainWindow(QMainWindow):
         self.file_prepared.connect(self._file_was_prepared)
         self.shell_output.connect(self._show_shell_output)
         self.shell_state.connect(self._show_shell_state)
+        self.input_state.connect(self._show_input_state)
         self._chat_service.add_message_listener(self._chat_listener)
         if self._file_service is not None:
             self._file_service.add_progress_listener(self._file_listener)
         if self._shell_service is not None:
             self._shell_service.add_output_listener(self._shell_output_listener)
             self._shell_service.add_state_listener(self._shell_state_listener)
+        if self._input_service is not None:
+            self._input_service.add_state_listener(self._input_state_listener)
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -254,6 +288,62 @@ class MainWindow(QMainWindow):
         self.file_cancel_button.setEnabled(False)
         self.open_download_button.setEnabled(files_enabled)
         layout.addWidget(file_panel)
+
+        input_panel = QFrame()
+        input_panel.setObjectName("panel")
+        input_layout = QGridLayout(input_panel)
+        input_layout.setContentsMargins(18, 13, 18, 13)
+        input_layout.setHorizontalSpacing(10)
+        input_layout.setVerticalSpacing(8)
+        input_title = QLabel("INPUT SHARE")
+        input_title.setObjectName("sectionLabel")
+        self.allow_input_checkbox = QCheckBox("Allow Remote Input")
+        self.allow_input_checkbox.toggled.connect(self._set_input_permission)
+        peer_side_label = QLabel("PEER SIDE")
+        self.peer_side_combo = QComboBox()
+        self.peer_side_combo.addItems(["Right", "Left", "Top", "Bottom"])
+        self.auto_edge_checkbox = QCheckBox("Auto Edge Toggle")
+        self.toggle_input_button = QPushButton("Toggle Remote Control")
+        self.toggle_input_button.clicked.connect(self._toggle_input_control)
+        self.input_status = QLabel("Idle")
+        self.input_status.setObjectName("inputStatus")
+        self.input_permission_status = QLabel("Unavailable")
+        self.input_permission_status.setObjectName("inputPermissionStatus")
+        self.input_emergency_help = QLabel(
+            "Ctrl+Alt+Shift+Backspace: emergency stop · Ctrl+Alt+Shift+Escape: exit"
+        )
+        self.input_emergency_help.setObjectName("inputEmergencyHelp")
+        input_layout.addWidget(input_title, 0, 0)
+        input_layout.addWidget(self.allow_input_checkbox, 0, 1)
+        input_layout.addWidget(peer_side_label, 0, 2)
+        input_layout.addWidget(self.peer_side_combo, 0, 3)
+        input_layout.addWidget(self.auto_edge_checkbox, 0, 4)
+        input_layout.addWidget(self.input_status, 0, 5)
+        input_layout.addWidget(self.toggle_input_button, 0, 6)
+        input_layout.addWidget(self.input_permission_status, 1, 0, 1, 2)
+        input_layout.addWidget(self.input_emergency_help, 1, 2, 1, 5)
+        input_layout.setColumnStretch(5, 1)
+        input_enabled = self._input_service is not None
+        self.allow_input_checkbox.setEnabled(input_enabled)
+        self.peer_side_combo.setEnabled(input_enabled)
+        self.auto_edge_checkbox.setEnabled(input_enabled)
+        self.toggle_input_button.setEnabled(input_enabled)
+        if self._input_service is not None:
+            self.peer_side_combo.setCurrentText(
+                self._input_service.peer_side.value.title()
+            )
+            self.auto_edge_checkbox.setChecked(
+                self._input_service.auto_edge_enabled
+            )
+            try:
+                permission = self._input_service.permission_status()
+                self.input_permission_status.setText(permission.detail)
+            except Exception as error:
+                self.input_permission_status.setText(str(error))
+            self._show_input_state(InputStateChange(self._input_service.state))
+        self.peer_side_combo.currentTextChanged.connect(self._set_input_side)
+        self.auto_edge_checkbox.toggled.connect(self._set_auto_edge)
+        layout.addWidget(input_panel)
 
         shell_panel = QFrame()
         shell_panel.setObjectName("panel")
@@ -376,6 +466,9 @@ class MainWindow(QMainWindow):
             QLabel#messageKind, QLabel#actionStatus { color: #66756f; }
             QLabel#fileProgress { color: #526761; font-size: 11px; }
             QLabel#shellStatus { color: #526761; font-size: 11px; }
+            QLabel#inputStatus, QLabel#inputPermissionStatus, QLabel#inputEmergencyHelp {
+                color: #526761; font-size: 11px;
+            }
             QProgressBar {
                 min-height: 8px; max-height: 8px; border: none; border-radius: 4px;
                 background: #cbc7bd;
@@ -487,6 +580,66 @@ class MainWindow(QMainWindow):
         self._shell_service.set_allow_remote_shell(allowed)
         if self._active_shell_session is None:
             self.shell_status.setText("Armed" if allowed else "Disabled")
+
+    def _set_input_permission(self, allowed: bool) -> None:
+        if self._input_service is None:
+            return
+        try:
+            self._input_service.set_allow_remote_input(allowed)
+        except Exception as error:
+            self.input_status.setText(str(error))
+
+    def _set_input_side(self, label: str) -> None:
+        if self._input_service is None:
+            return
+        try:
+            self._input_service.set_peer_side(label.lower())
+        except Exception as error:
+            self.input_status.setText(str(error))
+            self.peer_side_combo.setCurrentText(
+                self._input_service.peer_side.value.title()
+            )
+
+    def _set_auto_edge(self, enabled: bool) -> None:
+        if self._input_service is None:
+            return
+        try:
+            self._input_service.set_auto_edge_enabled(enabled)
+        except Exception as error:
+            self.input_status.setText(str(error))
+            self.auto_edge_checkbox.setChecked(
+                self._input_service.auto_edge_enabled
+            )
+
+    def _toggle_input_control(self) -> None:
+        if self._input_service is None:
+            return
+        try:
+            if self._input_service.state is InputSessionState.IDLE:
+                self._input_service.request_control()
+            else:
+                self._input_service.stop_control(reason="manual")
+        except Exception as error:
+            self.input_status.setText(str(error))
+
+    def _show_input_state(self, change: InputStateChange) -> None:
+        labels = {
+            InputSessionState.IDLE: "Idle",
+            InputSessionState.REQUESTING: "Requesting remote control",
+            InputSessionState.CONTROLLING: "Controlling remote",
+            InputSessionState.BEING_CONTROLLED: "Being controlled",
+        }
+        self.input_status.setText(labels[change.state])
+        active = change.state is not InputSessionState.IDLE
+        self.toggle_input_button.setText(
+            "Stop Input Share" if active else "Toggle Remote Control"
+        )
+        self.peer_side_combo.setEnabled(
+            self._input_service is not None and not active
+        )
+        self.auto_edge_checkbox.setEnabled(
+            self._input_service is not None and not active
+        )
 
     def _open_remote_shell(self) -> None:
         if self._shell_service is None:
@@ -616,6 +769,8 @@ class MainWindow(QMainWindow):
         self.connect_button.setText("Disconnect" if connected else "Connect")
         self.port_combo.setEnabled(not connected)
         self.baud_combo.setEnabled(not connected)
+        if self._input_service is not None:
+            self._input_service.connection_changed(connected)
 
     def refresh_secure_state(self) -> None:
         self.send_secure_button.setEnabled(self._chat_service.secure_available)
@@ -653,6 +808,8 @@ class MainWindow(QMainWindow):
         if self._shell_service is not None:
             self._shell_service.remove_output_listener(self._shell_output_listener)
             self._shell_service.remove_state_listener(self._shell_state_listener)
+        if self._input_service is not None:
+            self._input_service.remove_state_listener(self._input_state_listener)
         if self.terminal_window is not None:
             self.terminal_window.close()
         super().closeEvent(event)

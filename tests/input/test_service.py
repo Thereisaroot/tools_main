@@ -1,0 +1,779 @@
+from __future__ import annotations
+
+import pytest
+
+from shooklink.input.backend import BaseInputBackend, PermissionStatus
+from shooklink.input.events import (
+    KeyAction,
+    KeyEvent,
+    KeyLocation,
+    Modifiers,
+    MouseButton,
+    MouseButtonEvent,
+    PointerMotionEvent,
+    PointerPositionEvent,
+)
+from shooklink.input.service import InputService, InputSessionState
+from shooklink.input.topology import Monitor, Rect, Side
+from shooklink.protocol.messages import Message, MessageType
+from shooklink.transport.multiplexer import Priority
+
+
+LOCAL_SESSION = "1" * 32
+REMOTE_SESSION = "2" * 32
+
+
+class FakeClock:
+    def __init__(self, value=10.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+
+def test_input_service_types_are_exported_from_input_package():
+    from shooklink.input import InputService as ExportedService
+    from shooklink.input import InputSessionState as ExportedState
+
+    assert ExportedService is InputService
+    assert ExportedState is InputSessionState
+
+
+class FakeBus:
+    def __init__(self, *, trusted=True):
+        self.trusted = trusted
+        self.sent = []
+
+    def send(self, message, *, secure=True, priority=Priority.NORMAL):
+        self.sent.append((message, secure, priority))
+
+    def decrypt_secure(self, message):
+        return message.body
+
+
+class FailingBus(FakeBus):
+    def __init__(self, *, fail_types=()):
+        super().__init__()
+        self.fail_types = set(fail_types)
+
+    def send(self, message, *, secure=True, priority=Priority.NORMAL):
+        if message.message_type in self.fail_types:
+            raise RuntimeError(f"cannot send {message.message_type.name}")
+        super().send(message, secure=secure, priority=priority)
+
+
+class FakeBackend(BaseInputBackend):
+    def __init__(self, monitors=None, position=(99, 50)):
+        super().__init__()
+        self._monitors = (
+            (Monitor("local", Rect(0, 0, 100, 100)),)
+            if monitors is None
+            else monitors
+        )
+        self.monitor_calls = 0
+        self.position = position
+        self.capture_starts = []
+        self.capture_stops = 0
+        self.native_injected = []
+        self.warps = []
+        self.capture_allowed = True
+        self.inject_allowed = True
+        self.emergency_callback = None
+
+    def permission_status(self):
+        return PermissionStatus(
+            self.capture_allowed,
+            self.inject_allowed,
+            "ready" if self.capture_allowed and self.inject_allowed else "permission required",
+        )
+
+    def monitors(self):
+        self.monitor_calls += 1
+        return self._monitors
+
+    def cursor_position(self):
+        return self.position
+
+    def warp_cursor(self, x, y):
+        self.position = (x, y)
+        self.warps.append((x, y))
+
+    def _start_native_capture(self, suppress):
+        self.capture_starts.append(suppress)
+        self.emergency_callback = self._emergency_callback
+
+    def _stop_native_capture(self):
+        self.capture_stops += 1
+
+    def _inject_native(self, event):
+        self.native_injected.append(event)
+        if isinstance(event, PointerPositionEvent):
+            self.position = event.position
+
+    def capture(self, event):
+        self.emit_captured(event)
+
+    def emergency_stop(self):
+        assert self.emergency_callback is not None
+        self.emergency_callback("stop")
+
+
+def monitors_metadata(*rectangles):
+    return [
+        {
+            "id": f"display-{index}",
+            "x": rectangle.x,
+            "y": rectangle.y,
+            "width": rectangle.width,
+            "height": rectangle.height,
+        }
+        for index, rectangle in enumerate(rectangles)
+    ]
+
+
+def input_request(
+    session_id=REMOTE_SESSION,
+    *,
+    controller_id="peer-b",
+    side="right",
+    rectangles=(Rect(0, 0, 200, 100),),
+):
+    return Message(
+        MessageType.INPUT_REQUEST,
+        {
+            "session_id": session_id,
+            "controller_id": controller_id,
+            "side": side,
+            "monitors": monitors_metadata(*rectangles),
+        },
+    )
+
+
+def input_accept(
+    session_id,
+    *,
+    peer_id="peer-b",
+    rectangles=(Rect(0, 0, 200, 100),),
+):
+    return Message(
+        MessageType.INPUT_ACCEPT,
+        {
+            "session_id": session_id,
+            "peer_id": peer_id,
+            "monitors": monitors_metadata(*rectangles),
+        },
+    )
+
+
+def start_controlling(*, clock=None, auto_edge=False):
+    bus = FakeBus()
+    backend = FakeBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        peer_side=Side.RIGHT,
+        auto_edge_enabled=auto_edge,
+        clock=clock or FakeClock(),
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    session_id = service.request_control()
+    assert service.handle_message(input_accept(session_id))
+    return service, bus, backend, session_id
+
+
+def start_being_controlled():
+    bus = FakeBus()
+    backend = FakeBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+    )
+    service.set_allow_remote_input(True)
+    assert service.handle_message(input_request())
+    return service, bus, backend
+
+
+def test_outgoing_request_accepts_topology_and_enters_absolute_pointer_mode():
+    bus = FakeBus()
+    backend = FakeBackend(position=(99, 50))
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        peer_side=Side.RIGHT,
+        clock=FakeClock(),
+        session_factory=lambda: LOCAL_SESSION,
+    )
+
+    session_id = service.request_control()
+
+    request, secure, priority = bus.sent[-1]
+    assert session_id == LOCAL_SESSION
+    assert service.state is InputSessionState.REQUESTING
+    assert request.message_type is MessageType.INPUT_REQUEST
+    assert request.metadata["side"] == "right"
+    assert request.metadata["monitors"][0]["width"] == 100
+    assert secure is True
+    assert priority is Priority.INTERACTIVE
+
+    assert service.handle_message(input_accept(session_id))
+
+    enter = bus.sent[-1][0]
+    assert service.state is InputSessionState.CONTROLLING
+    assert backend.capture_starts == [True]
+    assert enter.message_type is MessageType.INPUT_ENTER
+    assert (enter.metadata["x"], enter.metadata["y"]) == (0, 50)
+
+
+def test_allowed_incoming_request_accepts_and_injects_normalized_key():
+    service, bus, backend = start_being_controlled()
+    accept, secure, priority = bus.sent[-1]
+    assert service.state is InputSessionState.BEING_CONTROLLED
+    assert accept.message_type is MessageType.INPUT_ACCEPT
+    assert accept.metadata["monitors"][0]["width"] == 100
+    assert secure is True
+    assert priority is Priority.INTERACTIVE
+
+    key = KeyEvent(
+        KeyAction.DOWN,
+        usage=0x38,
+        scan_code=44,
+        virtual_key=191,
+        text="?",
+        modifiers=Modifiers.SHIFT,
+        location=KeyLocation.STANDARD,
+        repeat=True,
+        extended=False,
+    )
+    message = Message(
+        MessageType.INPUT_KEY,
+        {
+            "session_id": REMOTE_SESSION,
+            "action": key.action.value,
+            "usage": key.usage,
+            "scan_code": key.scan_code,
+            "virtual_key": key.virtual_key,
+            "text": key.text,
+            "modifiers": int(key.modifiers),
+            "location": key.location.value,
+            "repeat": key.repeat,
+            "extended": key.extended,
+        },
+    )
+
+    assert service.handle_message(message)
+    assert backend.native_injected[-1] == key
+
+
+def test_denied_incoming_request_does_not_require_monitor_enumeration():
+    bus = FakeBus()
+    backend = FakeBackend(monitors=())
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+    )
+
+    assert service.handle_message(input_request())
+
+    busy = bus.sent[-1][0]
+    assert busy.message_type is MessageType.INPUT_BUSY
+    assert busy.metadata["reason"] == "permission"
+
+
+def test_incoming_request_rolls_back_when_pressed_input_cleanup_fails():
+    class FailingReleaseBackend(FakeBackend):
+        def release_all(self):
+            raise RuntimeError("release failed")
+
+    bus = FakeBus()
+    service = InputService(
+        bus,
+        FailingReleaseBackend(),
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+    )
+    service.set_allow_remote_input(True)
+
+    assert service.handle_message(input_request())
+
+    assert service.state is InputSessionState.IDLE
+    assert bus.sent[-1][0].message_type is MessageType.INPUT_BUSY
+    assert bus.sent[-1][0].metadata["reason"] == "unavailable"
+
+
+def test_simultaneous_requests_use_stable_peer_id_tie_breaker():
+    lower_bus = FakeBus()
+    lower = InputService(
+        lower_bus,
+        FakeBackend(),
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    lower.set_allow_remote_input(True)
+    lower.request_control()
+    lower_bus.sent.clear()
+
+    assert lower.handle_message(input_request(controller_id="peer-b"))
+    assert lower.state is InputSessionState.REQUESTING
+    assert lower_bus.sent[-1][0].message_type is MessageType.INPUT_BUSY
+
+    higher_bus = FakeBus()
+    higher = InputService(
+        higher_bus,
+        FakeBackend(),
+        local_peer_id="peer-b",
+        peer_id="peer-a",
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    higher.set_allow_remote_input(True)
+    higher.request_control()
+    higher_bus.sent.clear()
+
+    assert higher.handle_message(input_request(controller_id="peer-a"))
+    assert higher.state is InputSessionState.BEING_CONTROLLED
+    assert higher.active_session_id == REMOTE_SESSION
+    assert higher_bus.sent[-1][0].message_type is MessageType.INPUT_ACCEPT
+
+
+def test_stale_session_event_is_rejected_without_injection():
+    service, _bus, backend = start_being_controlled()
+    stale = Message(
+        MessageType.INPUT_BUTTON,
+        {
+            "session_id": "f" * 32,
+            "button": MouseButton.LEFT.value,
+            "action": KeyAction.DOWN.value,
+        },
+    )
+
+    assert service.handle_message(stale) is False
+    assert backend.native_injected == []
+
+
+def test_unknown_modifier_bits_are_rejected_before_native_injection():
+    service, _bus, backend = start_being_controlled()
+    message = Message(
+        MessageType.INPUT_KEY,
+        {
+            "session_id": REMOTE_SESSION,
+            "action": "down",
+            "usage": 4,
+            "scan_code": 30,
+            "virtual_key": 65,
+            "text": "a",
+            "modifiers": 1 << 20,
+            "location": "standard",
+            "repeat": False,
+            "extended": False,
+        },
+    )
+
+    assert service.handle_message(message) is False
+    assert backend.native_injected == []
+
+
+def test_monitor_rectangle_must_stay_within_protocol_coordinate_bounds():
+    bus = FakeBus()
+    service = InputService(
+        bus,
+        FakeBackend(),
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+    )
+    service.set_allow_remote_input(True)
+    message = input_request()
+    message.metadata["monitors"][0].update(x=10_000_000, width=2)
+
+    assert service.handle_message(message) is False
+    assert service.state is InputSessionState.IDLE
+    assert bus.sent == []
+
+
+def test_local_topology_cannot_exceed_wire_monitor_limit():
+    monitors = tuple(
+        Monitor(f"display-{index}", Rect(index * 10, 0, 10, 10))
+        for index in range(33)
+    )
+    bus = FakeBus()
+    service = InputService(
+        bus,
+        FakeBackend(monitors=monitors, position=(0, 0)),
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+    )
+
+    try:
+        service.request_control()
+    except Exception as error:
+        assert "monitor" in str(error).lower()
+    else:
+        raise AssertionError("oversized local topology was sent")
+    assert bus.sent == []
+
+
+def test_incoming_motion_reuses_session_topology_instead_of_enumerating_displays():
+    service, _bus, backend = start_being_controlled()
+    calls_after_accept = backend.monitor_calls
+    assert service.handle_message(
+        Message(
+            MessageType.INPUT_ENTER,
+            {"session_id": REMOTE_SESSION, "x": 0, "y": 50},
+        )
+    )
+    for sequence in (1, 2):
+        assert service.handle_message(
+            Message(
+                MessageType.INPUT_MOVE,
+                {
+                    "session_id": REMOTE_SESSION,
+                    "motion_sequence": sequence,
+                    "x": sequence,
+                    "y": 50,
+                },
+            )
+        )
+
+    assert backend.monitor_calls == calls_after_accept
+
+
+def test_out_of_order_incoming_motion_cannot_rewind_injected_pointer():
+    service, _bus, backend = start_being_controlled()
+    for sequence, x in ((2, 20), (1, 1)):
+        assert service.handle_message(
+            Message(
+                MessageType.INPUT_MOVE,
+                {
+                    "session_id": REMOTE_SESSION,
+                    "motion_sequence": sequence,
+                    "x": x,
+                    "y": 50,
+                },
+            )
+        )
+
+    assert backend.position == (20, 50)
+
+
+def test_disconnect_releases_every_remotely_pressed_input():
+    service, _bus, backend = start_being_controlled()
+    assert service.handle_message(
+        Message(
+            MessageType.INPUT_KEY,
+            {
+                "session_id": REMOTE_SESSION,
+                "action": "down",
+                "usage": 4,
+                "scan_code": 30,
+                "virtual_key": 65,
+                "text": "a",
+                "modifiers": 0,
+                "location": "standard",
+                "repeat": False,
+                "extended": False,
+            },
+        )
+    )
+    assert service.handle_message(
+        Message(
+            MessageType.INPUT_BUTTON,
+            {
+                "session_id": REMOTE_SESSION,
+                "button": "left",
+                "action": "down",
+            },
+        )
+    )
+    assert backend.pressed_keys == frozenset({4})
+    assert backend.pressed_buttons == frozenset({MouseButton.LEFT})
+
+    service.disconnect()
+
+    assert service.state is InputSessionState.IDLE
+    assert backend.pressed_keys == frozenset()
+    assert backend.pressed_buttons == frozenset()
+    assert [event.action for event in backend.native_injected[-2:]] == [
+        KeyAction.UP,
+        KeyAction.UP,
+    ]
+
+
+def test_manual_and_emergency_stop_release_remote_session():
+    service, bus, backend, _session_id = start_controlling()
+    bus.sent.clear()
+
+    service.stop_control(reason="manual")
+
+    assert service.state is InputSessionState.IDLE
+    assert backend.capture_running is False
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.INPUT_RELEASE_ALL,
+        MessageType.INPUT_STOP,
+    ]
+
+    service, bus, backend, _session_id = start_controlling()
+    bus.sent.clear()
+    backend.emergency_stop()
+
+    assert service.state is InputSessionState.IDLE
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.INPUT_RELEASE_ALL,
+        MessageType.INPUT_STOP,
+    ]
+
+
+def test_auto_edge_hold_enters_and_remote_return_edge_leaves_without_dead_space():
+    clock = FakeClock(20.0)
+    bus = FakeBus()
+    backend = FakeBackend(position=(99, 50))
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        peer_side=Side.RIGHT,
+        clock=clock,
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    service.set_auto_edge_enabled(True)
+    assert backend.capture_starts == [False]
+
+    backend.capture(PointerMotionEvent(2, 0))
+    clock.value += 0.51
+    backend.capture(PointerMotionEvent(1, 0))
+
+    assert service.state is InputSessionState.REQUESTING
+    assert backend.capture_running is False
+    assert service.handle_message(input_accept(LOCAL_SESSION))
+    bus.sent.clear()
+
+    backend.capture(PointerMotionEvent(-1, 0))
+
+    assert service.state is InputSessionState.IDLE
+    assert backend.warps[-1] == (98, 50)
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.INPUT_LEAVE,
+        MessageType.INPUT_RELEASE_ALL,
+        MessageType.INPUT_STOP,
+    ]
+    assert backend.capture_starts[-1] is False
+
+
+def test_auto_edge_setting_rolls_back_when_idle_capture_cannot_start():
+    class FailingStartBackend(FakeBackend):
+        def _start_native_capture(self, suppress):
+            raise RuntimeError("hook start failed")
+
+    service = InputService(
+        FakeBus(),
+        FailingStartBackend(),
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+    )
+
+    with pytest.raises(RuntimeError, match="hook start failed"):
+        service.set_auto_edge_enabled(True)
+
+    assert service.auto_edge_enabled is False
+    assert service.state is InputSessionState.IDLE
+
+
+def test_request_rolls_back_when_idle_capture_cannot_stop():
+    class FailingStopBackend(FakeBackend):
+        def _stop_native_capture(self):
+            raise RuntimeError("hook stop failed")
+
+    bus = FakeBus()
+    backend = FailingStopBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    service.set_auto_edge_enabled(True)
+
+    with pytest.raises(RuntimeError, match="failed to stop"):
+        service.request_control()
+
+    assert service.state is InputSessionState.IDLE
+    assert bus.sent == []
+
+
+def test_pending_absolute_pointer_is_flushed_before_button_down():
+    clock = FakeClock(30.0)
+    service, bus, backend, _session_id = start_controlling(clock=clock)
+    bus.sent.clear()
+
+    backend.capture(PointerMotionEvent(5, 2))
+    backend.capture(MouseButtonEvent(MouseButton.LEFT, KeyAction.DOWN))
+
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.INPUT_MOVE,
+        MessageType.INPUT_BUTTON,
+    ]
+    assert bus.sent[0][0].metadata["x"] == 5
+    assert bus.sent[0][0].metadata["y"] == 52
+    assert bus.sent[0][2] is Priority.MOTION
+    assert bus.sent[1][2] is Priority.INTERACTIVE
+
+
+def test_pointer_state_reconciles_controller_logical_position():
+    service, bus, backend, session_id = start_controlling()
+    bus.sent.clear()
+    backend.capture(PointerMotionEvent(5, 0))
+    backend.capture(MouseButtonEvent(MouseButton.LEFT, KeyAction.DOWN))
+    sent_move = next(
+        item[0]
+        for item in bus.sent
+        if item[0].message_type is MessageType.INPUT_MOVE
+    )
+    bus.sent.clear()
+
+    assert service.handle_message(
+        Message(
+            MessageType.INPUT_POINTER_STATE,
+            {
+                "session_id": session_id,
+                "motion_sequence": sent_move.metadata["motion_sequence"],
+                "x": 150,
+                "y": 20,
+            },
+        )
+    )
+
+    backend.capture(PointerMotionEvent(1, 1))
+    backend.capture(MouseButtonEvent(MouseButton.LEFT, KeyAction.DOWN))
+
+    move = next(
+        item[0]
+        for item in bus.sent
+        if item[0].message_type is MessageType.INPUT_MOVE
+    )
+    assert (move.metadata["x"], move.metadata["y"]) == (151, 21)
+
+
+def test_stale_pointer_state_does_not_rewind_newer_logical_position():
+    service, bus, backend, session_id = start_controlling()
+    bus.sent.clear()
+    backend.capture(PointerMotionEvent(5, 0))
+    backend.capture(MouseButtonEvent(MouseButton.LEFT, KeyAction.DOWN))
+    first = next(item[0] for item in bus.sent if item[0].message_type is MessageType.INPUT_MOVE)
+    bus.sent.clear()
+    backend.capture(PointerMotionEvent(5, 0))
+    backend.capture(MouseButtonEvent(MouseButton.LEFT, KeyAction.DOWN))
+    second = next(item[0] for item in bus.sent if item[0].message_type is MessageType.INPUT_MOVE)
+    bus.sent.clear()
+
+    assert service.handle_message(
+        Message(
+            MessageType.INPUT_POINTER_STATE,
+            {
+                "session_id": session_id,
+                "motion_sequence": first.metadata["motion_sequence"],
+                "x": 1,
+                "y": 1,
+            },
+        )
+    )
+    backend.capture(PointerMotionEvent(1, 0))
+    backend.capture(MouseButtonEvent(MouseButton.LEFT, KeyAction.DOWN))
+
+    latest = [item[0] for item in bus.sent if item[0].message_type is MessageType.INPUT_MOVE][-1]
+    assert second.metadata["motion_sequence"] > first.metadata["motion_sequence"]
+    assert (latest.metadata["x"], latest.metadata["y"]) == (11, 50)
+
+
+def test_accept_enter_send_failure_rolls_back_suppressed_capture():
+    bus = FailingBus(fail_types={MessageType.INPUT_ENTER})
+    backend = FakeBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    session_id = service.request_control()
+
+    assert service.handle_message(input_accept(session_id)) is False
+    assert service.state is InputSessionState.IDLE
+    assert backend.capture_running is False
+
+
+def test_stop_cleans_up_even_when_pending_pointer_flush_fails():
+    bus = FailingBus()
+    backend = FakeBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        clock=FakeClock(),
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    session_id = service.request_control()
+    assert service.handle_message(input_accept(session_id))
+    backend.capture(PointerMotionEvent(1, 0))
+    bus.fail_types.add(MessageType.INPUT_MOVE)
+
+    service.stop_control(reason="manual")
+
+    assert service.state is InputSessionState.IDLE
+    assert backend.capture_running is False
+
+
+def test_interactive_send_failure_stops_capture_without_escaping_hook_callback():
+    bus = FailingBus()
+    backend = FakeBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    session_id = service.request_control()
+    assert service.handle_message(input_accept(session_id))
+    bus.fail_types.add(MessageType.INPUT_BUTTON)
+
+    backend.capture(MouseButtonEvent(MouseButton.LEFT, KeyAction.DOWN))
+
+    assert service.state is InputSessionState.IDLE
+    assert backend.capture_running is False
+
+
+def test_stop_during_capture_start_cannot_publish_late_enter():
+    holder = {}
+
+    class StoppingBackend(FakeBackend):
+        def _start_native_capture(self, suppress):
+            super()._start_native_capture(suppress)
+            holder["service"].stop_control(reason="cancelled")
+
+    bus = FakeBus()
+    backend = StoppingBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    holder["service"] = service
+    session_id = service.request_control()
+    bus.sent.clear()
+
+    service.handle_message(input_accept(session_id))
+
+    assert service.state is InputSessionState.IDLE
+    assert backend.capture_running is False
+    assert MessageType.INPUT_ENTER not in [item[0].message_type for item in bus.sent]
