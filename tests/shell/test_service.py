@@ -341,6 +341,106 @@ def test_stalled_process_start_does_not_block_permission_revocation():
     assert factory.processes[-1].terminate_calls >= 1
 
 
+def test_input_during_process_start_does_not_reach_unstarted_process():
+    started = threading.Event()
+    release_start = threading.Event()
+
+    class StalledFactory(FakeProcessFactory):
+        def __call__(self, on_output, on_exit, term="xterm"):
+            process = super().__call__(on_output, on_exit, term)
+
+            def start(columns, rows):
+                started.set()
+                release_start.wait(2)
+                process.started.append((columns, rows))
+                process.running = True
+
+            def write(data):
+                if not process.running:
+                    raise RuntimeError("not running")
+                process.writes.append(data)
+
+            process.start = start
+            process.write = write
+            return process
+
+    bus = FakeBus()
+    factory = StalledFactory()
+    service = ShellService(bus, factory)
+    service.set_allow_remote_shell(True)
+    session_id = "c" * 32
+    opener = threading.Thread(
+        target=lambda: service.handle_message(
+            shell_message(
+                MessageType.SHELL_OPEN,
+                session_id,
+                columns=80,
+                rows=24,
+                term="xterm",
+            )
+        )
+    )
+    opener.start()
+    assert started.wait(1)
+
+    assert not service.handle_message(
+        shell_message(MessageType.SHELL_INPUT, session_id, b"whoami\r")
+    )
+    assert factory.processes[-1].writes == []
+
+    release_start.set()
+    opener.join(2)
+    assert not opener.is_alive()
+
+
+def test_permission_revocation_cannot_be_followed_by_stale_active_state():
+    about_to_notify_active = threading.Event()
+    revocation_started = threading.Event()
+    release_notification = threading.Event()
+    bus = FakeBus()
+    service = ShellService(bus, FakeProcessFactory())
+    states = []
+    service.add_state_listener(states.append)
+    service.set_allow_remote_shell(True)
+    original_notify_state = service._notify_state
+
+    def notify_state(state):
+        if state.state == "active":
+            about_to_notify_active.set()
+            release_notification.wait(2)
+        original_notify_state(state)
+
+    service._notify_state = notify_state
+    opener = threading.Thread(
+        target=lambda: service.handle_message(
+            shell_message(
+                MessageType.SHELL_OPEN,
+                columns=80,
+                rows=24,
+                term="xterm",
+            )
+        )
+    )
+    opener.start()
+    assert about_to_notify_active.wait(1)
+
+    def revoke_permission():
+        revocation_started.set()
+        service.set_allow_remote_shell(False)
+
+    revoker = threading.Thread(target=revoke_permission)
+    revoker.start()
+    assert revocation_started.wait(1)
+    release_notification.set()
+    opener.join(2)
+    revoker.join(2)
+
+    assert not opener.is_alive()
+    assert not revoker.is_alive()
+    assert [state.state for state in states] == ["active", "exited"]
+    assert states[-1].reason == "permission"
+
+
 def test_initial_resize_is_queued_while_shell_request_is_pending():
     bus = FakeBus()
     service = ShellService(bus, FakeProcessFactory())

@@ -339,7 +339,7 @@ class ShellService:
                 self._session = _ShellSession(
                     session_id,
                     "incoming",
-                    "active",
+                    "starting",
                     process,
                 )
         if denied_reason is not None:
@@ -399,12 +399,14 @@ class ShellService:
                 and self._session is not None
                 and self._session.session_id == session_id
                 and self._session.direction == "incoming"
+                and self._session.state == "starting"
                 and self._session.process is process
             )
+            if active:
+                self._session.state = "active"
+                self._notify_state(ShellState(session_id, "incoming", "active"))
         if not active:
             process.terminate()
-            return
-        self._notify_state(ShellState(session_id, "incoming", "active"))
 
     def _handle_accept(self, message: Message) -> None:
         session_id = _session_id(message.metadata)
@@ -545,6 +547,7 @@ class ShellService:
                 self._session is None
                 or self._session.session_id != session_id
                 or self._session.direction != "incoming"
+                or self._session.state != "active"
                 or self._session.process is None
             ):
                 raise ShellProtocolError("stale executing shell message")
