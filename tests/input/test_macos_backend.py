@@ -1,4 +1,5 @@
 import sys
+import threading
 from types import ModuleType
 
 import pytest
@@ -154,3 +155,178 @@ def test_macos_successful_stop_is_idempotent(monkeypatch):
     assert backend._run_loop is None
     assert backend._event_tap is None
     assert backend._tap_callback_ref is None
+
+
+def test_macos_callback_thread_restart_isolated_from_stale_cleanup(monkeypatch):
+    backend = MacOSInputBackend()
+    monkeypatch.setattr(
+        backend,
+        "permission_status",
+        lambda: PermissionStatus(True, True, "ready"),
+    )
+
+    real_thread = threading.Thread
+    threads = []
+
+    def thread_factory(**kwargs):
+        thread = real_thread(**kwargs)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr("shooklink.input.macos_backend.threading.Thread", thread_factory)
+
+    restart_complete = threading.Event()
+    release_old_cleanup = threading.Event()
+    errors = []
+    thread_state = threading.local()
+    stop_events = {}
+    loop_count = 0
+
+    core_foundation = ModuleType("CoreFoundation")
+
+    def current_run_loop():
+        nonlocal loop_count
+        loop_count += 1
+        run_loop = f"run-loop-{loop_count}"
+        thread_state.run_loop = run_loop
+        stop_events[run_loop] = threading.Event()
+        return run_loop
+
+    def run_loop():
+        current = thread_state.run_loop
+        if current == "run-loop-1":
+            try:
+                backend.stop_capture()
+                backend.start_capture(lambda _event: None, lambda _action: None)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                restart_complete.set()
+            assert release_old_cleanup.wait(2)
+            return
+        assert stop_events[current].wait(2)
+
+    core_foundation.CFRunLoopGetCurrent = current_run_loop
+    core_foundation.CFRunLoopAddSource = lambda *_args: None
+    core_foundation.CFRunLoopRun = run_loop
+    core_foundation.CFRunLoopStop = lambda value: stop_events[value].set()
+    core_foundation.kCFRunLoopCommonModes = object()
+    monkeypatch.setitem(sys.modules, "CoreFoundation", core_foundation)
+
+    quartz = ModuleType("Quartz")
+    event_names = (
+        "kCGEventKeyDown",
+        "kCGEventKeyUp",
+        "kCGEventFlagsChanged",
+        "kCGEventMouseMoved",
+        "kCGEventLeftMouseDragged",
+        "kCGEventRightMouseDragged",
+        "kCGEventOtherMouseDragged",
+        "kCGEventLeftMouseDown",
+        "kCGEventLeftMouseUp",
+        "kCGEventRightMouseDown",
+        "kCGEventRightMouseUp",
+        "kCGEventOtherMouseDown",
+        "kCGEventOtherMouseUp",
+        "kCGEventScrollWheel",
+    )
+    for event_type, name in enumerate(event_names, start=1):
+        setattr(quartz, name, event_type)
+    quartz.kCGSessionEventTap = 1
+    quartz.kCGHeadInsertEventTap = 2
+    quartz.kCGEventTapOptionDefault = 3
+    quartz.CGEventTapCreate = lambda *_args: object()
+    quartz.CFMachPortCreateRunLoopSource = lambda *_args: object()
+    quartz.CGEventTapEnable = lambda *_args: None
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+
+    try:
+        backend.start_capture(lambda _event: None, lambda _action: None)
+        assert restart_complete.wait(2)
+        assert errors == []
+        assert len(threads) == 2
+
+        new_thread = threads[1]
+        new_run_loop = backend._run_loop
+        new_event_tap = backend._event_tap
+        new_callback = backend._tap_callback_ref
+        assert new_run_loop == "run-loop-2"
+        assert new_event_tap is not None
+        assert new_callback is not None
+
+        release_old_cleanup.set()
+        threads[0].join(2)
+
+        assert not threads[0].is_alive()
+        assert backend._tap_thread is new_thread
+        assert backend._run_loop is new_run_loop
+        assert backend._event_tap is new_event_tap
+        assert backend._tap_callback_ref is new_callback
+    finally:
+        release_old_cleanup.set()
+        for event in stop_events.values():
+            event.set()
+        for thread in threads:
+            thread.join(2)
+
+
+def test_macos_new_generation_resets_modifier_key_tracking(monkeypatch):
+    backend = MacOSInputBackend()
+    backend._modifier_keys_down = {56}
+    monkeypatch.setattr(
+        backend,
+        "permission_status",
+        lambda: PermissionStatus(True, True, "ready"),
+    )
+
+    class ImmediateThread:
+        def __init__(self, *, args, **_kwargs):
+            self.generation = args[0]
+
+        def start(self):
+            self.generation.ready.set()
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr("shooklink.input.macos_backend.threading.Thread", ImmediateThread)
+    backend.start_capture(lambda _event: None, lambda _action: None)
+
+    class Quartz:
+        kCGEventKeyDown = 1
+        kCGEventKeyUp = 2
+        kCGEventFlagsChanged = 3
+        kCGEventSourceUserData = 4
+        kCGKeyboardEventKeycode = 5
+        kCGKeyboardEventAutorepeat = 6
+        kCGEventFlagMaskShift = 1 << 0
+        kCGEventFlagMaskControl = 1 << 1
+        kCGEventFlagMaskAlternate = 1 << 2
+        kCGEventFlagMaskCommand = 1 << 3
+        kCGEventFlagMaskAlphaShift = 1 << 4
+
+        @staticmethod
+        def CGEventGetIntegerValueField(_event, field):
+            return {
+                Quartz.kCGEventSourceUserData: 0,
+                Quartz.kCGKeyboardEventKeycode: 56,
+                Quartz.kCGKeyboardEventAutorepeat: 0,
+            }[field]
+
+        @staticmethod
+        def CGEventKeyboardGetUnicodeString(*_args):
+            return 0, ""
+
+        @staticmethod
+        def CGEventGetFlags(_event):
+            return 0
+
+    event = backend._normalize_event(
+        Quartz.kCGEventFlagsChanged,
+        object(),
+        Quartz,
+    )
+
+    assert event.action is KeyAction.DOWN
+    assert backend._modifier_keys_down == {56}
+    backend.stop_capture()

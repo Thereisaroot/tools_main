@@ -1,10 +1,15 @@
 import ctypes
+import threading
 from types import SimpleNamespace
 
 import pytest
 
-from shooklink.input.events import KeyAction, KeyEvent, Modifiers
-from shooklink.input.windows_backend import WindowsInputBackend, _Win32Api
+from shooklink.input.events import KeyAction, KeyEvent, Modifiers, PointerMotionEvent
+from shooklink.input.windows_backend import (
+    INJECTION_MARKER,
+    WindowsInputBackend,
+    _Win32Api,
+)
 
 
 class _FakeFunction:
@@ -62,7 +67,6 @@ def test_win32_api_defines_prototypes_for_every_native_function(win32_api):
         "DispatchMessageW",
         "GetAsyncKeyState",
         "GetKeyState",
-        "GetKeyboardState",
         "ToUnicodeEx",
         "GetKeyboardLayout",
         "GetCursorPos",
@@ -133,8 +137,9 @@ def test_windows_keyboard_callback_preserves_translated_text():
                 dwExtraInfo=0,
             )
 
-        def key_text(self, virtual_key, scan_code):
+        def key_text(self, virtual_key, scan_code, key_state):
             assert (virtual_key, scan_code) == (0xBF, 0x35)
+            assert key_state[0xBF] & 0x80
             return "?"
 
         def call_next(self, *_args):
@@ -150,6 +155,285 @@ def test_windows_keyboard_callback_preserves_translated_text():
     assert result == 77
     assert captured[0].usage == 0x38
     assert captured[0].text == "?"
+
+
+def test_windows_text_translation_uses_updated_left_right_shift_state():
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            pass
+
+        def _stop_native_capture(self):
+            pass
+
+    class KeyboardApi:
+        def __init__(self):
+            self.states = []
+
+        def keyboard_data(self, pointer):
+            return pointer
+
+        def key_text(self, virtual_key, _scan_code, key_state):
+            self.states.append((virtual_key, key_state))
+            if virtual_key == 0xBF:
+                return "?" if key_state[0x10] & 0x80 else "/"
+            return ""
+
+        def call_next(self, *_args):
+            return 77
+
+    def data(virtual_key, scan_code):
+        return SimpleNamespace(
+            vkCode=virtual_key,
+            scanCode=scan_code,
+            flags=0,
+            dwExtraInfo=0,
+        )
+
+    backend = CallbackBackend()
+    api = KeyboardApi()
+    backend._api = api
+    captured = []
+    backend.start_capture(captured.append, lambda _action: None)
+
+    backend._keyboard_callback(0, 0x0100, data(0xA0, 0x2A))
+    backend._keyboard_callback(0, 0x0100, data(0xA1, 0x36))
+    backend._keyboard_callback(0, 0x0101, data(0xA0, 0x2A))
+    backend._keyboard_callback(0, 0x0100, data(0xBF, 0x35))
+    backend._keyboard_callback(0, 0x0101, data(0xBF, 0x35))
+    backend._keyboard_callback(0, 0x0101, data(0xA1, 0x36))
+    backend._keyboard_callback(0, 0x0100, data(0xBF, 0x35))
+
+    slash_events = [event for event in captured if event.virtual_key == 0xBF]
+    assert [event.text for event in slash_events if event.action is KeyAction.DOWN] == [
+        "?",
+        "/",
+    ]
+    shifted_state = next(state for key, state in api.states if key == 0xBF)
+    assert shifted_state[0x10] & 0x80
+    assert shifted_state[0xA0] & 0x80 == 0
+    assert shifted_state[0xA1] & 0x80
+    assert shifted_state[0xBF] & 0x80
+
+
+def test_windows_text_translation_tracks_caps_lock_transitions():
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            pass
+
+        def _stop_native_capture(self):
+            pass
+
+    class KeyboardApi:
+        def keyboard_data(self, pointer):
+            return pointer
+
+        def key_text(self, virtual_key, _scan_code, key_state):
+            if virtual_key != 0x41:
+                return ""
+            shifted = bool(key_state[0x10] & 0x80)
+            caps_locked = bool(key_state[0x14] & 0x01)
+            return "A" if shifted ^ caps_locked else "a"
+
+        def call_next(self, *_args):
+            return 77
+
+    def data(virtual_key, scan_code):
+        return SimpleNamespace(
+            vkCode=virtual_key,
+            scanCode=scan_code,
+            flags=0,
+            dwExtraInfo=0,
+        )
+
+    backend = CallbackBackend()
+    backend._api = KeyboardApi()
+    captured = []
+    backend.start_capture(captured.append, lambda _action: None)
+
+    backend._keyboard_callback(0, 0x0100, data(0x14, 0x3A))
+    backend._keyboard_callback(0, 0x0101, data(0x14, 0x3A))
+    backend._keyboard_callback(0, 0x0100, data(0x41, 0x1E))
+    backend._keyboard_callback(0, 0x0101, data(0x41, 0x1E))
+    backend._keyboard_callback(0, 0x0100, data(0x14, 0x3A))
+    backend._keyboard_callback(0, 0x0101, data(0x14, 0x3A))
+    backend._keyboard_callback(0, 0x0100, data(0x41, 0x1E))
+
+    letter_events = [
+        event
+        for event in captured
+        if event.virtual_key == 0x41 and event.action is KeyAction.DOWN
+    ]
+    assert [event.text for event in letter_events] == ["A", "a"]
+    assert letter_events[0].modifiers & Modifiers.CAPS_LOCK
+    assert letter_events[1].modifiers & Modifiers.CAPS_LOCK == 0
+
+
+def test_win32_key_text_uses_supplied_state_without_get_keyboard_state(win32_api):
+    api, user32, _kernel32 = win32_api
+    key_state = bytearray(256)
+    key_state[0x10] = 0x80
+    key_state[0xA0] = 0x80
+    key_state[0xBF] = 0x80
+    user32.GetKeyboardState.result = lambda *_args: pytest.fail(
+        "hook-thread keyboard state must not be read"
+    )
+    user32.GetKeyboardLayout.result = 1
+
+    def translate(_virtual_key, _scan_code, state, buffer, *_args):
+        assert state[0x10] == 0x80
+        assert state[0xA0] == 0x80
+        assert state[0xBF] == 0x80
+        buffer[0] = "?"
+        return 1
+
+    user32.ToUnicodeEx.result = translate
+
+    assert api.key_text(0xBF, 0x35, key_state) == "?"
+    assert user32.GetKeyboardState.calls == []
+
+
+@pytest.mark.parametrize(
+    ("suppress", "expected_result"),
+    [(False, 77), (True, 1)],
+)
+def test_windows_third_party_injected_keyboard_follows_capture_policy(
+    suppress,
+    expected_result,
+):
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            pass
+
+        def _stop_native_capture(self):
+            pass
+
+    class KeyboardApi:
+        def keyboard_data(self, _pointer):
+            return SimpleNamespace(
+                vkCode=0x41,
+                scanCode=0x1E,
+                flags=0x10,
+                dwExtraInfo=0,
+            )
+
+        def key_text(self, _virtual_key, _scan_code, _key_state):
+            return "a"
+
+        def call_next(self, *_args):
+            return 77
+
+    backend = CallbackBackend()
+    backend._api = KeyboardApi()
+    captured = []
+    backend.start_capture(
+        captured.append,
+        lambda _action: None,
+        suppress=suppress,
+    )
+
+    result = backend._keyboard_callback(0, 0x0100, object())
+
+    assert result == expected_result
+    assert len(captured) == 1
+    assert captured[0].injected is False
+    assert captured[0].text == "a"
+
+
+def test_windows_private_marker_keyboard_is_self_filtered():
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            pass
+
+        def _stop_native_capture(self):
+            pass
+
+    class KeyboardApi:
+        def keyboard_data(self, _pointer):
+            return SimpleNamespace(
+                vkCode=0x41,
+                scanCode=0x1E,
+                flags=0x10,
+                dwExtraInfo=INJECTION_MARKER,
+            )
+
+        def key_text(self, _virtual_key, _scan_code, _key_state):
+            return "a"
+
+        def call_next(self, *_args):
+            return 77
+
+    backend = CallbackBackend()
+    backend._api = KeyboardApi()
+    captured = []
+    backend.start_capture(captured.append, lambda _action: None)
+
+    result = backend._keyboard_callback(0, 0x0100, object())
+
+    assert result == 1
+    assert captured == []
+
+
+def test_windows_third_party_injected_mouse_follows_capture_policy():
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            pass
+
+        def _stop_native_capture(self):
+            pass
+
+    class MouseApi:
+        def mouse_data(self, _pointer):
+            return SimpleNamespace(
+                pt=SimpleNamespace(x=10, y=20),
+                mouseData=0,
+                flags=0x01,
+                dwExtraInfo=0,
+            )
+
+        def call_next(self, *_args):
+            return 77
+
+    backend = CallbackBackend()
+    backend._api = MouseApi()
+    captured = []
+    backend.start_capture(captured.append, lambda _action: None)
+
+    result = backend._mouse_callback(0, 0x0201, object())
+
+    assert result == 77
+    assert len(captured) == 1
+    assert captured[0].injected is False
+
+
+def test_windows_private_marker_mouse_is_self_filtered():
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            pass
+
+        def _stop_native_capture(self):
+            pass
+
+    class MouseApi:
+        def mouse_data(self, _pointer):
+            return SimpleNamespace(
+                pt=SimpleNamespace(x=10, y=20),
+                mouseData=0,
+                flags=0x01,
+                dwExtraInfo=INJECTION_MARKER,
+            )
+
+        def call_next(self, *_args):
+            return 77
+
+    backend = CallbackBackend()
+    backend._api = MouseApi()
+    captured = []
+    backend.start_capture(captured.append, lambda _action: None)
+
+    result = backend._mouse_callback(0, 0x0201, object())
+
+    assert result == 1
+    assert captured == []
 
 
 def test_windows_modifier_aggregation_keeps_other_side_pressed():
@@ -322,3 +606,191 @@ def test_windows_stop_retries_failed_hook_cleanup_without_dropping_callbacks():
     assert backend._hook_thread_id is None
     assert backend._keyboard_hook is None
     assert backend._keyboard_callback_ref is None
+
+
+def test_windows_callback_thread_restart_isolated_from_stale_cleanup(monkeypatch):
+    backend = WindowsInputBackend()
+    monkeypatch.setattr("shooklink.input.windows_backend.sys.platform", "win32")
+
+    real_thread = threading.Thread
+    threads = []
+
+    def thread_factory(**kwargs):
+        thread = real_thread(**kwargs)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr("shooklink.input.windows_backend.threading.Thread", thread_factory)
+
+    class HookApi:
+        def __init__(self):
+            self.thread_state = threading.local()
+            self.next_thread_id = 1
+            self.next_hook_id = 1
+            self.quit_events = {}
+            self.unhooked = []
+            self.unhook_attempts = []
+            self.failed_old_cleanup = False
+            self.restart_complete = threading.Event()
+            self.release_old_cleanup = threading.Event()
+            self.errors = []
+
+        def current_thread_id(self):
+            thread_id = self.next_thread_id
+            self.next_thread_id += 1
+            self.thread_state.thread_id = thread_id
+            self.quit_events[thread_id] = threading.Event()
+            return thread_id
+
+        def ensure_message_queue(self):
+            pass
+
+        def key_is_down(self, _virtual_key):
+            return False
+
+        def key_is_toggled(self, _virtual_key):
+            return False
+
+        def hook_proc(self, callback):
+            return callback
+
+        def install_hook(self, _hook_type, _callback):
+            hook = f"hook-{self.next_hook_id}"
+            self.next_hook_id += 1
+            return hook
+
+        def post_quit(self, thread_id):
+            self.quit_events[thread_id].set()
+
+        def message_loop(self):
+            thread_id = self.thread_state.thread_id
+            if thread_id == 1:
+                try:
+                    backend.stop_capture()
+                    backend.start_capture(lambda _event: None, lambda _action: None)
+                except BaseException as error:
+                    self.errors.append(error)
+                finally:
+                    self.restart_complete.set()
+                assert self.release_old_cleanup.wait(2)
+                return
+            assert self.quit_events[thread_id].wait(2)
+
+        def unhook(self, hook):
+            self.unhook_attempts.append(hook)
+            if hook == "hook-1" and not self.failed_old_cleanup:
+                self.failed_old_cleanup = True
+                raise OSError("old hook cleanup failed")
+            self.unhooked.append(hook)
+
+    api = HookApi()
+    backend._api = api
+
+    try:
+        backend.start_capture(lambda _event: None, lambda _action: None)
+        assert api.restart_complete.wait(2)
+        assert api.errors == []
+        assert len(threads) == 2
+
+        new_thread = threads[1]
+        new_keyboard_hook = backend._keyboard_hook
+        new_mouse_hook = backend._mouse_hook
+        new_keyboard_callback = backend._keyboard_callback_ref
+        new_mouse_callback = backend._mouse_callback_ref
+        assert new_keyboard_hook == "hook-3"
+        assert new_mouse_hook == "hook-4"
+
+        api.release_old_cleanup.set()
+        threads[0].join(2)
+
+        assert not threads[0].is_alive()
+        assert backend._hook_thread is new_thread
+        assert backend._keyboard_hook == new_keyboard_hook
+        assert backend._mouse_hook == new_mouse_hook
+        assert backend._keyboard_callback_ref is new_keyboard_callback
+        assert backend._mouse_callback_ref is new_mouse_callback
+        assert "hook-1" in api.unhook_attempts
+        assert "hook-1" not in api.unhooked
+        assert "hook-2" in api.unhooked
+        assert new_keyboard_hook not in api.unhooked
+        assert new_mouse_hook not in api.unhooked
+
+        backend.stop_capture()
+        assert "hook-1" in api.unhooked
+    finally:
+        api.release_old_cleanup.set()
+        for event in api.quit_events.values():
+            event.set()
+        for thread in threads:
+            thread.join(2)
+
+
+def test_windows_new_generation_resets_capture_local_state(monkeypatch):
+    backend = WindowsInputBackend()
+    backend._modifier_keys_down = {0xE1}
+    backend._lock_modifiers = Modifiers.CAPS_LOCK | Modifiers.NUM_LOCK
+    backend._modifiers = Modifiers.SHIFT | backend._lock_modifiers
+    backend._captured_keys_down = {0x04}
+    backend._last_mouse_position = (100, 200)
+    monkeypatch.setattr("shooklink.input.windows_backend.sys.platform", "win32")
+
+    class ImmediateThread:
+        def __init__(self, *, args, **_kwargs):
+            self.generation = args[0]
+
+        def start(self):
+            self.generation.ready.set()
+
+        def is_alive(self):
+            return False
+
+    class CaptureApi:
+        def keyboard_data(self, pointer):
+            return pointer
+
+        def mouse_data(self, pointer):
+            return pointer
+
+        def key_text(self, _virtual_key, _scan_code, _key_state):
+            return "a"
+
+        def call_next(self, *_args):
+            return 77
+
+    monkeypatch.setattr(
+        "shooklink.input.windows_backend.threading.Thread",
+        ImmediateThread,
+    )
+    backend._api = CaptureApi()
+    captured = []
+    backend.start_capture(captured.append, lambda _action: None)
+
+    backend._keyboard_callback(
+        0,
+        0x0100,
+        SimpleNamespace(
+            vkCode=0x41,
+            scanCode=0x1E,
+            flags=0,
+            dwExtraInfo=0,
+        ),
+    )
+    backend._mouse_callback(
+        0,
+        0x0200,
+        SimpleNamespace(
+            pt=SimpleNamespace(x=110, y=210),
+            mouseData=0,
+            flags=0,
+            dwExtraInfo=0,
+        ),
+    )
+
+    key_event = next(event for event in captured if isinstance(event, KeyEvent))
+    motion_event = next(
+        event for event in captured if isinstance(event, PointerMotionEvent)
+    )
+    assert key_event.repeat is False
+    assert key_event.modifiers is Modifiers.NONE
+    assert (motion_event.dx, motion_event.dy) == (0, 0)
+    backend.stop_capture()

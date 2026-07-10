@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sys
 import threading
+from dataclasses import dataclass, field
+from typing import Any
 
 from shooklink.input.backend import BaseInputBackend, PermissionStatus
 from shooklink.input.events import (
@@ -41,6 +43,11 @@ _MODIFIER_GROUPS = {
     Modifiers.SHIFT: frozenset({0xE1, 0xE5}),
     Modifiers.ALT: frozenset({0xE2, 0xE6}),
     Modifiers.META: frozenset({0xE3, 0xE7}),
+}
+_GENERIC_MODIFIER_VK = {
+    Modifiers.SHIFT: 0x10,
+    Modifiers.CONTROL: 0x11,
+    Modifiers.ALT: 0x12,
 }
 
 _VK_TO_USAGE = {
@@ -208,6 +215,19 @@ _USAGE_TO_SCAN = {
 _SCAN_TO_USAGE = {scan: usage for usage, scan in _USAGE_TO_SCAN.items()}
 
 
+@dataclass(slots=True)
+class _WindowsCaptureGeneration:
+    number: int
+    ready: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    error: BaseException | None = None
+    thread_id: int | None = None
+    keyboard_hook: Any = None
+    mouse_hook: Any = None
+    keyboard_callback_ref: Any = None
+    mouse_callback_ref: Any = None
+
+
 def windows_key_to_usage(virtual_key: int, scan_code: int, extended: bool) -> int:
     if any(type(value) is not int for value in (virtual_key, scan_code)):
         raise TypeError("Windows key values must be integers")
@@ -236,6 +256,9 @@ class WindowsInputBackend(BaseInputBackend):
         self._lock_modifiers = Modifiers.NONE
         self._captured_keys_down: set[int] = set()
         self._last_mouse_position: tuple[int, int] | None = None
+        self._hook_generation_number = 0
+        self._hook_generation: _WindowsCaptureGeneration | None = None
+        self._hook_generations: dict[int, _WindowsCaptureGeneration] = {}
 
     def permission_status(self) -> PermissionStatus:
         if sys.platform != "win32":
@@ -260,32 +283,47 @@ class WindowsInputBackend(BaseInputBackend):
     def _start_native_capture(self, suppress: bool) -> None:
         if sys.platform != "win32":
             raise OSError("Windows input capture is only available on Windows")
-        self._hook_ready.clear()
-        self._hook_error = None
-        self._hook_thread = threading.Thread(
+        self._reset_capture_local_state()
+        self._hook_generation_number += 1
+        generation = _WindowsCaptureGeneration(self._hook_generation_number)
+        generation.thread = threading.Thread(
             target=self._hook_loop,
+            args=(generation,),
             name="shooklink-win32-input-hooks",
             daemon=True,
         )
-        self._hook_thread.start()
-        if not self._hook_ready.wait(3):
+        self._hook_generations[generation.number] = generation
+        self._hook_generation = generation
+        self._publish_hook_generation(generation)
+        generation.thread.start()
+        if not generation.ready.wait(3):
             raise RuntimeError("Windows input hooks did not start")
-        if self._hook_error is not None:
-            raise RuntimeError("Windows input hooks failed") from self._hook_error
+        if generation.error is not None:
+            raise RuntimeError("Windows input hooks failed") from generation.error
+
+    def _reset_capture_local_state(self) -> None:
+        self._modifier_keys_down.clear()
+        self._lock_modifiers = Modifiers.NONE
+        self._modifiers = Modifiers.NONE
+        self._captured_keys_down.clear()
+        self._last_mouse_position = None
 
     def _stop_native_capture(self) -> None:
-        thread = self._hook_thread
+        generation = self._hook_generation
+        thread = generation.thread if generation is not None else self._hook_thread
         if thread is None:
-            self._cleanup_hooks()
-            self._hook_thread_id = None
+            self._finish_native_stop(generation)
             return
         if not thread.is_alive():
-            self._finish_native_stop()
+            self._finish_native_stop(generation)
             return
-        if self._hook_thread_id is None:
+        thread_id = (
+            generation.thread_id if generation is not None else self._hook_thread_id
+        )
+        if thread_id is None:
             raise RuntimeError("Windows hook thread has no message-loop identifier")
         try:
-            self._get_api().post_quit(self._hook_thread_id)
+            self._get_api().post_quit(thread_id)
         except Exception as error:
             if thread.is_alive():
                 raise RuntimeError(
@@ -296,59 +334,162 @@ class WindowsInputBackend(BaseInputBackend):
         thread.join(3)
         if thread.is_alive():
             raise RuntimeError("Windows hook thread did not stop within 3 seconds")
-        self._finish_native_stop()
+        self._finish_native_stop(generation)
 
-    def _finish_native_stop(self) -> None:
-        self._cleanup_hooks()
+    def _finish_native_stop(
+        self,
+        generation: _WindowsCaptureGeneration | None = None,
+    ) -> None:
+        self._cleanup_hooks(generation)
+        self._cleanup_retired_hook_generations(generation)
+        if generation is not None:
+            generation.thread = None
+            generation.thread_id = None
+            if self._hook_generation is not generation:
+                return
+            self._hook_generation = None
+            self._hook_generations.pop(generation.number, None)
         self._hook_thread = None
         self._hook_thread_id = None
 
-    def _cleanup_hooks(self) -> None:
+    def _cleanup_retired_hook_generations(
+        self,
+        current: _WindowsCaptureGeneration | None,
+    ) -> None:
+        for generation in tuple(self._hook_generations.values()):
+            if generation is current or generation is self._hook_generation:
+                continue
+            thread = generation.thread
+            if thread is not None and thread.is_alive():
+                if thread is threading.current_thread():
+                    continue
+                thread.join(3)
+                if thread.is_alive():
+                    raise RuntimeError(
+                        "retired Windows hook thread did not stop within 3 seconds"
+                    )
+            self._cleanup_hooks(generation)
+            generation.thread = None
+            generation.thread_id = None
+            self._hook_generations.pop(generation.number, None)
+
+    def _cleanup_hooks(
+        self,
+        generation: _WindowsCaptureGeneration | None = None,
+    ) -> None:
         failures = []
+        target = generation if generation is not None else self
         for hook_name, callback_name in (
-            ("_keyboard_hook", "_keyboard_callback_ref"),
-            ("_mouse_hook", "_mouse_callback_ref"),
+            ("keyboard_hook", "keyboard_callback_ref"),
+            ("mouse_hook", "mouse_callback_ref"),
         ):
-            hook = getattr(self, hook_name)
+            if generation is None:
+                hook_name = f"_{hook_name}"
+                callback_name = f"_{callback_name}"
+            hook = getattr(target, hook_name)
             if hook is None:
-                setattr(self, callback_name, None)
+                setattr(target, callback_name, None)
                 continue
             try:
                 self._get_api().unhook(hook)
             except Exception as error:
                 failures.append(error)
             else:
-                setattr(self, hook_name, None)
-                setattr(self, callback_name, None)
+                setattr(target, hook_name, None)
+                setattr(target, callback_name, None)
+        if generation is not None:
+            self._publish_hook_generation(generation)
         if failures:
             raise RuntimeError("could not remove Windows input hooks") from failures[0]
+        if (
+            generation is not None
+            and generation is not self._hook_generation
+            and generation.keyboard_hook is None
+            and generation.mouse_hook is None
+        ):
+            self._hook_generations.pop(generation.number, None)
 
-    def _hook_loop(self) -> None:
+    def _publish_hook_generation(
+        self,
+        generation: _WindowsCaptureGeneration,
+    ) -> None:
+        if self._hook_generation is not generation:
+            return
+        self._hook_ready = generation.ready
+        self._hook_error = generation.error
+        self._hook_thread = generation.thread
+        self._hook_thread_id = generation.thread_id
+        self._keyboard_hook = generation.keyboard_hook
+        self._mouse_hook = generation.mouse_hook
+        self._keyboard_callback_ref = generation.keyboard_callback_ref
+        self._mouse_callback_ref = generation.mouse_callback_ref
+
+    def _hook_loop(self, generation: _WindowsCaptureGeneration) -> None:
         try:
             api = self._get_api()
-            self._hook_thread_id = api.current_thread_id()
+            generation.thread_id = api.current_thread_id()
+            self._publish_hook_generation(generation)
             api.ensure_message_queue()
             self._initialize_modifier_state(api)
-            self._keyboard_callback_ref = api.hook_proc(self._keyboard_callback)
-            self._mouse_callback_ref = api.hook_proc(self._mouse_callback)
-            self._keyboard_hook = api.install_hook(13, self._keyboard_callback_ref)
-            self._mouse_hook = api.install_hook(14, self._mouse_callback_ref)
-            self._hook_ready.set()
+            generation.keyboard_callback_ref = api.hook_proc(
+                lambda code, message, pointer: self._keyboard_callback(
+                    code,
+                    message,
+                    pointer,
+                    _generation=generation,
+                )
+            )
+            generation.mouse_callback_ref = api.hook_proc(
+                lambda code, message, pointer: self._mouse_callback(
+                    code,
+                    message,
+                    pointer,
+                    _generation=generation,
+                )
+            )
+            self._publish_hook_generation(generation)
+            generation.keyboard_hook = api.install_hook(
+                13,
+                generation.keyboard_callback_ref,
+            )
+            self._publish_hook_generation(generation)
+            generation.mouse_hook = api.install_hook(
+                14,
+                generation.mouse_callback_ref,
+            )
+            self._publish_hook_generation(generation)
+            generation.ready.set()
             api.message_loop()
         except BaseException as error:
-            self._hook_error = error
-            self._hook_ready.set()
+            generation.error = error
+            self._publish_hook_generation(generation)
+            generation.ready.set()
         finally:
             try:
-                self._cleanup_hooks()
+                self._cleanup_hooks(generation)
             except BaseException as error:
-                if self._hook_error is None:
-                    self._hook_error = error
+                if generation.error is None:
+                    generation.error = error
+                    self._publish_hook_generation(generation)
 
-    def _keyboard_callback(self, code, message, pointer):
+    def _keyboard_callback(
+        self,
+        code,
+        message,
+        pointer,
+        *,
+        _generation: _WindowsCaptureGeneration | None = None,
+    ):
         api = self._get_api()
+        hook = (
+            _generation.keyboard_hook
+            if _generation is not None
+            else self._keyboard_hook
+        )
+        if _generation is not None and self._hook_generation is not _generation:
+            return api.call_next(hook, code, message, pointer)
         if code < 0:
-            return api.call_next(self._keyboard_hook, code, message, pointer)
+            return api.call_next(hook, code, message, pointer)
         data = api.keyboard_data(pointer)
         action = (
             KeyAction.DOWN
@@ -364,7 +505,11 @@ class WindowsInputBackend(BaseInputBackend):
         else:
             self._captured_keys_down.discard(usage)
         text = (
-            api.key_text(int(data.vkCode), int(data.scanCode))
+            api.key_text(
+                int(data.vkCode),
+                int(data.scanCode),
+                self._translation_key_state(int(data.vkCode), action),
+            )
             if action is KeyAction.DOWN
             else ""
         )
@@ -378,19 +523,33 @@ class WindowsInputBackend(BaseInputBackend):
             location=_usage_location(usage),
             repeat=repeat,
             extended=extended,
-            injected=bool(data.flags & 0x10) or int(data.dwExtraInfo) == INJECTION_MARKER,
+            injected=int(data.dwExtraInfo) == INJECTION_MARKER,
         )
         consumed = self.emit_captured(event)
         if consumed or self._capture_suppress:
             return 1
-        return api.call_next(self._keyboard_hook, code, message, pointer)
+        return api.call_next(hook, code, message, pointer)
 
-    def _mouse_callback(self, code, message, pointer):
+    def _mouse_callback(
+        self,
+        code,
+        message,
+        pointer,
+        *,
+        _generation: _WindowsCaptureGeneration | None = None,
+    ):
         api = self._get_api()
+        hook = (
+            _generation.mouse_hook
+            if _generation is not None
+            else self._mouse_hook
+        )
+        if _generation is not None and self._hook_generation is not _generation:
+            return api.call_next(hook, code, message, pointer)
         if code < 0:
-            return api.call_next(self._mouse_hook, code, message, pointer)
+            return api.call_next(hook, code, message, pointer)
         data = api.mouse_data(pointer)
-        injected = bool(data.flags & 0x01) or int(data.dwExtraInfo) == INJECTION_MARKER
+        injected = int(data.dwExtraInfo) == INJECTION_MARKER
         event: InputEvent | None = None
         position = (int(data.pt.x), int(data.pt.y))
         if message == 0x0200:
@@ -418,7 +577,7 @@ class WindowsInputBackend(BaseInputBackend):
             consumed = self.emit_captured(event)
             if consumed or self._capture_suppress:
                 return 1
-        return api.call_next(self._mouse_hook, code, message, pointer)
+        return api.call_next(hook, code, message, pointer)
 
     def _initialize_modifier_state(self, api) -> None:
         self._modifier_keys_down = {
@@ -459,6 +618,25 @@ class WindowsInputBackend(BaseInputBackend):
             if self._modifier_keys_down & usages:
                 modifiers |= modifier
         self._modifiers = modifiers
+
+    def _translation_key_state(
+        self,
+        virtual_key: int,
+        action: KeyAction,
+    ) -> bytes:
+        state = bytearray(256)
+        for usage in self._modifier_keys_down:
+            state[_MODIFIER_USAGE_TO_VK[usage]] |= 0x80
+        for modifier, virtual_key_code in _GENERIC_MODIFIER_VK.items():
+            if self._modifiers & modifier:
+                state[virtual_key_code] |= 0x80
+        if self._lock_modifiers & Modifiers.CAPS_LOCK:
+            state[0x14] |= 0x01
+        if self._lock_modifiers & Modifiers.NUM_LOCK:
+            state[0x90] |= 0x01
+        if action is KeyAction.DOWN and 0 <= virtual_key < len(state):
+            state[virtual_key] |= 0x80
+        return bytes(state)
 
     def _inject_native(self, event: InputEvent) -> None:
         if sys.platform != "win32":
@@ -634,8 +812,6 @@ class _Win32Api:
         self.user32.GetAsyncKeyState.restype = wintypes.SHORT
         self.user32.GetKeyState.argtypes = [ctypes.c_int]
         self.user32.GetKeyState.restype = wintypes.SHORT
-        self.user32.GetKeyboardState.argtypes = [ctypes.POINTER(wintypes.BYTE)]
-        self.user32.GetKeyboardState.restype = wintypes.BOOL
         self.user32.ToUnicodeEx.argtypes = [
             wintypes.UINT,
             wintypes.UINT,
@@ -741,11 +917,15 @@ class _Win32Api:
     def key_is_toggled(self, virtual_key: int) -> bool:
         return bool(self.user32.GetKeyState(virtual_key) & 0x0001)
 
-    def key_text(self, virtual_key: int, scan_code: int) -> str:
-        state = (self.wintypes.BYTE * 256)()
-        if not self.user32.GetKeyboardState(state):
-            raise self.ctypes.WinError(self.ctypes.get_last_error())
-        state[virtual_key & 0xFF] |= 0x80
+    def key_text(
+        self,
+        virtual_key: int,
+        scan_code: int,
+        key_state: bytes | bytearray,
+    ) -> str:
+        if len(key_state) != 256:
+            raise ValueError("Windows key state must contain 256 bytes")
+        state = (self.wintypes.BYTE * 256)(*key_state)
         layout = self.user32.GetKeyboardLayout(0)
         if not layout:
             raise self.ctypes.WinError(self.ctypes.get_last_error())

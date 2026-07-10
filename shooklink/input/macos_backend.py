@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from dataclasses import dataclass, field
 from typing import Any
 
 from shooklink.input.backend import BaseInputBackend, PermissionStatus
@@ -128,6 +129,17 @@ _MAC_TO_USAGE = {
 _USAGE_TO_MAC = {usage: keycode for keycode, usage in _MAC_TO_USAGE.items()}
 
 
+@dataclass(slots=True)
+class _MacCaptureGeneration:
+    number: int
+    ready: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+    error: BaseException | None = None
+    run_loop: Any = None
+    event_tap: Any = None
+    callback_ref: Any = None
+
+
 def mac_keycode_to_usage(keycode: int) -> int:
     if type(keycode) is not int:
         raise TypeError("macOS keycode must be an integer")
@@ -144,6 +156,8 @@ class MacOSInputBackend(BaseInputBackend):
         self._event_tap = None
         self._tap_callback_ref = None
         self._modifier_keys_down: set[int] = set()
+        self._tap_generation_number = 0
+        self._tap_generation: _MacCaptureGeneration | None = None
 
     def permission_status(self) -> PermissionStatus:
         if sys.platform != "darwin":
@@ -193,33 +207,42 @@ class MacOSInputBackend(BaseInputBackend):
 
     def _start_native_capture(self, suppress: bool) -> None:
         self._require_input_permissions()
-        self._tap_ready.clear()
-        self._tap_error = None
-        self._tap_thread = threading.Thread(
+        self._reset_capture_local_state()
+        self._tap_generation_number += 1
+        generation = _MacCaptureGeneration(self._tap_generation_number)
+        generation.thread = threading.Thread(
             target=self._tap_loop,
+            args=(generation,),
             name="shooklink-quartz-event-tap",
             daemon=True,
         )
-        self._tap_thread.start()
-        if not self._tap_ready.wait(3):
+        self._tap_generation = generation
+        self._publish_tap_generation(generation)
+        generation.thread.start()
+        if not generation.ready.wait(3):
             raise RuntimeError("macOS event tap did not start")
-        if self._tap_error is not None:
-            raise RuntimeError("macOS event tap failed") from self._tap_error
+        if generation.error is not None:
+            raise RuntimeError("macOS event tap failed") from generation.error
+
+    def _reset_capture_local_state(self) -> None:
+        self._modifier_keys_down.clear()
 
     def _stop_native_capture(self) -> None:
-        thread = self._tap_thread
+        generation = self._tap_generation
+        thread = generation.thread if generation is not None else self._tap_thread
         if thread is None:
-            self._clear_native_capture_refs()
+            self._clear_native_capture_refs(generation)
             return
         if not thread.is_alive():
-            self._clear_native_capture_refs()
+            self._clear_native_capture_refs(generation)
             return
-        if self._run_loop is None:
+        run_loop = generation.run_loop if generation is not None else self._run_loop
+        if run_loop is None:
             raise RuntimeError("macOS event-tap thread has no CFRunLoop")
         import CoreFoundation
 
         try:
-            CoreFoundation.CFRunLoopStop(self._run_loop)
+            CoreFoundation.CFRunLoopStop(run_loop)
         except Exception as error:
             raise RuntimeError("could not stop macOS run loop") from error
         if thread is threading.current_thread():
@@ -227,20 +250,41 @@ class MacOSInputBackend(BaseInputBackend):
         thread.join(3)
         if thread.is_alive():
             raise RuntimeError("macOS event-tap thread did not stop within 3 seconds")
-        self._clear_native_capture_refs()
+        self._clear_native_capture_refs(generation)
 
-    def _clear_native_capture_refs(self) -> None:
+    def _clear_native_capture_refs(
+        self,
+        generation: _MacCaptureGeneration | None = None,
+    ) -> None:
+        if generation is not None:
+            generation.thread = None
+            generation.run_loop = None
+            generation.event_tap = None
+            generation.callback_ref = None
+            if self._tap_generation is not generation:
+                return
+            self._tap_generation = None
         self._tap_thread = None
         self._run_loop = None
         self._event_tap = None
         self._tap_callback_ref = None
+
+    def _publish_tap_generation(self, generation: _MacCaptureGeneration) -> None:
+        if self._tap_generation is not generation:
+            return
+        self._tap_ready = generation.ready
+        self._tap_error = generation.error
+        self._tap_thread = generation.thread
+        self._run_loop = generation.run_loop
+        self._event_tap = generation.event_tap
+        self._tap_callback_ref = generation.callback_ref
 
     def _require_input_permissions(self) -> None:
         status = self.permission_status()
         if not status.capture_allowed or not status.inject_allowed:
             raise PermissionError(status.detail)
 
-    def _tap_loop(self) -> None:
+    def _tap_loop(self, generation: _MacCaptureGeneration) -> None:
         try:
             import CoreFoundation
             import Quartz
@@ -262,44 +306,76 @@ class MacOSInputBackend(BaseInputBackend):
                 Quartz.kCGEventScrollWheel,
             )
             mask = sum(1 << event_type for event_type in event_types)
-            self._tap_callback_ref = self._tap_callback
-            self._event_tap = Quartz.CGEventTapCreate(
+            generation.callback_ref = (
+                lambda proxy, event_type, event, context: self._tap_callback(
+                    proxy,
+                    event_type,
+                    event,
+                    context,
+                    _generation=generation,
+                )
+            )
+            self._publish_tap_generation(generation)
+            generation.event_tap = Quartz.CGEventTapCreate(
                 Quartz.kCGSessionEventTap,
                 Quartz.kCGHeadInsertEventTap,
                 Quartz.kCGEventTapOptionDefault,
                 mask,
-                self._tap_callback_ref,
+                generation.callback_ref,
                 None,
             )
-            if self._event_tap is None:
+            self._publish_tap_generation(generation)
+            if generation.event_tap is None:
                 raise PermissionError("could not create macOS event tap")
-            source = Quartz.CFMachPortCreateRunLoopSource(None, self._event_tap, 0)
-            self._run_loop = CoreFoundation.CFRunLoopGetCurrent()
+            source = Quartz.CFMachPortCreateRunLoopSource(
+                None,
+                generation.event_tap,
+                0,
+            )
+            generation.run_loop = CoreFoundation.CFRunLoopGetCurrent()
+            self._publish_tap_generation(generation)
             CoreFoundation.CFRunLoopAddSource(
-                self._run_loop,
+                generation.run_loop,
                 source,
                 CoreFoundation.kCFRunLoopCommonModes,
             )
-            Quartz.CGEventTapEnable(self._event_tap, True)
-            self._tap_ready.set()
+            Quartz.CGEventTapEnable(generation.event_tap, True)
+            generation.ready.set()
             CoreFoundation.CFRunLoopRun()
         except BaseException as error:
-            self._tap_error = error
-            self._tap_ready.set()
+            generation.error = error
+            self._publish_tap_generation(generation)
+            generation.ready.set()
         finally:
-            self._run_loop = None
-            self._event_tap = None
-            self._tap_callback_ref = None
+            generation.run_loop = None
+            generation.event_tap = None
+            generation.callback_ref = None
+            self._publish_tap_generation(generation)
 
-    def _tap_callback(self, _proxy, event_type, event, _context):
+    def _tap_callback(
+        self,
+        _proxy,
+        event_type,
+        event,
+        _context,
+        *,
+        _generation: _MacCaptureGeneration | None = None,
+    ):
+        if _generation is not None and self._tap_generation is not _generation:
+            return event
         import Quartz
 
         if event_type in (
             Quartz.kCGEventTapDisabledByTimeout,
             Quartz.kCGEventTapDisabledByUserInput,
         ):
-            if self._event_tap is not None:
-                Quartz.CGEventTapEnable(self._event_tap, True)
+            event_tap = (
+                _generation.event_tap
+                if _generation is not None
+                else self._event_tap
+            )
+            if event_tap is not None:
+                Quartz.CGEventTapEnable(event_tap, True)
             return event
         normalized = self._normalize_event(event_type, event, Quartz)
         if normalized is None:
