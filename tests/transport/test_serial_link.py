@@ -294,6 +294,29 @@ def test_thread_start_failure_rolls_back_and_closes_endpoint(monkeypatch):
         link.send(OutboundItem(Priority.NORMAL, 1, b"late"))
 
 
+def test_finalizer_start_failure_falls_back_to_synchronous_endpoint_close(
+    monkeypatch,
+):
+    endpoint, _peer = endpoint_pair()
+    disconnects = []
+    link = SerialLink(endpoint, lambda frame: None, disconnects.append)
+    original_start = threading.Thread.start
+
+    def failing_start(thread):
+        if thread.name == "shooklink-serial-finalizer":
+            raise RuntimeError("cannot start finalizer")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", failing_start)
+
+    with pytest.raises(LinkCloseError, match="cannot start finalizer"):
+        link.close()
+
+    assert endpoint.close_calls == 1
+    assert endpoint.closed
+    assert isinstance(disconnects[0], RuntimeError)
+
+
 def test_first_stop_owns_disconnect_cause_during_concurrent_close():
     endpoint = BlockingBrokenWriteEndpoint()
     endpoint.connect(MemoryEndpoint())

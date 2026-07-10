@@ -260,8 +260,7 @@ class SerialLink:
             raise LinkClosedError("serial link closed during write")
 
     def _request_stop(self, error: BaseException | None) -> None:
-        callback = None
-        callback_error: BaseException | None = None
+        use_synchronous_fallback = False
         with self._lifecycle_lock:
             if self._state in (_LinkState.STOPPING, _LinkState.CLOSED):
                 return
@@ -280,15 +279,11 @@ class SerialLink:
                 self._endpoint_close_error = start_error
                 if self._terminal_cause is None:
                     self._terminal_cause = start_error
-                self._state = _LinkState.CLOSED
-                callback_error = self._terminal_cause
-                if not self._disconnect_notified:
-                    self._disconnect_notified = True
-                    callback = self._on_disconnect
-                self._stop_finalized.set()
+                self._finalizer_thread = None
+                use_synchronous_fallback = True
 
-        if callback is not None:
-            self._invoke_disconnect(callback, callback_error)
+        if use_synchronous_fallback:
+            self._finalize_stop()
 
     def _finalize_stop(self) -> None:
         close_error: BaseException | None = None
