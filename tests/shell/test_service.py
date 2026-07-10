@@ -1,3 +1,5 @@
+import threading
+
 from shooklink.protocol.messages import Message, MessageType
 from shooklink.shell.service import ShellService
 from shooklink.transport.multiplexer import Priority
@@ -291,6 +293,52 @@ def test_shell_accept_precedes_output_emitted_synchronously_by_start():
         MessageType.SHELL_ACCEPT,
         MessageType.SHELL_OUTPUT,
     ]
+
+
+def test_stalled_process_start_does_not_block_permission_revocation():
+    started = threading.Event()
+    release_start = threading.Event()
+
+    class StalledFactory(FakeProcessFactory):
+        def __call__(self, on_output, on_exit, term="xterm"):
+            process = super().__call__(on_output, on_exit, term)
+
+            def start(columns, rows):
+                started.set()
+                release_start.wait(2)
+                process.started.append((columns, rows))
+                process.running = True
+
+            process.start = start
+            return process
+
+    bus = FakeBus()
+    factory = StalledFactory()
+    service = ShellService(bus, factory)
+    service.set_allow_remote_shell(True)
+    opener = threading.Thread(
+        target=lambda: service.handle_message(
+            shell_message(
+                MessageType.SHELL_OPEN,
+                columns=80,
+                rows=24,
+                term="xterm",
+            )
+        )
+    )
+    opener.start()
+    assert started.wait(1)
+
+    revoker = threading.Thread(target=lambda: service.set_allow_remote_shell(False))
+    revoker.start()
+    revoker.join(0.2)
+
+    assert not revoker.is_alive()
+    assert service.active_session_id is None
+    release_start.set()
+    opener.join(2)
+    assert not opener.is_alive()
+    assert factory.processes[-1].terminate_calls >= 1
 
 
 def test_initial_resize_is_queued_while_shell_request_is_pending():

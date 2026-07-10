@@ -365,35 +365,46 @@ class ShellService:
             raise
         try:
             with self._lock:
-                if (
-                    not self._allow_remote_shell
-                    or self._session is None
-                    or self._session.session_id != session_id
-                    or self._session.process is not process
-                ):
-                    return
-                process.start(columns, rows)
+                can_start = (
+                    self._allow_remote_shell
+                    and self._session is not None
+                    and self._session.session_id == session_id
+                    and self._session.process is process
+                )
+            if not can_start:
+                process.terminate()
+                return
+            process.start(columns, rows)
         except BaseException:
             with self._lock:
-                if self._session is not None and self._session.session_id == session_id:
+                active = (
+                    self._session is not None
+                    and self._session.session_id == session_id
+                )
+                if active:
                     self._session = None
             process.terminate()
-            self._send(
-                Message(
-                    MessageType.SHELL_EXIT,
-                    {"session_id": session_id, "reason": "start_failed"},
-                ),
-                Priority.INTERACTIVE,
-            )
+            if active:
+                self._send(
+                    Message(
+                        MessageType.SHELL_EXIT,
+                        {"session_id": session_id, "reason": "start_failed"},
+                    ),
+                    Priority.INTERACTIVE,
+                )
             return
         with self._lock:
             active = (
-                self._session is not None
+                self._allow_remote_shell
+                and self._session is not None
                 and self._session.session_id == session_id
                 and self._session.direction == "incoming"
+                and self._session.process is process
             )
-        if active:
-            self._notify_state(ShellState(session_id, "incoming", "active"))
+        if not active:
+            process.terminate()
+            return
+        self._notify_state(ShellState(session_id, "incoming", "active"))
 
     def _handle_accept(self, message: Message) -> None:
         session_id = _session_id(message.metadata)
