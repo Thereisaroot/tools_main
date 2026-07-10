@@ -178,6 +178,32 @@ def test_stream_cannot_be_released_while_popped_item_is_in_flight():
     assert mux.tracked_streams == 0
 
 
+def test_stream_cannot_be_released_with_unconsumed_sequence_reservation():
+    mux = Multiplexer()
+    sequence = mux.reserve_sequence(9)
+
+    with pytest.raises(ValueError, match="reserved"):
+        mux.release_stream(9)
+
+    item = mux.enqueue(
+        OutboundItem(Priority.NORMAL, 9, b"reserved", sequence=sequence)
+    )
+    assert item.sequence == sequence
+    popped = mux.pop()
+    mux.task_done(popped)
+    mux.release_stream(9)
+
+
+def test_cancelled_sequence_reservation_allows_stream_release():
+    mux = Multiplexer()
+    sequence = mux.reserve_sequence(10)
+
+    mux.cancel_sequence(10, sequence)
+    mux.release_stream(10)
+
+    assert mux.tracked_streams == 0
+
+
 def test_sequence_only_streams_are_bounded_and_close_clears_metadata():
     mux = Multiplexer(max_tracked_streams=1)
     assert mux.reserve_sequence(11) == 1

@@ -169,6 +169,13 @@ class SerialLink:
         except MultiplexerClosed as error:
             raise LinkClosedError("serial link is closed") from error
 
+    def cancel_sequence(self, stream_id: int, sequence: int) -> None:
+        self._ensure_active()
+        try:
+            self._multiplexer.cancel_sequence(stream_id, sequence)
+        except MultiplexerClosed as error:
+            raise LinkClosedError("serial link is closed") from error
+
     def send(self, item: OutboundItem) -> OutboundItem:
         self._ensure_active()
         try:

@@ -89,6 +89,7 @@ class Multiplexer:
         self._pointer_items: dict[int, tuple[int, OutboundItem]] = {}
         self._order = itertools.count()
         self._last_sequences: dict[int, int] = {}
+        self._reserved_sequences: dict[int, set[int]] = {}
         self._stream_priorities: dict[int, Priority] = {}
         self._in_flight: dict[int, int] = {}
         self._max_items = max_items
@@ -125,14 +126,21 @@ class Multiplexer:
         with self._condition:
             self._ensure_open()
             self._ensure_stream_capacity_locked(stream_id)
-            return self._reserve_sequence_locked(stream_id)
+            return self._reserve_sequence_locked(stream_id, track_reservation=True)
 
-    def _reserve_sequence_locked(self, stream_id: int) -> int:
+    def _reserve_sequence_locked(
+        self,
+        stream_id: int,
+        *,
+        track_reservation: bool = False,
+    ) -> int:
         previous = self._last_sequences.get(stream_id, 0)
         if previous >= UINT32_MAX:
             raise OverflowError(f"sequence exhausted for stream {stream_id}")
         sequence = previous + 1
         self._last_sequences[stream_id] = sequence
+        if track_reservation:
+            self._reserved_sequences.setdefault(stream_id, set()).add(sequence)
         return sequence
 
     def enqueue(self, item: OutboundItem) -> OutboundItem:
@@ -251,6 +259,7 @@ class Multiplexer:
             self._queue.clear()
             self._pointer_items.clear()
             self._last_sequences.clear()
+            self._reserved_sequences.clear()
             self._stream_priorities.clear()
             self._in_flight.clear()
             self._queued_bytes = 0
@@ -265,8 +274,22 @@ class Multiplexer:
                 raise ValueError(f"stream {stream_id} still has queued work")
             if self._in_flight.get(stream_id, 0):
                 raise ValueError(f"stream {stream_id} still has in-flight work")
+            if self._reserved_sequences.get(stream_id):
+                raise ValueError(f"stream {stream_id} still has reserved sequences")
             self._last_sequences.pop(stream_id, None)
             self._stream_priorities.pop(stream_id, None)
+
+    def cancel_sequence(self, stream_id: int, sequence: int) -> None:
+        _validate_uint("stream_id", stream_id, UINT32_MAX)
+        _validate_uint("sequence", sequence, UINT32_MAX)
+        with self._condition:
+            self._ensure_open()
+            reservations = self._reserved_sequences.get(stream_id)
+            if reservations is None or sequence not in reservations:
+                raise ValueError(f"sequence {sequence} is not reserved for stream {stream_id}")
+            reservations.remove(sequence)
+            if not reservations:
+                del self._reserved_sequences[stream_id]
 
     def task_done(self, item: OutboundItem) -> None:
         _validate_item(item)
@@ -312,6 +335,11 @@ class Multiplexer:
         )
 
     def _record_explicit_sequence_locked(self, stream_id: int, sequence: int) -> None:
+        reservations = self._reserved_sequences.get(stream_id)
+        if reservations is not None and sequence in reservations:
+            reservations.remove(sequence)
+            if not reservations:
+                del self._reserved_sequences[stream_id]
         previous = self._last_sequences.get(stream_id, 0)
         if sequence > previous:
             self._last_sequences[stream_id] = sequence
