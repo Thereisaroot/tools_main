@@ -70,10 +70,12 @@ class SerialLink:
         self._lifecycle_lock = threading.RLock()
         self._stop_event = threading.Event()
         self._stop_finalized = threading.Event()
+        self._disconnect_callback_completed = threading.Event()
         self._state = _LinkState.NEW
         self._endpoint_close_error: BaseException | None = None
         self._terminal_cause: BaseException | None = None
         self._disconnect_notified = False
+        self._disconnect_callback_thread_id: int | None = None
         self._reader_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
         self._finalizer_thread: threading.Thread | None = None
@@ -184,7 +186,14 @@ class SerialLink:
         if not self.wait_closed(remaining):
             raise LinkCloseTimeout("serial worker threads did not stop")
         with self._lifecycle_lock:
+            is_callback_thread = (
+                self._disconnect_callback_thread_id == threading.get_ident()
+            )
             close_error = self._endpoint_close_error
+        if not is_callback_thread:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._disconnect_callback_completed.wait(remaining):
+                raise LinkCloseTimeout("serial disconnect callback did not finish")
         if close_error is not None:
             raise LinkCloseError(str(close_error)) from close_error
 
@@ -307,16 +316,24 @@ class SerialLink:
         self._stop_finalized.set()
         if callback is not None:
             self._invoke_disconnect(callback, callback_error)
+        else:
+            self._disconnect_callback_completed.set()
 
-    @staticmethod
     def _invoke_disconnect(
+        self,
         callback: Callable[[BaseException | None], None],
         error: BaseException | None,
     ) -> None:
+        with self._lifecycle_lock:
+            self._disconnect_callback_thread_id = threading.get_ident()
         try:
             callback(error)
         except BaseException:
             logger.exception("serial disconnect callback failed")
+        finally:
+            with self._lifecycle_lock:
+                self._disconnect_callback_thread_id = None
+            self._disconnect_callback_completed.set()
 
 
 __all__ = [

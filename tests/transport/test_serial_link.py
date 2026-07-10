@@ -453,6 +453,28 @@ def test_on_disconnect_callback_can_close_its_own_link():
     assert link.wait_closed(1)
 
 
+def test_external_close_waits_for_disconnect_callback_completion():
+    endpoint, _peer = endpoint_pair()
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    close_errors = []
+
+    def on_disconnect(_error):
+        callback_started.set()
+        release_callback.wait(1)
+
+    link = SerialLink(endpoint, lambda frame: None, on_disconnect)
+    closer = threading.Thread(target=lambda: _capture_error(link.close, close_errors))
+    closer.start()
+    assert callback_started.wait(1)
+    time.sleep(0.02)
+
+    assert closer.is_alive()
+    release_callback.set()
+    closer.join(1)
+    assert close_errors == []
+
+
 def _capture_error(callback, errors):
     try:
         callback()
