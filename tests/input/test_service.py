@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from shooklink.input.backend import BaseInputBackend, PermissionStatus
@@ -228,6 +230,7 @@ def test_outgoing_request_accepts_topology_and_enters_absolute_pointer_mode():
     assert backend.capture_starts == [True]
     assert enter.message_type is MessageType.INPUT_ENTER
     assert (enter.metadata["x"], enter.metadata["y"]) == (0, 50)
+    assert bus.sent[-1][2] is Priority.INTERACTIVE
 
 
 def test_allowed_incoming_request_accepts_and_injects_normalized_key():
@@ -559,10 +562,10 @@ def test_auto_edge_hold_enters_and_remote_return_edge_leaves_without_dead_space(
     assert service.state is InputSessionState.IDLE
     assert backend.warps[-1] == (98, 50)
     assert [item[0].message_type for item in bus.sent] == [
-        MessageType.INPUT_LEAVE,
         MessageType.INPUT_RELEASE_ALL,
-        MessageType.INPUT_STOP,
+        MessageType.INPUT_LEAVE,
     ]
+    assert all(item[2] is Priority.INTERACTIVE for item in bus.sent)
     assert backend.capture_starts[-1] is False
 
 
@@ -622,8 +625,118 @@ def test_pending_absolute_pointer_is_flushed_before_button_down():
     ]
     assert bus.sent[0][0].metadata["x"] == 5
     assert bus.sent[0][0].metadata["y"] == 52
-    assert bus.sent[0][2] is Priority.MOTION
+    assert bus.sent[0][2] is Priority.INTERACTIVE
     assert bus.sent[1][2] is Priority.INTERACTIVE
+
+
+def test_stop_failure_still_releases_and_stops_remote_session():
+    class FailingStopBackend(FakeBackend):
+        def _stop_native_capture(self):
+            raise RuntimeError("hook stop failed")
+
+    bus = FakeBus()
+    backend = FailingStopBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    session_id = service.request_control()
+    assert service.handle_message(input_accept(session_id))
+    bus.sent.clear()
+
+    with pytest.raises(RuntimeError, match="failed to stop"):
+        service.stop_control(reason="manual")
+
+    assert service.state is InputSessionState.IDLE
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.INPUT_RELEASE_ALL,
+        MessageType.INPUT_STOP,
+    ]
+
+
+def test_handler_send_failure_tears_down_incoming_session_and_releases_inputs():
+    bus = FailingBus(fail_types={MessageType.INPUT_POINTER_STATE})
+    backend = FakeBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+    )
+    service.set_allow_remote_input(True)
+    assert service.handle_message(input_request())
+    backend.inject(KeyEvent(KeyAction.DOWN, usage=4))
+
+    assert not service.handle_message(
+        Message(
+            MessageType.INPUT_ENTER,
+            {"session_id": REMOTE_SESSION, "x": 0, "y": 50},
+        )
+    )
+
+    assert service.state is InputSessionState.IDLE
+    assert backend.pressed_keys == frozenset()
+    assert bus.sent[-1][0].message_type is MessageType.INPUT_STOP
+
+
+def test_pointer_state_reports_the_position_applied_by_the_os():
+    class ClampingBackend(FakeBackend):
+        def _inject_native(self, event):
+            super()._inject_native(event)
+            if isinstance(event, PointerPositionEvent):
+                self.position = (min(event.x, 10), event.y)
+
+    bus = FakeBus()
+    backend = ClampingBackend()
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+    )
+    service.set_allow_remote_input(True)
+    assert service.handle_message(input_request())
+    bus.sent.clear()
+
+    assert service.handle_message(
+        Message(
+            MessageType.INPUT_MOVE,
+            {
+                "session_id": REMOTE_SESSION,
+                "motion_sequence": 1,
+                "x": 40,
+                "y": 50,
+            },
+        )
+    )
+
+    report = bus.sent[-1][0]
+    assert report.message_type is MessageType.INPUT_POINTER_STATE
+    assert (report.metadata["x"], report.metadata["y"]) == (10, 50)
+
+
+def test_motion_scheduler_flushes_the_final_coalesced_position():
+    service, bus, backend, _session_id = start_controlling()
+    bus.sent.clear()
+
+    backend.capture(PointerMotionEvent(5, 2))
+
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline and not bus.sent:
+        time.sleep(0.005)
+    try:
+        assert [item[0].message_type for item in bus.sent] == [
+            MessageType.INPUT_MOVE
+        ]
+        assert (bus.sent[0][0].metadata["x"], bus.sent[0][0].metadata["y"]) == (
+            5,
+            52,
+        )
+    finally:
+        service.close()
 
 
 def test_pointer_state_reconciles_controller_logical_position():

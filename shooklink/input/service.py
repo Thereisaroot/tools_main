@@ -147,6 +147,7 @@ class InputService:
         self._last_motion_sequence = 0
         self._last_received_motion_sequence = 0
         self._edge_hold_started_at: float | None = None
+        self._motion_timer: threading.Timer | None = None
         self._state_listeners: list[Callable[[InputStateChange], None]] = []
         if auto_edge_enabled:
             self._refresh_idle_capture()
@@ -322,10 +323,21 @@ class InputService:
             self._connected = False
             self._auto_edge_enabled = False
             self._allow_remote_input = False
-        self._finish_session(reason="closed", send_remote=False)
+        try:
+            self._finish_session(reason="closed", send_remote=False)
+        except Exception:
+            pass
         if self._backend.capture_running:
-            self._backend.stop_capture()
-        self._backend.release_all()
+            try:
+                self._backend.stop_capture()
+            except Exception:
+                pass
+        try:
+            self._backend.release_all()
+        except Exception:
+            pass
+        with self._lock:
+            self._cancel_motion_timer_locked()
 
     def handle_message(self, message: Message) -> bool:
         if message.message_type not in _INPUT_TYPES:
@@ -355,7 +367,13 @@ class InputService:
         }
         try:
             handlers[authenticated.message_type](authenticated)
+        except InputProtocolError:
+            return False
         except Exception:
+            try:
+                self._finish_session(reason="handler_failed", send_remote=True)
+            except Exception:
+                pass
             return False
         return True
 
@@ -504,7 +522,7 @@ class InputService:
                                 "y": transition.y,
                             },
                         ),
-                        Priority.NORMAL,
+                        Priority.INTERACTIVE,
                     )
                 except BaseException as error:
                     send_error = error
@@ -547,7 +565,8 @@ class InputService:
         session_id, x, y = self._position_message(message)
         self._require_being_controlled(session_id)
         self._inject(PointerPositionEvent(x, y), session_id)
-        self._send_pointer_state(session_id, 0, x, y)
+        applied_x, applied_y = self._applied_pointer_position()
+        self._send_pointer_state(session_id, 0, applied_x, applied_y)
 
     def _handle_leave(self, message: Message) -> None:
         session_id, _x, _y = self._position_message(message)
@@ -624,13 +643,19 @@ class InputService:
             if motion_sequence <= self._last_received_motion_sequence:
                 return
         self._inject(PointerPositionEvent(x, y), session_id)
+        applied_x, applied_y = self._applied_pointer_position()
         with self._lock:
             if (
                 self._state is InputSessionState.BEING_CONTROLLED
                 and self._session_id == session_id
             ):
                 self._last_received_motion_sequence = motion_sequence
-        self._send_pointer_state(session_id, motion_sequence, x, y)
+        self._send_pointer_state(
+            session_id,
+            motion_sequence,
+            applied_x,
+            applied_y,
+        )
 
     def _handle_wheel(self, message: Message) -> None:
         _require_fields(message.metadata, {"session_id", "dx", "dy"})
@@ -711,7 +736,10 @@ class InputService:
             elif state is InputSessionState.CONTROLLING:
                 self._captured_controlling_event(event)
         except Exception:
-            self._finish_session(reason="send_failed", send_remote=True)
+            try:
+                self._finish_session(reason="send_failed", send_remote=True)
+            except Exception:
+                pass
 
     def _captured_idle_event(self, event: InputEvent) -> None:
         if not isinstance(event, PointerMotionEvent):
@@ -754,7 +782,17 @@ class InputService:
                     return
                 transition = self._pointer.move(event.dx, event.dy)
                 if transition.kind is TransitionKind.LEAVE:
-                    self._flush_pointer_locked(self._clock())
+                    self._flush_pointer_locked(
+                        self._clock(),
+                        priority=Priority.INTERACTIVE,
+                    )
+                    self._send(
+                        Message(
+                            MessageType.INPUT_RELEASE_ALL,
+                            {"session_id": session_id},
+                        ),
+                        Priority.INTERACTIVE,
+                    )
                     self._send(
                         Message(
                             MessageType.INPUT_LEAVE,
@@ -764,7 +802,7 @@ class InputService:
                                 "y": transition.y,
                             },
                         ),
-                        Priority.NORMAL,
+                        Priority.INTERACTIVE,
                     )
                     leave = True
                 else:
@@ -772,13 +810,21 @@ class InputService:
                     now = self._clock()
                     if now - self._last_motion_sent_at >= MOTION_INTERVAL_SECONDS:
                         self._flush_pointer_locked(now)
+                    else:
+                        self._schedule_motion_flush_locked(now)
                     leave = False
             elif isinstance(event, KeyEvent):
-                self._flush_pointer_locked(self._clock())
+                self._flush_pointer_locked(
+                    self._clock(),
+                    priority=Priority.INTERACTIVE,
+                )
                 self._send(Message(MessageType.INPUT_KEY, _encode_key(session_id, event)), Priority.INTERACTIVE)
                 leave = False
             elif isinstance(event, MouseButtonEvent):
-                self._flush_pointer_locked(self._clock())
+                self._flush_pointer_locked(
+                    self._clock(),
+                    priority=Priority.INTERACTIVE,
+                )
                 self._send(
                     Message(
                         MessageType.INPUT_BUTTON,
@@ -804,11 +850,17 @@ class InputService:
             else:
                 return
         if leave:
-            self._finish_session(reason="edge", send_remote=True)
+            self._finish_session(reason="edge", send_remote=False)
 
-    def _flush_pointer_locked(self, now: float) -> None:
+    def _flush_pointer_locked(
+        self,
+        now: float,
+        *,
+        priority: Priority = Priority.MOTION,
+    ) -> None:
         if self._pending_pointer is None or self._session_id is None:
             return
+        self._cancel_motion_timer_locked()
         x, y = self._pending_pointer
         self._pending_pointer = None
         self._last_motion_sent_at = now
@@ -827,11 +879,63 @@ class InputService:
                     "y": y,
                 },
             ),
-            Priority.MOTION,
+            priority,
         )
 
+    def _schedule_motion_flush_locked(self, now: float) -> None:
+        if self._motion_timer is not None:
+            return
+        delay = max(
+            0.0,
+            MOTION_INTERVAL_SECONDS - (now - self._last_motion_sent_at),
+        )
+        timer = threading.Timer(delay, self._scheduled_motion_flush)
+        timer.daemon = True
+        self._motion_timer = timer
+        timer.start()
+
+    def _scheduled_motion_flush(self) -> None:
+        failure = None
+        with self._lock:
+            self._motion_timer = None
+            if (
+                self._state is not InputSessionState.CONTROLLING
+                or self._pending_pointer is None
+            ):
+                return
+            timestamp = max(
+                self._clock(),
+                self._last_motion_sent_at + MOTION_INTERVAL_SECONDS,
+            )
+            try:
+                self._flush_pointer_locked(timestamp)
+            except Exception as error:
+                failure = error
+        if failure is not None:
+            try:
+                self._finish_session(reason="send_failed", send_remote=True)
+            except Exception:
+                pass
+
+    def _cancel_motion_timer_locked(self) -> None:
+        timer = self._motion_timer
+        self._motion_timer = None
+        if timer is not None:
+            timer.cancel()
+
     def _emergency_stop(self, _reason: str) -> None:
-        self._finish_session(reason="emergency", send_remote=True)
+        try:
+            self._finish_session(reason="emergency", send_remote=True)
+        except Exception:
+            pass
+
+    def _applied_pointer_position(self) -> tuple[int, int]:
+        with self._lock:
+            topology = self._local_session_topology
+        if topology is None:
+            raise InputProtocolError("input session topology is unavailable")
+        x, y = self._backend.cursor_position()
+        return topology.nearest_point(x, y)
 
     def _inject(self, event: InputEvent, session_id: str) -> None:
         try:
@@ -843,7 +947,10 @@ class InputService:
                     raise InputProtocolError("input session ended before injection")
                 self._backend.inject(event)
         except BaseException:
-            self._finish_session(reason="inject_failed", send_remote=True)
+            try:
+                self._finish_session(reason="inject_failed", send_remote=True)
+            except Exception:
+                pass
             raise
 
     def _send_pointer_state(
@@ -867,6 +974,7 @@ class InputService:
         )
 
     def _finish_session(self, *, reason: str, send_remote: bool) -> None:
+        cleanup_error: BaseException | None = None
         with self._lock:
             state = self._state
             session_id = self._session_id
@@ -874,15 +982,26 @@ class InputService:
                 return
             if state is InputSessionState.CONTROLLING:
                 try:
-                    self._flush_pointer_locked(self._clock())
-                except Exception:
+                    self._flush_pointer_locked(
+                        self._clock(),
+                        priority=Priority.INTERACTIVE,
+                    )
+                except BaseException:
                     self._pending_pointer = None
             return_position = self._local_return_position
             self._clear_session_locked()
         if state is InputSessionState.CONTROLLING and self._backend.capture_running:
-            self._backend.stop_capture()
+            try:
+                self._backend.stop_capture()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
         if state is InputSessionState.BEING_CONTROLLED:
-            self._backend.release_all()
+            try:
+                self._backend.release_all()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
         if send_remote and session_id is not None:
             if state is InputSessionState.CONTROLLING:
                 self._safe_send(
@@ -902,7 +1021,13 @@ class InputService:
             except OSError:
                 pass
         self._notify_state(InputStateChange(InputSessionState.IDLE, reason=reason))
-        self._refresh_idle_capture()
+        try:
+            self._refresh_idle_capture()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def _clear_session(self, session_id: str) -> None:
         with self._lock:
@@ -910,6 +1035,7 @@ class InputService:
                 self._clear_session_locked()
 
     def _clear_session_locked(self) -> None:
+        self._cancel_motion_timer_locked()
         self._state = InputSessionState.IDLE
         self._session_id = None
         self._pointer = None
