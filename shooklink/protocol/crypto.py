@@ -121,10 +121,10 @@ class _InterProcessFileLock:
             if os.name == "posix":
                 self.path.chmod(0o600)
             self._acquire()
-        except Exception:
+        except BaseException:
             try:
                 self._file.close()
-            except OSError:
+            except BaseException:
                 pass
             self._file = None
             raise
@@ -227,11 +227,17 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
             os.fsync(temporary_file.fileno())
         os.replace(temporary_path, path)
         temporary_path = None
-    except Exception:
+    except BaseException:
         if descriptor is not None:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise
 
 
@@ -299,7 +305,7 @@ class TrustStore:
             if self.path.stat().st_size > MAX_TRUST_STORE_SIZE:
                 return {}
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (OSError, UnicodeError, ValueError, RecursionError):
             return {}
         if not isinstance(raw, dict):
             return {}
@@ -312,12 +318,13 @@ class TrustStore:
     def status(self, peer_id: str, fingerprint: str) -> TrustStatus:
         self._validate(peer_id, fingerprint)
         with _STORE_LOCK:
-            stored = self._load().get(peer_id)
-            if stored is None:
-                return TrustStatus.UNKNOWN
-            if stored == fingerprint:
-                return TrustStatus.TRUSTED
-            return TrustStatus.CHANGED
+            with _InterProcessFileLock(self.path):
+                stored = self._load().get(peer_id)
+                if stored is None:
+                    return TrustStatus.UNKNOWN
+                if stored == fingerprint:
+                    return TrustStatus.TRUSTED
+                return TrustStatus.CHANGED
 
     def check(self, peer_id: str, fingerprint: str) -> bool:
         return self.status(peer_id, fingerprint) is TrustStatus.TRUSTED

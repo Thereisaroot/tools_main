@@ -352,6 +352,35 @@ def test_lock_setup_failure_closes_open_file(tmp_path, monkeypatch):
     assert lock._file is None
 
 
+def test_lock_keyboard_interrupt_closes_open_file(tmp_path, monkeypatch):
+    lock = crypto._InterProcessFileLock(tmp_path / "interrupt-target")
+
+    def interrupt_acquire():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(lock, "_acquire", interrupt_acquire)
+
+    with pytest.raises(KeyboardInterrupt):
+        lock.__enter__()
+
+    assert lock._file is None
+
+
+def test_atomic_write_keyboard_interrupt_removes_temporary_file(tmp_path, monkeypatch):
+    target = tmp_path / "target.json"
+
+    def interrupt_replace(_source, _target):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(crypto.os, "replace", interrupt_replace)
+
+    with pytest.raises(KeyboardInterrupt):
+        crypto._atomic_write(target, b"data")
+
+    assert not target.exists()
+    assert not [path for path in tmp_path.iterdir() if path.name.endswith(".tmp")]
+
+
 @pytest.mark.skipif(os.name != "posix", reason="uses POSIX flock failure injection")
 def test_unlock_failure_does_not_mask_protected_exception(monkeypatch, tmp_path):
     import fcntl
@@ -369,6 +398,45 @@ def test_unlock_failure_does_not_mask_protected_exception(monkeypatch, tmp_path)
 
     assert lock.__exit__(ValueError, ValueError("original"), None) is None
     assert lock._file is None
+
+
+def test_trust_status_serializes_read_with_interprocess_writer(tmp_path, monkeypatch):
+    path = tmp_path / "trusted-read-lock.json"
+    trust = TrustStore(path)
+    trust.accept("peer", "fingerprint")
+    entered = 0
+    real_lock = crypto._InterProcessFileLock
+
+    class TrackingLock:
+        def __init__(self, target_path):
+            self.lock = real_lock(target_path)
+
+        def __enter__(self):
+            nonlocal entered
+            entered += 1
+            return self.lock.__enter__()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return self.lock.__exit__(exc_type, exc_value, traceback)
+
+    monkeypatch.setattr(crypto, "_InterProcessFileLock", TrackingLock)
+
+    assert trust.status("peer", "fingerprint") is TrustStatus.TRUSTED
+    assert entered == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"peer":' + "9" * 5_000 + "}",
+        '{"peer":' + "[" * 1_100 + "0" + "]" * 1_100 + "}",
+    ],
+)
+def test_pathological_trust_json_is_treated_as_corrupt(tmp_path, payload):
+    path = tmp_path / "trusted-pathological.json"
+    path.write_text(payload, encoding="utf-8")
+
+    assert TrustStore(path).status("peer", "fingerprint") is TrustStatus.UNKNOWN
 
 
 def test_concurrent_identity_creation_returns_persisted_winner(tmp_path, monkeypatch):
