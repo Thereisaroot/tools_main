@@ -69,6 +69,7 @@ class SerialLink:
         self._parser = FrameParser()
         self._lifecycle_lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._stop_finalized = threading.Event()
         self._state = _LinkState.NEW
         self._endpoint_close_attempted = False
         self._endpoint_close_error: BaseException | None = None
@@ -173,8 +174,13 @@ class SerialLink:
     def close(self, timeout: float = 2.0) -> None:
         if timeout < 0:
             raise ValueError("timeout cannot be negative")
+        deadline = time.monotonic() + timeout
         self._request_stop(None)
-        if not self.wait_closed(timeout):
+        remaining = max(0.0, deadline - time.monotonic())
+        if not self._stop_finalized.wait(remaining):
+            raise LinkCloseTimeout("serial endpoint shutdown did not finish")
+        remaining = max(0.0, deadline - time.monotonic())
+        if not self.wait_closed(remaining):
             raise LinkCloseTimeout("serial worker threads did not stop")
         with self._lifecycle_lock:
             close_error = self._endpoint_close_error
@@ -282,6 +288,7 @@ class SerialLink:
                 self._disconnect_notified = True
                 callback = self._on_disconnect
 
+        self._stop_finalized.set()
         if callback is not None:
             try:
                 callback(callback_error)

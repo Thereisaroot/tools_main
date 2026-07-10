@@ -101,6 +101,22 @@ class FailingCloseEndpoint(MemoryEndpoint):
         raise OSError("close failed")
 
 
+class BlockingFailingCloseEndpoint(MemoryEndpoint):
+    def __init__(self):
+        super().__init__()
+        self.close_started = threading.Event()
+        self.release_close = threading.Event()
+
+    def close(self):
+        self.close_started.set()
+        self.release_close.wait(1)
+        with self._condition:
+            self.close_calls += 1
+            self._closed = True
+            self._condition.notify_all()
+        raise OSError("delayed close failed")
+
+
 def endpoint_pair(**kwargs):
     left = MemoryEndpoint(**kwargs)
     right = MemoryEndpoint(**kwargs)
@@ -324,6 +340,29 @@ def test_close_failure_is_reported_to_callback_and_caller():
         link.close()
 
     assert isinstance(disconnects[0], OSError)
+
+
+def test_concurrent_close_waits_for_endpoint_finalization_and_cause():
+    endpoint = BlockingFailingCloseEndpoint()
+    disconnects = []
+    link = SerialLink(endpoint, lambda frame: None, disconnects.append)
+    first_errors = []
+    first_close = threading.Thread(
+        target=lambda: _capture_error(link.close, first_errors),
+    )
+    first_close.start()
+    assert endpoint.close_started.wait(1)
+
+    with pytest.raises(LinkCloseTimeout):
+        link.close(timeout=0.05)
+
+    endpoint.release_close.set()
+    first_close.join(1)
+    assert len(first_errors) == 1
+    assert isinstance(first_errors[0], LinkCloseError)
+    assert isinstance(disconnects[0], OSError)
+    with pytest.raises(LinkCloseError, match="delayed close failed"):
+        link.close()
 
 
 def test_on_frame_callback_can_close_its_own_link():
