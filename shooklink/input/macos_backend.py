@@ -76,6 +76,7 @@ _MAC_TO_USAGE = {
     50: 0x35,
     51: 0x2A,
     53: 0x29,
+    54: 0xE7,
     55: 0xE3,
     56: 0xE1,
     57: 0x39,
@@ -191,9 +192,7 @@ class MacOSInputBackend(BaseInputBackend):
         Quartz.CGWarpMouseCursorPosition((x, y))
 
     def _start_native_capture(self, suppress: bool) -> None:
-        status = self.permission_status()
-        if not status.capture_allowed:
-            raise PermissionError(status.detail)
+        self._require_input_permissions()
         self._tap_ready.clear()
         self._tap_error = None
         self._tap_thread = threading.Thread(
@@ -208,16 +207,38 @@ class MacOSInputBackend(BaseInputBackend):
             raise RuntimeError("macOS event tap failed") from self._tap_error
 
     def _stop_native_capture(self) -> None:
-        if self._run_loop is not None:
-            import CoreFoundation
+        thread = self._tap_thread
+        if thread is None:
+            self._clear_native_capture_refs()
+            return
+        if not thread.is_alive():
+            self._clear_native_capture_refs()
+            return
+        if self._run_loop is None:
+            raise RuntimeError("macOS event-tap thread has no CFRunLoop")
+        import CoreFoundation
 
+        try:
             CoreFoundation.CFRunLoopStop(self._run_loop)
-        if self._tap_thread is not None and self._tap_thread is not threading.current_thread():
-            self._tap_thread.join(3)
+        except Exception as error:
+            raise RuntimeError("could not stop macOS run loop") from error
+        if thread is threading.current_thread():
+            return
+        thread.join(3)
+        if thread.is_alive():
+            raise RuntimeError("macOS event-tap thread did not stop within 3 seconds")
+        self._clear_native_capture_refs()
+
+    def _clear_native_capture_refs(self) -> None:
         self._tap_thread = None
         self._run_loop = None
         self._event_tap = None
         self._tap_callback_ref = None
+
+    def _require_input_permissions(self) -> None:
+        status = self.permission_status()
+        if not status.capture_allowed or not status.inject_allowed:
+            raise PermissionError(status.detail)
 
     def _tap_loop(self) -> None:
         try:
@@ -265,6 +286,10 @@ class MacOSInputBackend(BaseInputBackend):
         except BaseException as error:
             self._tap_error = error
             self._tap_ready.set()
+        finally:
+            self._run_loop = None
+            self._event_tap = None
+            self._tap_callback_ref = None
 
     def _tap_callback(self, _proxy, event_type, event, _context):
         import Quartz
@@ -377,6 +402,7 @@ class MacOSInputBackend(BaseInputBackend):
         return None
 
     def _inject_native(self, event: InputEvent) -> None:
+        self._require_input_permissions()
         import Quartz
 
         source = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStatePrivate)

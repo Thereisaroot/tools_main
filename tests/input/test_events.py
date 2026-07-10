@@ -29,6 +29,7 @@ from shooklink.input.windows_backend import windows_key_to_usage
         (60, 0xA1, 0xE5),
         (59, 0xA2, 0xE0),
         (62, 0xA3, 0xE4),
+        (54, 0x5C, 0xE7),
         (122, 0x70, 0x3A),
     ],
 )
@@ -113,6 +114,27 @@ def test_number_row_and_punctuation_matrix(mac_keycode, virtual_key, usage):
 def test_keypad_matrix(mac_keycode, virtual_key, usage, extended):
     assert mac_keycode_to_usage(mac_keycode) == usage
     assert windows_key_to_usage(virtual_key, 0, extended) == usage
+
+
+@pytest.mark.parametrize(
+    ("virtual_key", "scan_code", "extended", "usage"),
+    [
+        (0x23, 0x4F, False, 0x59),  # Keypad 1 reports VK_END with Num Lock off.
+        (0x23, 0x4F, True, 0x4D),
+        (0x11, 0x1D, False, 0xE0),
+        (0x11, 0x1D, True, 0xE4),
+        (0x10, 0x2A, False, 0xE1),
+        (0x10, 0x36, False, 0xE5),
+        (0x00, 0x35, False, 0x38),
+    ],
+)
+def test_windows_scan_code_preserves_physical_key_identity(
+    virtual_key,
+    scan_code,
+    extended,
+    usage,
+):
+    assert windows_key_to_usage(virtual_key, scan_code, extended) == usage
 
 
 def test_keypad_and_pointer_events_are_explicit():
