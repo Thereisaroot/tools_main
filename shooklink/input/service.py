@@ -153,6 +153,7 @@ class InputService:
         self._edge_hold_started_at: float | None = None
         self._motion_timer: threading.Timer | None = None
         self._state_listeners: list[Callable[[InputStateChange], None]] = []
+        self._emergency_listeners: list[Callable[[str], None]] = []
         if auto_edge_enabled:
             self._refresh_idle_capture()
 
@@ -193,6 +194,20 @@ class InputService:
         with self._lock:
             try:
                 self._state_listeners.remove(listener)
+            except ValueError:
+                pass
+
+    def add_emergency_listener(self, listener: Callable[[str], None]) -> None:
+        if not callable(listener):
+            raise TypeError("emergency listener must be callable")
+        with self._lock:
+            if listener not in self._emergency_listeners:
+                self._emergency_listeners.append(listener)
+
+    def remove_emergency_listener(self, listener: Callable[[str], None]) -> None:
+        with self._lock:
+            try:
+                self._emergency_listeners.remove(listener)
             except ValueError:
                 pass
 
@@ -994,11 +1009,23 @@ class InputService:
         if timer is not None:
             timer.cancel()
 
-    def _emergency_stop(self, _reason: str) -> None:
+    def _emergency_stop(self, action: str) -> None:
         try:
-            self._finish_session(reason="emergency", send_remote=True)
+            self._finish_session(
+                reason="emergency_exit" if action == "exit" else "emergency",
+                send_remote=True,
+            )
         except Exception:
             pass
+        if action != "exit":
+            return
+        with self._lock:
+            listeners = tuple(self._emergency_listeners)
+        for listener in listeners:
+            try:
+                listener(action)
+            except Exception:
+                pass
 
     def _applied_pointer_position(self) -> tuple[int, int]:
         with self._lock:

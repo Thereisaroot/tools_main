@@ -161,6 +161,10 @@ class FakeBackend(BaseInputBackend):
         assert self.emergency_callback is not None
         self.emergency_callback("stop")
 
+    def emergency_exit(self):
+        assert self.emergency_callback is not None
+        self.emergency_callback("exit")
+
 
 def monitors_metadata(*rectangles):
     return [
@@ -751,6 +755,43 @@ def test_manual_and_emergency_stop_release_remote_session():
         MessageType.INPUT_RELEASE_ALL,
         MessageType.INPUT_STOP,
     ]
+
+
+def test_emergency_exit_releases_session_and_notifies_local_application():
+    service, bus, backend, _session_id = start_controlling()
+    exits = []
+    service.add_emergency_listener(exits.append)
+    bus.sent.clear()
+
+    backend.emergency_exit()
+
+    assert service.state is InputSessionState.IDLE
+    assert backend.capture_running is False
+    assert exits == ["exit"]
+    assert [item[0].message_type for item in bus.sent] == [
+        MessageType.INPUT_RELEASE_ALL,
+        MessageType.INPUT_STOP,
+    ]
+
+
+def test_emergency_exit_is_available_during_idle_auto_edge_capture():
+    bus = FakeBus()
+    backend = FakeBackend(position=(99, 50))
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="local",
+        peer_id="remote",
+        peer_side=Side.RIGHT,
+        auto_edge_enabled=True,
+    )
+    exits = []
+    service.add_emergency_listener(exits.append)
+
+    backend.emergency_exit()
+
+    assert exits == ["exit"]
+    service.close()
 
     service, bus, backend, _session_id = start_controlling()
     bus.sent.clear()

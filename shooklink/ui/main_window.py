@@ -79,6 +79,10 @@ class ShellUiService(Protocol):
 
     def remove_state_listener(self, listener) -> None: ...
 
+    def add_emergency_listener(self, listener) -> None: ...
+
+    def remove_emergency_listener(self, listener) -> None: ...
+
     def set_allow_remote_shell(self, allowed: bool) -> None: ...
 
     def open_remote(self, *, columns: int, rows: int) -> str: ...
@@ -160,6 +164,7 @@ class MainWindow(QMainWindow):
     connect_requested = Signal(str, int)
     disconnect_requested = Signal()
     trust_requested = Signal(int, str)
+    emergency_exit_requested = Signal()
     incoming_message = Signal(object)
     file_progress = Signal(object)
     file_prepared = Signal(object)
@@ -193,6 +198,7 @@ class MainWindow(QMainWindow):
         self._shell_output_listener = self.shell_output.emit
         self._shell_state_listener = self.shell_state.emit
         self._input_state_listener = self.input_state.emit
+        self._input_emergency_listener = self._show_input_emergency
         self.setWindowTitle("ShookLink")
         self.setMinimumSize(760, 640)
         self.resize(920, 760)
@@ -213,6 +219,9 @@ class MainWindow(QMainWindow):
             self._shell_service.add_state_listener(self._shell_state_listener)
         if self._input_service is not None:
             self._input_service.add_state_listener(self._input_state_listener)
+            self._input_service.add_emergency_listener(
+                self._input_emergency_listener
+            )
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -665,6 +674,10 @@ class MainWindow(QMainWindow):
             self._input_service is not None and not active
         )
 
+    def _show_input_emergency(self, action: str) -> None:
+        if action == "exit":
+            self.emergency_exit_requested.emit()
+
     def _open_remote_shell(self) -> None:
         if self._shell_service is None:
             return
@@ -915,6 +928,9 @@ class MainWindow(QMainWindow):
             self._shell_service.remove_state_listener(self._shell_state_listener)
         if self._input_service is not None:
             self._input_service.remove_state_listener(self._input_state_listener)
+            self._input_service.remove_emergency_listener(
+                self._input_emergency_listener
+            )
         if self.terminal_window is not None:
             self.terminal_window.close()
         super().closeEvent(event)

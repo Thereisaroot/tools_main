@@ -116,6 +116,7 @@ class FakeInputService:
         self.auto_edge_enabled = False
         self.allowed = False
         self.listeners = []
+        self.emergency_listeners = []
         self.requests = 0
         self.stops = []
         self.connection_changes = []
@@ -128,6 +129,12 @@ class FakeInputService:
 
     def remove_state_listener(self, listener):
         self.listeners.remove(listener)
+
+    def add_emergency_listener(self, listener):
+        self.emergency_listeners.append(listener)
+
+    def remove_emergency_listener(self, listener):
+        self.emergency_listeners.remove(listener)
 
     def set_allow_remote_input(self, allowed):
         self.allowed = allowed
@@ -154,6 +161,10 @@ class FakeInputService:
         self.state = change.state
         for listener in tuple(self.listeners):
             listener(change)
+
+    def emit_emergency(self, action):
+        for listener in tuple(self.emergency_listeners):
+            listener(action)
 
 
 def test_main_window_sends_korean_and_punctuation(qtbot):
@@ -484,5 +495,11 @@ def test_being_controlled_state_is_visible_and_listener_is_removed_on_close(qtbo
     qtbot.waitUntil(lambda: window.input_status.text() == "Being controlled")
     assert "Ctrl+Alt+Shift" in window.input_emergency_help.text()
 
+    exits = []
+    window.emergency_exit_requested.connect(lambda: exits.append(True))
+    input_service.emit_emergency("exit")
+    qtbot.waitUntil(lambda: exits == [True])
+
     window.close()
     assert input_service.listeners == []
+    assert input_service.emergency_listeners == []

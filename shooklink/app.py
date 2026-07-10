@@ -286,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         settings,
     )
     qt_app.aboutToQuit.connect(controller.close)
+    window.emergency_exit_requested.connect(qt_app.quit)
     window.show()
     controller.start()
     try:
