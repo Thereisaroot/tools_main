@@ -344,6 +344,38 @@ def test_core_snapshot_gates_features_by_readiness_and_negotiation(qtbot, tmp_pa
     assert window.toggle_input_button.isEnabled()
 
 
+def test_disconnecting_snapshot_disables_peer_features(qtbot, tmp_path):
+    bus = FakeBus(trusted=True)
+    window = MainWindow(
+        ChatService(bus),
+        FakeFileService(tmp_path / "downloads"),
+        FakeShellService(),
+        FakeInputService(),
+    )
+    qtbot.addWidget(window)
+
+    window.apply_core_snapshot(
+        CoreSnapshot(
+            1,
+            CoreState.DISCONNECTING,
+            "peer",
+            "SHA256:peer",
+            TrustStatus.TRUSTED,
+            True,
+            True,
+            frozenset({"chat", "files", "shell", "input"}),
+        )
+    )
+
+    assert window.connection_status.text() == "Disconnecting"
+    assert window.connect_button.text() == "Disconnect"
+    assert not window.send_plain_button.isEnabled()
+    assert not window.send_secure_button.isEnabled()
+    assert not window.file_select_button.isEnabled()
+    assert not window.open_shell_button.isEnabled()
+    assert not window.toggle_input_button.isEnabled()
+
+
 def test_file_drop_zone_accepts_local_files_only(tmp_path):
     local_path = tmp_path / "drop.txt"
     local_path.write_text("drop", encoding="utf-8")

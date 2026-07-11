@@ -63,6 +63,7 @@ class CoreError(RuntimeError):
 
 class CoreState(str, Enum):
     DISCONNECTED = "disconnected"
+    DISCONNECTING = "disconnecting"
     HANDSHAKING = "handshaking"
     UNTRUSTED = "untrusted"
     CHANGED = "changed"
@@ -199,6 +200,7 @@ class ShookLinkCore:
         self._last_state = CoreState.DISCONNECTED
         self._last_error: str | None = None
         self._closed = False
+        self._disconnect_requested = threading.Event()
         self._listeners = []
         self._links: list[SerialLink] = []
 
@@ -379,13 +381,23 @@ class ShookLinkCore:
         return message.body
 
     def disconnect(self) -> None:
+        # Record intent before waiting for the core lock. A transport worker may
+        # already be reporting the peer's concurrent close through this lock.
+        self._disconnect_requested.set()
         with self._lock:
             connection = self._connection
+            if connection is None:
+                self._last_state = CoreState.DISCONNECTED
+                self._last_error = None
+                self._disconnect_requested.clear()
         if connection is None:
+            self._publish_current()
             return
+        self._publish_current()
         connection.link.close()
 
     def close(self) -> None:
+        self._disconnect_requested.set()
         with self._lock:
             if self._closed:
                 return
@@ -565,13 +577,26 @@ class ShookLinkCore:
                     "accepts_fingerprint": accepted,
                 },
             )
-        self._send_internal(
-            connection_id,
-            message,
-            secure=True,
-            priority=Priority.INTERACTIVE,
-            allow_untrusted=True,
-        )
+        try:
+            self._send_internal(
+                connection_id,
+                message,
+                secure=True,
+                priority=Priority.INTERACTIVE,
+                allow_untrusted=True,
+            )
+        except (CoreError, LinkClosedError):
+            with self._lock:
+                current = self._connection
+                interrupted = bool(
+                    current is None
+                    or current.connection_id != connection_id
+                    or current.link.closed
+                    or self._disconnect_requested.is_set()
+                )
+            if interrupted:
+                return
+            raise
         with self._lock:
             current = self._connection
             if current is not None and current.connection_id == connection_id:
@@ -749,10 +774,18 @@ class ShookLinkCore:
             connection = self._connection
             if connection is None or connection.connection_id != connection_id:
                 return
+            disconnect_requested = self._disconnect_requested.is_set()
             self._connection = None
             self._last_connection_id = connection_id
-            self._last_state = CoreState.ERROR if error is not None else CoreState.DISCONNECTED
-            self._last_error = None if error is None else str(error)
+            self._last_state = (
+                CoreState.DISCONNECTED
+                if disconnect_requested or error is None
+                else CoreState.ERROR
+            )
+            self._last_error = (
+                None if disconnect_requested or error is None else str(error)
+            )
+            self._disconnect_requested.clear()
         self.files.disconnect()
         self.shell.close()
         if self.input is not None:
@@ -766,6 +799,7 @@ class ShookLinkCore:
         connection = self._connection
         return bool(
             connection is not None
+            and not self._disconnect_requested.is_set()
             and connection.remote_peer_id is not None
             and connection.remote_fingerprint is not None
             and connection.trust_status is TrustStatus.TRUSTED
@@ -780,7 +814,9 @@ class ShookLinkCore:
                 self._last_state,
                 error=self._last_error,
             )
-        if connection.remote_peer_id is None:
+        if self._disconnect_requested.is_set():
+            state = CoreState.DISCONNECTING
+        elif connection.remote_peer_id is None:
             state = CoreState.HANDSHAKING
         elif connection.trust_status is TrustStatus.CHANGED:
             state = CoreState.CHANGED

@@ -16,6 +16,7 @@ from shooklink.protocol.crypto import IdentityStore, TrustStore
 from shooklink.protocol.framing import SECURE_FLAG, Frame, pack_frame_header
 from shooklink.protocol.messages import Message, MessageType, encode_message
 from shooklink.transport.multiplexer import Priority
+from shooklink.transport.serial_link import LinkCloseTimeout
 
 
 class MemoryEndpoint:
@@ -61,6 +62,18 @@ class MemoryEndpoint:
         with self._condition:
             self._closed = True
             self._condition.notify_all()
+
+
+class BlockingCloseEndpoint(MemoryEndpoint):
+    def __init__(self):
+        super().__init__()
+        self.close_started = threading.Event()
+        self.release_close = threading.Event()
+
+    def close(self):
+        self.close_started.set()
+        self.release_close.wait(2)
+        super().close()
 
 
 def endpoint_pair():
@@ -530,6 +543,208 @@ def test_approval_persisting_during_disconnect_does_not_report_stale_failure(
         assert left.snapshot.state is CoreState.DISCONNECTED
     finally:
         release_approval.set()
+        left.close()
+        right.close()
+
+
+def test_approval_send_racing_disconnect_does_not_report_persisted_trust_as_failure(
+    tmp_path,
+):
+    left, *_ = build_core(tmp_path, "left-approval-send-race")
+    right, *_ = build_core(tmp_path, "right-approval-send-race")
+    left_endpoint, right_endpoint = endpoint_pair()
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+    release_send = threading.Event()
+    approver = None
+
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        approval = left.snapshot
+        original_send_internal = left._send_internal
+        send_started = threading.Event()
+
+        def blocking_send_internal(*args, **kwargs):
+            send_started.set()
+            assert release_send.wait(2)
+            return original_send_internal(*args, **kwargs)
+
+        left._send_internal = blocking_send_internal
+        approval_errors = []
+
+        def approve():
+            try:
+                left.approve_peer(
+                    approval.connection_id,
+                    approval.fingerprint,
+                )
+            except BaseException as error:
+                approval_errors.append(error)
+
+        approver = threading.Thread(target=approve)
+        approver.start()
+        assert send_started.wait(1)
+        left.disconnect()
+        right.disconnect()
+        release_send.set()
+        approver.join(2)
+
+        assert not approver.is_alive()
+        assert approval_errors == []
+        assert left.trust_store.check(
+            "right-approval-send-race",
+            approval.fingerprint,
+        )
+    finally:
+        release_send.set()
+        if approver is not None:
+            approver.join(2)
+        left.close()
+        right.close()
+
+
+def test_explicit_disconnect_wins_over_error_reported_while_closing(tmp_path):
+    left, *_ = build_core(tmp_path, "left-explicit-disconnect")
+    right, *_ = build_core(tmp_path, "right-explicit-disconnect")
+    left_endpoint, right_endpoint = endpoint_pair()
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        connection = left._connection
+        assert connection is not None
+        original_close = connection.link.close
+
+        def close_with_concurrent_error(*args, **kwargs):
+            left._on_disconnect(
+                connection.connection_id,
+                OSError("endpoint unavailable"),
+            )
+            return original_close(*args, **kwargs)
+
+        connection.link.close = close_with_concurrent_error
+        left.disconnect()
+
+        assert left.snapshot.state is CoreState.DISCONNECTED
+        assert left.snapshot.error is None
+    finally:
+        left.close()
+        right.close()
+
+
+def test_explicit_disconnect_clears_error_callback_already_in_progress(
+    tmp_path,
+    monkeypatch,
+):
+    left, *_ = build_core(tmp_path, "left-error-callback-race")
+    right, *_ = build_core(tmp_path, "right-error-callback-race")
+    left_endpoint, right_endpoint = endpoint_pair()
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+    callback_sampled_intent = threading.Event()
+    release_callback = threading.Event()
+    callback_thread = None
+    disconnector = None
+    link = None
+
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        connection = left._connection
+        assert connection is not None
+        link = connection.link
+        original_is_set = left._disconnect_requested.is_set
+        blocked_once = False
+
+        def blocking_is_set():
+            nonlocal blocked_once
+            sampled = original_is_set()
+            if (
+                not blocked_once
+                and threading.current_thread().name == "test-error-callback"
+            ):
+                blocked_once = True
+                callback_sampled_intent.set()
+                assert release_callback.wait(2)
+            return sampled
+
+        monkeypatch.setattr(
+            left._disconnect_requested,
+            "is_set",
+            blocking_is_set,
+        )
+        callback_thread = threading.Thread(
+            target=left._on_disconnect,
+            args=(connection.connection_id, OSError("endpoint unavailable")),
+            name="test-error-callback",
+        )
+        callback_thread.start()
+        assert callback_sampled_intent.wait(1)
+
+        disconnector = threading.Thread(target=left.disconnect)
+        disconnector.start()
+        assert left._disconnect_requested.wait(1)
+        release_callback.set()
+        callback_thread.join(2)
+        disconnector.join(2)
+
+        assert not callback_thread.is_alive()
+        assert not disconnector.is_alive()
+        assert left.snapshot.state is CoreState.DISCONNECTED
+        assert left.snapshot.error is None
+    finally:
+        release_callback.set()
+        if callback_thread is not None:
+            callback_thread.join(2)
+        if disconnector is not None:
+            disconnector.join(2)
+        if link is not None:
+            link.close()
+        left.close()
+        right.close()
+
+
+def test_disconnect_timeout_exposes_disconnecting_state(tmp_path):
+    left, *_ = build_core(tmp_path, "left-disconnect-timeout")
+    right, *_ = build_core(tmp_path, "right-disconnect-timeout")
+    left_endpoint = BlockingCloseEndpoint()
+    right_endpoint = MemoryEndpoint()
+    left_endpoint.connect(right_endpoint)
+    right_endpoint.connect(left_endpoint)
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+    connection = None
+
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        approve_pair(left, right)
+        connection = left._connection
+        assert connection is not None
+        original_close = connection.link.close
+        connection.link.close = lambda: original_close(timeout=0.02)
+
+        with pytest.raises(LinkCloseTimeout):
+            left.disconnect()
+
+        assert left_endpoint.close_started.is_set()
+        assert left.snapshot.state is CoreState.DISCONNECTING
+        assert not left.trusted
+    finally:
+        left_endpoint.release_close.set()
+        if connection is not None:
+            connection.link.close = original_close
         left.close()
         right.close()
 

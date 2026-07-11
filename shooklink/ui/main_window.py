@@ -872,6 +872,7 @@ class MainWindow(QMainWindow):
         else:
             status = {
                 CoreState.DISCONNECTED: "Disconnected",
+                CoreState.DISCONNECTING: "Disconnecting",
                 CoreState.HANDSHAKING: "Handshaking",
                 CoreState.UNTRUSTED: "Untrusted",
                 CoreState.CHANGED: "Identity changed",
