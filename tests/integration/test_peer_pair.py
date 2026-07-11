@@ -473,6 +473,67 @@ def test_peer_approval_is_scoped_to_the_current_connection(tmp_path):
         right.close()
 
 
+def test_approval_persisting_during_disconnect_does_not_report_stale_failure(
+    tmp_path,
+):
+    left, *_ = build_core(tmp_path, "left-approval-race")
+    right, *_ = build_core(tmp_path, "right-approval-race")
+    left_endpoint, right_endpoint = endpoint_pair()
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+    release_approval = threading.Event()
+
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        approval = left.snapshot
+        original_accept = left.trust_store.accept
+        trust_written = threading.Event()
+
+        def blocking_accept(peer_id, fingerprint):
+            original_accept(peer_id, fingerprint)
+            trust_written.set()
+            assert release_approval.wait(2)
+
+        left.trust_store.accept = blocking_accept
+        approval_errors = []
+
+        def approve():
+            try:
+                left.approve_peer(
+                    approval.connection_id,
+                    approval.fingerprint,
+                )
+            except BaseException as error:
+                approval_errors.append(error)
+
+        approver = threading.Thread(target=approve)
+        approver.start()
+        assert trust_written.wait(1)
+        left_disconnector = threading.Thread(target=left.disconnect)
+        right_disconnector = threading.Thread(target=right.disconnect)
+        left_disconnector.start()
+        right_disconnector.start()
+        time.sleep(0.02)
+        release_approval.set()
+        approver.join(2)
+        left_disconnector.join(2)
+        right_disconnector.join(2)
+
+        assert not approver.is_alive()
+        assert not left_disconnector.is_alive()
+        assert not right_disconnector.is_alive()
+        assert approval_errors == []
+        assert left.trust_store.check("right-approval-race", approval.fingerprint)
+        assert left.snapshot.state is CoreState.DISCONNECTED
+    finally:
+        release_approval.set()
+        left.close()
+        right.close()
+
+
 def test_secure_sequence_reservation_encryption_and_enqueue_are_serialized(tmp_path):
     left, *_ = build_core(tmp_path, "left-concurrent")
     right, *_ = build_core(tmp_path, "right-concurrent")
@@ -623,6 +684,41 @@ def test_ready_transition_starts_persisted_auto_edge_capture(tmp_path):
             lambda: left_input.capture_running
             and right_input.capture_running
         )
+    finally:
+        left.close()
+        right.close()
+
+
+def test_replayed_plain_chat_frame_is_delivered_only_once(tmp_path):
+    left, *_ = build_core(tmp_path, "left-plain-replay")
+    right, *_ = build_core(tmp_path, "right-plain-replay")
+    left_endpoint, right_endpoint = endpoint_pair()
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+    received = []
+    right.chat.add_message_listener(received.append)
+
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        priority = Priority.NORMAL
+        message_type = MessageType.CHAT_PLAIN
+        replayed = Frame(
+            message_type=int(message_type),
+            flags=0,
+            priority=int(priority),
+            stream_id=int(message_type) * 4 + int(priority),
+            sequence=99,
+            acknowledgement=0,
+            payload=encode_message(Message(message_type, {}, b"once")),
+        )
+
+        right._on_frame(right.snapshot.connection_id, replayed)
+        right._on_frame(right.snapshot.connection_id, replayed)
+
+        assert [message.text for message in received] == ["once"]
     finally:
         left.close()
         right.close()

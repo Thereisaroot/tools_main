@@ -1220,17 +1220,12 @@ class FileService:
                         self._send_finish_status(transfer_id, "error")
                         notify = (transfer, "failed")
             else:
-                remove_stale_path = False
                 with self._lock:
                     active = remove_current_transfer_locked()
                     if active and not self._closed and self._connected:
                         self._remember_completed_locked(transfer, path, "ok")
                         self._send_finish_status(transfer_id, "ok")
                         notify = (transfer, "complete")
-                    else:
-                        remove_stale_path = True
-                if remove_stale_path:
-                    path.unlink(missing_ok=True)
             if notify is not None:
                 if notify[1] == "complete":
                     self._notify(

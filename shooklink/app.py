@@ -217,7 +217,11 @@ class ApplicationController(QObject):
         if self._closed or error is None:
             return
         logger.debug("%s operation failed", kind, exc_info=error)
-        self._window.show_connection_error(str(error))
+        if kind == "connect":
+            self._window.show_connection_error(str(error))
+            return
+        self._window.apply_core_snapshot(self._core.snapshot)
+        self._window.show_operation_error(str(error))
 
     def _apply_snapshot(self, snapshot: CoreSnapshot) -> None:
         if not self._closed:

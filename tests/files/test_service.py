@@ -720,6 +720,98 @@ def test_stale_finalizer_cannot_remove_same_id_transfer_after_reconnect(
     service.close()
 
 
+def test_stale_successful_finalizer_cannot_delete_new_same_name_file(
+    tmp_path,
+    monkeypatch,
+):
+    from shooklink.files import service as service_module
+
+    bus = QueueBus()
+    downloads = tmp_path / "downloads"
+    service = FileService(bus, downloads)
+    old_data = b"old file"
+    old_offer = make_offer(
+        "same.bin",
+        old_data,
+        transfer_id="e" * 32,
+        chunk_size=len(old_data),
+    )
+    original_finalize = service_module.IncomingTransfer.finalize
+    old_committed = threading.Event()
+    release_old_callback = threading.Event()
+    old_path = []
+
+    def finalize_then_block_callback(transfer):
+        path = original_finalize(transfer)
+        if transfer.offer.transfer_id == old_offer.transfer_id:
+            old_path.append(path)
+            old_committed.set()
+            release_old_callback.wait(2)
+        return path
+
+    monkeypatch.setattr(
+        service_module.IncomingTransfer,
+        "finalize",
+        finalize_then_block_callback,
+    )
+    service.handle_message(Message(MessageType.FILE_OFFER, old_offer.to_metadata()))
+    service.handle_message(
+        Message(
+            MessageType.FILE_CHUNK,
+            {"transfer_id": old_offer.transfer_id, "index": 0},
+            old_data,
+        )
+    )
+    service.handle_message(
+        Message(
+            MessageType.FILE_FINISH,
+            {"transfer_id": old_offer.transfer_id, "sha256": old_offer.sha256},
+        )
+    )
+    assert old_committed.wait(1)
+    old_completion = service._finalizing[old_offer.transfer_id]
+    old_callback_done = threading.Event()
+    old_completion.add_done_callback(lambda _future: old_callback_done.set())
+
+    service.disconnect()
+    old_path[0].unlink()
+    service.connection_changed(True)
+    new_data = b"new file"
+    new_offer = make_offer(
+        "same.bin",
+        new_data,
+        transfer_id="f" * 32,
+        chunk_size=len(new_data),
+    )
+    service.handle_message(Message(MessageType.FILE_OFFER, new_offer.to_metadata()))
+    service.handle_message(
+        Message(
+            MessageType.FILE_CHUNK,
+            {"transfer_id": new_offer.transfer_id, "index": 0},
+            new_data,
+        )
+    )
+    service.handle_message(
+        Message(
+            MessageType.FILE_FINISH,
+            {"transfer_id": new_offer.transfer_id, "sha256": new_offer.sha256},
+        )
+    )
+    new_path = downloads / "same.bin"
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and (
+        not new_path.exists() or new_path.read_bytes() != new_data
+    ):
+        time.sleep(0.01)
+    assert new_path.read_bytes() == new_data
+
+    release_old_callback.set()
+    assert old_callback_done.wait(2)
+
+    assert new_path.read_bytes() == new_data
+    service.close()
+
+
 def test_cancelled_incoming_transfer_cannot_be_resurrected_by_late_offer(tmp_path):
     offer = make_offer("cancelled.bin", b"cancelled", transfer_id="3" * 32)
     bus = QueueBus()

@@ -855,6 +855,9 @@ class MainWindow(QMainWindow):
         self.connection_status.setText("Error")
         self.action_status.setText(message)
 
+    def show_operation_error(self, message: str) -> None:
+        self.action_status.setText(message)
+
     def apply_core_snapshot(self, snapshot: CoreSnapshot) -> None:
         self._connection_id = snapshot.connection_id
         self._peer_fingerprint = snapshot.fingerprint

@@ -67,6 +67,7 @@ class FakeWindow(QObject):
         self.snapshots = []
         self.pending = []
         self.errors = []
+        self.operation_errors = []
         self.preferences = ("COM9", 460800, "left", True)
 
     def available_ports(self):
@@ -83,6 +84,9 @@ class FakeWindow(QObject):
 
     def show_connection_error(self, message):
         self.errors.append(message)
+
+    def show_operation_error(self, message):
+        self.operation_errors.append(message)
 
     def persistent_preferences(self):
         return self.preferences
@@ -160,4 +164,32 @@ def test_controller_does_not_autoconnect_a_missing_saved_port(qtbot, tmp_path):
     controller.start()
     qtbot.wait(10)
     assert core.connect_calls == []
+    controller.close()
+
+
+def test_trust_failure_preserves_the_active_connection_snapshot(qtbot, tmp_path):
+    core = FakeCore()
+    active_snapshot = object()
+    core.snapshot = active_snapshot
+
+    def fail_approval(_connection_id, _fingerprint):
+        raise OSError("trust store unavailable")
+
+    core.approve_peer = fail_approval
+    window = FakeWindow(("COM9",))
+    controller = app.ApplicationController(
+        core,
+        window,
+        SettingsStore(tmp_path / "settings.json"),
+        AppSettings(last_port="COM9"),
+        executor=ImmediateExecutor(),
+    )
+
+    window.trust_requested.emit(7, "SHA256:peer")
+    qtbot.waitUntil(
+        lambda: window.operation_errors == ["trust store unavailable"]
+    )
+
+    assert window.errors == []
+    assert window.snapshots[-1] is active_snapshot
     controller.close()

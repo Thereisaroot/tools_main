@@ -6,7 +6,7 @@ import logging
 import sys
 import threading
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -37,7 +37,11 @@ from shooklink.protocol.messages import (
 )
 from shooklink.shell.service import ShellService
 from shooklink.transport.multiplexer import OutboundItem, Priority
-from shooklink.transport.serial_link import SerialEndpoint, SerialLink
+from shooklink.transport.serial_link import (
+    LinkClosedError,
+    SerialEndpoint,
+    SerialLink,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +98,7 @@ class _Connection:
     input_bound: bool = False
     local_hello_sent: bool = False
     remote_hello_received: bool = False
+    plain_receive_sequences: dict[int, int] = field(default_factory=dict)
 
 
 _FEATURE_BY_TYPE = {
@@ -344,18 +349,16 @@ class ShookLinkCore:
             if connection.trust_status is TrustStatus.CHANGED:
                 raise CoreError("peer identity changed; remove the old trust entry first")
             peer_id = connection.remote_peer_id
-        self.trust_store.accept(peer_id, fingerprint)
-        with self._lock:
-            connection = self._connection
-            if (
-                connection is None
-                or connection.connection_id != connection_id
-                or connection.remote_peer_id != peer_id
-                or connection.remote_fingerprint != fingerprint
-            ):
-                raise CoreError("peer disconnected during approval")
+            # Keep approval and disconnect ordered so persisted trust cannot
+            # disagree with the result reported to the UI.
+            self.trust_store.accept(peer_id, fingerprint)
             connection.trust_status = TrustStatus.TRUSTED
-        self._send_trust(connection_id)
+            link_closed = connection.link.closed
+        if not link_closed:
+            try:
+                self._send_trust(connection_id)
+            except LinkClosedError:
+                pass
         self._refresh_input_if_ready(connection_id)
         self._publish_current()
 
@@ -624,6 +627,18 @@ class ShookLinkCore:
         message = decode_message(payload)
         if message is None or message.message_type is not message_type:
             return
+        if not secure:
+            with self._lock:
+                connection = self._connection
+                if connection is None or connection.connection_id != connection_id:
+                    return
+                last_sequence = connection.plain_receive_sequences.get(
+                    frame.stream_id,
+                    -1,
+                )
+                if frame.sequence <= last_sequence:
+                    return
+                connection.plain_receive_sequences[frame.stream_id] = frame.sequence
         if self.debug and message_type is not MessageType.INPUT_MOVE:
             logger.debug(
                 "received %s frame (%d bytes%s)",
