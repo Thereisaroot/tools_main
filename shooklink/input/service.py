@@ -143,6 +143,7 @@ class InputService:
         self._remote_topology: Topology | None = None
         self._local_session_topology: Topology | None = None
         self._session_peer_side = peer_side
+        self._enter_from_edge = False
         self._entry_fraction = 0.5
         self._local_return_position: tuple[int, int] | None = None
         self._pending_pointer: tuple[int, int] | None = None
@@ -265,6 +266,9 @@ class InputService:
             raise
 
     def request_control(self) -> str:
+        return self._request_control(enter_from_edge=False)
+
+    def _request_control(self, *, enter_from_edge: bool) -> str:
         with self._lock:
             if self._closed:
                 raise InputUnavailable("input service is closed")
@@ -285,6 +289,7 @@ class InputService:
             self._state = InputSessionState.REQUESTING
             self._session_id = session_id
             self._session_peer_side = side
+            self._enter_from_edge = enter_from_edge
             self._entry_fraction = fraction
             self._local_return_position = return_position
             self._local_session_topology = local_topology
@@ -460,7 +465,10 @@ class InputService:
             return
         try:
             local_topology = self._local_topology()
-        except InputUnavailable:
+            cursor_x, cursor_y = local_topology.nearest_point(
+                *self._backend.cursor_position()
+            )
+        except (InputUnavailable, OSError, TypeError, ValueError):
             self._send_busy(session_id, "unavailable")
             return
         inject_allowed = self._backend.permission_status().inject_allowed
@@ -513,6 +521,8 @@ class InputService:
                         "session_id": session_id,
                         "peer_id": self.local_peer_id,
                         "monitors": _encode_topology(local_topology),
+                        "x": cursor_x,
+                        "y": cursor_y,
                     },
                 ),
                 Priority.INTERACTIVE,
@@ -541,13 +551,20 @@ class InputService:
             )
 
     def _handle_accept(self, message: Message) -> None:
-        _require_fields(message.metadata, {"session_id", "peer_id", "monitors"})
+        _require_fields(
+            message.metadata,
+            {"session_id", "peer_id", "monitors", "x", "y"},
+        )
         session_id = _metadata_session_id(message.metadata)
         peer_id = message.metadata["peer_id"]
         _validate_peer_id(peer_id)
         if peer_id != self.peer_id:
             raise InputProtocolError("input accept identity does not match the peer")
         topology = _decode_topology(message.metadata["monitors"])
+        cursor_x = _bounded_int(message.metadata["x"], "pointer x")
+        cursor_y = _bounded_int(message.metadata["y"], "pointer y")
+        if not topology.contains(cursor_x, cursor_y):
+            raise InputProtocolError("input accept pointer is outside peer monitors")
         with self._lock:
             if (
                 self._state is not InputSessionState.REQUESTING
@@ -558,10 +575,15 @@ class InputService:
                 topology,
                 return_side=self._session_peer_side.opposite,
             )
-            transition = pointer.enter(
-                self._session_peer_side.opposite,
-                self._entry_fraction,
-            )
+            if self._enter_from_edge:
+                transition = pointer.enter(
+                    self._session_peer_side.opposite,
+                    self._entry_fraction,
+                )
+                initial_x, initial_y = transition.position
+            else:
+                pointer.set_position(cursor_x, cursor_y)
+                initial_x, initial_y = cursor_x, cursor_y
             self._pointer = pointer
             self._remote_topology = topology
             self._pending_pointer = None
@@ -602,8 +624,8 @@ class InputService:
                             MessageType.INPUT_ENTER,
                             {
                                 "session_id": session_id,
-                                "x": transition.x,
-                                "y": transition.y,
+                                "x": initial_x,
+                                "y": initial_y,
                             },
                         ),
                         Priority.INTERACTIVE,
@@ -848,7 +870,7 @@ class InputService:
                 trigger = True
         if trigger:
             try:
-                self.request_control()
+                self._request_control(enter_from_edge=True)
             except InputUnavailable:
                 pass
 
@@ -1143,6 +1165,7 @@ class InputService:
         self._next_motion_sequence = 1
         self._last_motion_sequence = 0
         self._last_received_motion_sequence = 0
+        self._enter_from_edge = False
         self._entry_fraction = 0.5
         self._local_return_position = None
         self._reset_edge_hold_locked()

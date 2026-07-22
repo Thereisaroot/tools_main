@@ -321,13 +321,14 @@ def test_fragmented_peer_pair_runs_all_services_and_reconnects_cleanly(tmp_path)
         assert wait_for(lambda: remote_process.terminated)
 
         right.input.set_allow_remote_input(True)
+        right_input.position = (50, 50)
         input_id = left.input.request_control()
         assert wait_for(
             lambda: left.input.state is InputSessionState.CONTROLLING
             and right.input.state is InputSessionState.BEING_CONTROLLED
         )
         left_input.capture(PointerMotionEvent(10, 0))
-        assert wait_for(lambda: right_input.position == (10, 50))
+        assert wait_for(lambda: right_input.position == (60, 50))
         left_input.capture(PointerMotionEvent(-1000, 0))
         assert wait_for(
             lambda: left.input.state is InputSessionState.IDLE

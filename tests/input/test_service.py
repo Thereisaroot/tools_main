@@ -202,6 +202,7 @@ def input_accept(
     *,
     peer_id="peer-b",
     rectangles=(Rect(0, 0, 200, 100),),
+    cursor=(0, 50),
 ):
     return Message(
         MessageType.INPUT_ACCEPT,
@@ -209,11 +210,13 @@ def input_accept(
             "session_id": session_id,
             "peer_id": peer_id,
             "monitors": monitors_metadata(*rectangles),
+            "x": cursor[0],
+            "y": cursor[1],
         },
     )
 
 
-def start_controlling(*, clock=None, auto_edge=False):
+def start_controlling(*, clock=None, auto_edge=False, remote_cursor=(0, 50)):
     bus = FakeBus()
     backend = FakeBackend()
     service = InputService(
@@ -227,7 +230,9 @@ def start_controlling(*, clock=None, auto_edge=False):
         session_factory=lambda: LOCAL_SESSION,
     )
     session_id = service.request_control()
-    assert service.handle_message(input_accept(session_id))
+    assert service.handle_message(
+        input_accept(session_id, cursor=remote_cursor)
+    )
     return service, bus, backend, session_id
 
 
@@ -269,14 +274,36 @@ def test_outgoing_request_accepts_topology_and_enters_absolute_pointer_mode():
     assert secure is True
     assert priority is Priority.INTERACTIVE
 
-    assert service.handle_message(input_accept(session_id))
+    assert service.handle_message(input_accept(session_id, cursor=(100, 50)))
 
     enter = bus.sent[-1][0]
     assert service.state is InputSessionState.CONTROLLING
     assert backend.capture_starts == [True]
     assert enter.message_type is MessageType.INPUT_ENTER
-    assert (enter.metadata["x"], enter.metadata["y"]) == (0, 50)
+    assert (enter.metadata["x"], enter.metadata["y"]) == (100, 50)
     assert bus.sent[-1][2] is Priority.INTERACTIVE
+
+
+@pytest.mark.parametrize("auto_edge_enabled", [False, True])
+def test_manual_request_starts_at_the_remote_cursor_without_immediate_leave(
+    auto_edge_enabled,
+):
+    service, bus, backend, _session_id = start_controlling(
+        auto_edge=auto_edge_enabled,
+        remote_cursor=(100, 50),
+    )
+    bus.sent.clear()
+
+    try:
+        backend.capture(PointerMotionEvent(-1, 0))
+
+        assert service.state is InputSessionState.CONTROLLING
+        assert all(
+            item[0].message_type is not MessageType.INPUT_LEAVE
+            for item in bus.sent
+        )
+    finally:
+        service.close()
 
 
 def test_cancelled_request_is_followed_by_stop_when_request_send_finishes_late():
@@ -474,6 +501,7 @@ def test_allowed_incoming_request_accepts_and_injects_normalized_key():
     assert service.state is InputSessionState.BEING_CONTROLLED
     assert accept.message_type is MessageType.INPUT_ACCEPT
     assert accept.metadata["monitors"][0]["width"] == 100
+    assert (accept.metadata["x"], accept.metadata["y"]) == (99, 50)
     assert secure is True
     assert priority is Priority.INTERACTIVE
 
@@ -826,7 +854,12 @@ def test_auto_edge_hold_enters_and_remote_return_edge_leaves_without_dead_space(
 
     assert service.state is InputSessionState.REQUESTING
     assert backend.capture_running is False
-    assert service.handle_message(input_accept(LOCAL_SESSION))
+    assert service.handle_message(
+        input_accept(LOCAL_SESSION, cursor=(100, 50))
+    )
+    enter = bus.sent[-1][0]
+    assert enter.message_type is MessageType.INPUT_ENTER
+    assert (enter.metadata["x"], enter.metadata["y"]) == (0, 50)
     bus.sent.clear()
 
     backend.capture(PointerMotionEvent(-1, 0))
