@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1
 AEAD_TAG_SIZE = 16
+HANDSHAKE_RETRY_SECONDS = 0.5
 LOCAL_FEATURES = frozenset({"chat", "files", "shell", "input"})
 MAX_FEATURES = 32
 MAX_PEER_ID_BYTES = 256
@@ -99,6 +100,8 @@ class _Connection:
     input_bound: bool = False
     local_hello_sent: bool = False
     remote_hello_received: bool = False
+    handshake_timer: threading.Timer | None = None
+    hello_attempts: int = 0
     plain_receive_sequences: dict[int, int] = field(default_factory=dict)
 
 
@@ -309,28 +312,8 @@ class ShookLinkCore:
         self._publish_current()
         try:
             link.start()
-            self._send_internal(
-                connection_id,
-                Message(
-                    MessageType.HELLO,
-                    {"protocol": PROTOCOL_VERSION},
-                    connection.secure_session.create_hello(),
-                ),
-                secure=False,
-                priority=Priority.INTERACTIVE,
-                allow_untrusted=True,
-            )
-            with self._lock:
-                current = self._connection
-                send_trust = bool(
-                    current is not None
-                    and current.connection_id == connection_id
-                    and current.remote_hello_received
-                )
-                if current is not None and current.connection_id == connection_id:
-                    current.local_hello_sent = True
-            if send_trust:
-                self._send_trust(connection_id)
+            self._queue_hello(connection_id, retry=False)
+            self._schedule_handshake_retry(connection_id)
         except BaseException:
             try:
                 link.close()
@@ -386,6 +369,8 @@ class ShookLinkCore:
         self._disconnect_requested.set()
         with self._lock:
             connection = self._connection
+            if connection is not None:
+                self._cancel_handshake_retry_locked(connection)
             if connection is None:
                 self._last_state = CoreState.DISCONNECTED
                 self._last_error = None
@@ -403,6 +388,8 @@ class ShookLinkCore:
                 return
             self._closed = True
             connection = self._connection
+            if connection is not None:
+                self._cancel_handshake_retry_locked(connection)
         if connection is not None:
             try:
                 connection.link.close()
@@ -549,7 +536,95 @@ class ShookLinkCore:
                     pass
             raise
 
-    def _send_trust(self, connection_id: int) -> None:
+    def _queue_hello(self, connection_id: int, *, retry: bool) -> None:
+        with self._lock:
+            connection = self._connection
+            if connection is None or connection.connection_id != connection_id:
+                raise CoreError("serial connection changed")
+            hello = connection.secure_session.create_hello()
+        self._send_internal(
+            connection_id,
+            Message(
+                MessageType.HELLO,
+                {"protocol": PROTOCOL_VERSION},
+                hello,
+            ),
+            secure=False,
+            priority=Priority.INTERACTIVE,
+            allow_untrusted=True,
+        )
+        with self._lock:
+            current = self._connection
+            if current is None or current.connection_id != connection_id:
+                return
+            current.local_hello_sent = True
+            current.hello_attempts += 1
+            attempt = current.hello_attempts
+            send_trust = current.remote_hello_received
+        if self.debug:
+            logger.debug("queued HELLO attempt %d", attempt)
+        if send_trust:
+            self._send_trust(connection_id, force=retry)
+
+    def _schedule_handshake_retry(self, connection_id: int) -> None:
+        with self._lock:
+            connection = self._connection
+            if (
+                self._closed
+                or connection is None
+                or connection.connection_id != connection_id
+                or connection.remote_peer_id is not None
+                or connection.link.closed
+                or connection.handshake_timer is not None
+            ):
+                return
+            timer = threading.Timer(
+                HANDSHAKE_RETRY_SECONDS,
+                self._retry_handshake,
+                args=(connection_id,),
+            )
+            timer.daemon = True
+            connection.handshake_timer = timer
+        try:
+            timer.start()
+        except BaseException:
+            with self._lock:
+                current = self._connection
+                if (
+                    current is not None
+                    and current.connection_id == connection_id
+                    and current.handshake_timer is timer
+                ):
+                    current.handshake_timer = None
+            raise
+
+    def _retry_handshake(self, connection_id: int) -> None:
+        with self._lock:
+            connection = self._connection
+            if connection is None or connection.connection_id != connection_id:
+                return
+            connection.handshake_timer = None
+            if (
+                self._closed
+                or connection.remote_peer_id is not None
+                or connection.link.closed
+            ):
+                return
+        try:
+            self._queue_hello(connection_id, retry=True)
+        except Exception:
+            logger.debug("handshake retry could not be queued", exc_info=self.debug)
+        finally:
+            self._schedule_handshake_retry(connection_id)
+
+    @staticmethod
+    def _cancel_handshake_retry_locked(connection: _Connection) -> None:
+        timer = connection.handshake_timer
+        connection.handshake_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _send_trust(self, connection_id: int, *, force: bool = False) -> None:
         with self._lock:
             connection = self._connection
             if connection is None or connection.connection_id != connection_id:
@@ -560,7 +635,7 @@ class ShookLinkCore:
                 if connection.trust_status is TrustStatus.TRUSTED
                 else None
             )
-            if (
+            if not force and (
                 connection.trust_sent
                 and connection.last_accepts_fingerprint == accepted
             ):
@@ -693,6 +768,7 @@ class ShookLinkCore:
             connection = self._connection
             if connection is None or connection.connection_id != connection_id:
                 return
+            duplicate = connection.remote_hello_received
             secure_session = connection.secure_session
         secure_session.receive_hello(message.body)
         with self._lock:
@@ -702,7 +778,7 @@ class ShookLinkCore:
             connection.remote_hello_received = True
             send_trust = connection.local_hello_sent
         if send_trust:
-            self._send_trust(connection_id)
+            self._send_trust(connection_id, force=duplicate)
 
     def _handle_trust(self, connection_id: int, message: Message) -> None:
         metadata = _validate_trust_metadata(message.metadata)
@@ -734,6 +810,7 @@ class ShookLinkCore:
             connection.remote_approved = (
                 metadata["accepts_fingerprint"] == self.identity.fingerprint
             )
+            self._cancel_handshake_retry_locked(connection)
             bind_input = self.input is not None and not connection.input_bound
         if bind_input and self.input is not None:
             self.input.set_peer_id(peer_id)
@@ -774,6 +851,7 @@ class ShookLinkCore:
             connection = self._connection
             if connection is None or connection.connection_id != connection_id:
                 return
+            self._cancel_handshake_retry_locked(connection)
             disconnect_requested = self._disconnect_requested.is_set()
             self._connection = None
             self._last_connection_id = connection_id

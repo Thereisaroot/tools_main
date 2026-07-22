@@ -76,6 +76,20 @@ class BlockingCloseEndpoint(MemoryEndpoint):
         super().close()
 
 
+class GatedMemoryEndpoint(MemoryEndpoint):
+    def __init__(self):
+        super().__init__()
+        self.accepting = True
+        self.dropped_bytes = 0
+
+    def write(self, data):
+        if self.peer is not None and not self.peer.accepting:
+            count = min(len(data), self.max_write)
+            self.dropped_bytes += count
+            return count
+        return super().write(data)
+
+
 def endpoint_pair():
     left = MemoryEndpoint()
     right = MemoryEndpoint()
@@ -866,6 +880,33 @@ def test_trust_waits_until_local_hello_has_been_queued(tmp_path):
         )
     finally:
         release_local_hello.set()
+        left.close()
+        right.close()
+
+
+def test_handshake_recovers_when_the_first_hello_is_lost(tmp_path):
+    left, *_ = build_core(tmp_path, "left-lost-hello")
+    right, *_ = build_core(tmp_path, "right-lost-hello")
+    left_endpoint = GatedMemoryEndpoint()
+    right_endpoint = GatedMemoryEndpoint()
+    left_endpoint.connect(right_endpoint)
+    right_endpoint.connect(left_endpoint)
+    right_endpoint.accepting = False
+
+    try:
+        left.connect_endpoint(left_endpoint)
+        assert wait_for(lambda: left_endpoint.dropped_bytes > 0, timeout=1)
+        assert left.snapshot.state is CoreState.HANDSHAKING
+
+        right_endpoint.accepting = True
+        right.connect_endpoint(right_endpoint)
+
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED,
+            timeout=1.5,
+        )
+    finally:
         left.close()
         right.close()
 

@@ -452,6 +452,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QWidget#root { background: #f2efe7; color: #172421; }
+            QWidget#root QLabel, QWidget#root QCheckBox { color: #172421; }
             QLabel#title { color: #0b3d36; font-size: 23px; font-weight: 800; }
             QLabel#subtitle { color: #b4482b; font-size: 11px; font-weight: 700; }
             QLabel#sectionLabel, QFrame#panel QLabel {
@@ -469,15 +470,22 @@ class MainWindow(QMainWindow):
             }
             QFrame#fileDropZone QLabel { color: #31564e; font-size: 10px; font-weight: 750; }
             QComboBox, QPlainTextEdit {
-                background: #fffdf8; border: 1px solid #b9b2a5; border-radius: 6px;
+                background: #fffdf8; color: #172421;
+                border: 1px solid #b9b2a5; border-radius: 6px;
                 selection-background-color: #176b5b; selection-color: white;
             }
             QComboBox { min-height: 31px; padding: 0 9px; }
+            QComboBox QLineEdit { color: #172421; background: transparent; }
+            QComboBox QAbstractItemView {
+                background: #fffdf8; color: #172421;
+                selection-background-color: #176b5b; selection-color: white;
+            }
             QPlainTextEdit { padding: 12px; font-size: 14px; }
             QPlainTextEdit#receivedView { background: #172421; color: #e9f0e8; }
             QPushButton {
                 min-height: 31px; padding: 0 14px; border: 1px solid #8f988f;
-                border-radius: 6px; background: #f8f5ed; font-weight: 650;
+                border-radius: 6px; background: #f8f5ed; color: #172421;
+                font-weight: 650;
             }
             QPushButton:hover { background: #ebe5d9; }
             QPushButton:disabled { color: #9b9a93; background: #e1ded6; }

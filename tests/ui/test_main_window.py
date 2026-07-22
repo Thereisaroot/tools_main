@@ -5,6 +5,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QMimeData, Qt, QUrl
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
 from shooklink.chat.service import ChatService
@@ -223,6 +224,40 @@ def test_connection_shell_contains_expected_controls(qtbot):
     assert window.baud_combo.isEditable()
     assert window.connect_button.text() == "Connect"
     assert window.connection_status.text() == "Disconnected"
+
+
+def test_light_surface_text_remains_dark_with_a_dark_system_palette(qtbot):
+    application = QApplication.instance()
+    original_palette = QPalette(application.palette())
+    dark_palette = QPalette(original_palette)
+    for group in (
+        QPalette.ColorGroup.Active,
+        QPalette.ColorGroup.Inactive,
+    ):
+        dark_palette.setColor(group, QPalette.ColorRole.Text, QColor("#ffffff"))
+        dark_palette.setColor(group, QPalette.ColorRole.WindowText, QColor("#ffffff"))
+        dark_palette.setColor(group, QPalette.ColorRole.ButtonText, QColor("#ffffff"))
+    application.setPalette(dark_palette)
+
+    try:
+        window = MainWindow(ChatService(FakeBus()))
+        qtbot.addWidget(window)
+        window.show()
+        window.ensurePolished()
+        widgets_and_roles = (
+            (window.port_combo, QPalette.ColorRole.Text),
+            (window.port_combo.lineEdit(), QPalette.ColorRole.Text),
+            (window.message_editor, QPalette.ColorRole.Text),
+            (window.allow_input_checkbox, QPalette.ColorRole.WindowText),
+            (window.copy_last_button, QPalette.ColorRole.ButtonText),
+        )
+
+        for widget, role in widgets_and_roles:
+            widget.ensurePolished()
+            color = widget.palette().color(QPalette.ColorGroup.Active, role)
+            assert color == QColor("#172421")
+    finally:
+        application.setPalette(original_palette)
 
 
 def test_connection_state_exposes_trust_approval_and_disconnect(qtbot):
