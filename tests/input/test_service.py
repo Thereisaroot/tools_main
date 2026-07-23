@@ -1230,6 +1230,30 @@ def test_accept_enter_send_failure_rolls_back_suppressed_capture():
     assert service.handle_message(input_accept(session_id)) is False
     assert service.state is InputSessionState.IDLE
     assert backend.capture_running is False
+    assert backend.warps[-1] == (98, 50)
+
+
+def test_accept_capture_start_failure_restores_local_cursor():
+    class FailingStartBackend(FakeBackend):
+        def _start_native_capture(self, suppress):
+            assert suppress is True
+            self.position = (50, 50)
+            raise RuntimeError("capture failed")
+
+    backend = FailingStartBackend(position=(99, 50))
+    service = InputService(
+        FakeBus(),
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    session_id = service.request_control()
+
+    assert service.handle_message(input_accept(session_id)) is False
+    assert service.state is InputSessionState.IDLE
+    assert backend.capture_running is False
+    assert backend.warps[-1] == (98, 50)
 
 
 def test_stop_cleans_up_even_when_pending_pointer_flush_fails():

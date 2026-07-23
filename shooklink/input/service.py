@@ -593,6 +593,7 @@ class InputService:
             self._next_motion_sequence = 1
             self._last_motion_sequence = 0
             self._last_received_motion_sequence = 0
+            return_position = self._local_return_position
         try:
             self._start_capture(
                 self._captured_event,
@@ -610,9 +611,11 @@ class InputService:
                 ),
                 Priority.INTERACTIVE,
             )
+            self._restore_local_cursor(return_position)
             self._refresh_idle_capture()
             raise
         send_error = None
+        failed_return_position = return_position
         with self._lock:
             cancelled = (
                 self._state is not InputSessionState.REQUESTING
@@ -634,9 +637,9 @@ class InputService:
                     )
                 except BaseException as error:
                     send_error = error
+                    failed_return_position = self._local_return_position
                     self._clear_session_locked()
         if cancelled or send_error is not None:
-            self._stop_capture_if_running()
             if send_error is not None:
                 self._safe_send(
                     Message(
@@ -645,6 +648,11 @@ class InputService:
                     ),
                     Priority.INTERACTIVE,
                 )
+            try:
+                self._stop_capture_if_running()
+            finally:
+                self._restore_local_cursor(failed_return_position)
+            if send_error is not None:
                 self._refresh_idle_capture()
                 raise send_error
             self._refresh_idle_capture()
@@ -1121,10 +1129,7 @@ class InputService:
                 Priority.INTERACTIVE,
             )
         if state is InputSessionState.CONTROLLING and return_position is not None:
-            try:
-                self._backend.warp_cursor(*return_position)
-            except OSError:
-                pass
+            self._restore_local_cursor(return_position)
         self._notify_state(InputStateChange(InputSessionState.IDLE, reason=reason))
         try:
             self._refresh_idle_capture()
@@ -1133,6 +1138,14 @@ class InputService:
                 cleanup_error = error
         if cleanup_error is not None:
             raise cleanup_error
+
+    def _restore_local_cursor(self, position: tuple[int, int] | None) -> None:
+        if position is None:
+            return
+        try:
+            self._backend.warp_cursor(*position)
+        except OSError:
+            pass
 
     def _clear_session(self, session_id: str) -> None:
         with self._lock:
