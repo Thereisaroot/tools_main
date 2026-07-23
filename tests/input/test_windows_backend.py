@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from shooklink.input.events import KeyAction, KeyEvent, Modifiers, PointerMotionEvent
+from shooklink.input.topology import Monitor, Rect
 from shooklink.input.windows_backend import (
     INJECTION_MARKER,
     WindowsInputBackend,
@@ -405,6 +406,105 @@ def test_windows_third_party_injected_mouse_follows_capture_policy():
     assert len(captured) == 1
     assert captured[0].injected is True
     assert captured[0].self_injected is False
+
+
+def test_windows_suppressed_mouse_capture_reanchors_each_packet():
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            assert suppress is True
+            self._mouse_anchor_position = (500, 500)
+            self._last_mouse_position = (500, 500)
+
+        def _stop_native_capture(self):
+            pass
+
+    class MouseApi:
+        def __init__(self):
+            self.warps = []
+
+        def mouse_data(self, pointer):
+            return pointer
+
+        def set_cursor_position(self, x, y):
+            self.warps.append((x, y))
+
+        def call_next(self, *_args):
+            return 77
+
+    def movement(x, y):
+        return SimpleNamespace(
+            pt=SimpleNamespace(x=x, y=y),
+            mouseData=0,
+            flags=0,
+            dwExtraInfo=0,
+        )
+
+    backend = CallbackBackend()
+    api = MouseApi()
+    backend._api = api
+    captured = []
+    backend.start_capture(
+        captured.append,
+        lambda _action: None,
+        suppress=True,
+    )
+
+    first_result = backend._mouse_callback(0, 0x0200, movement(504, 500))
+    second_result = backend._mouse_callback(0, 0x0200, movement(504, 500))
+
+    assert first_result == 1
+    assert second_result == 1
+    assert [(event.dx, event.dy) for event in captured] == [(4, 0), (4, 0)]
+    assert api.warps == [(500, 500), (500, 500)]
+
+
+def test_windows_suppressed_capture_starts_at_current_monitor_center(monkeypatch):
+    backend = WindowsInputBackend()
+    monkeypatch.setattr("shooklink.input.windows_backend.sys.platform", "win32")
+
+    class ImmediateThread:
+        def __init__(self, *, args, **_kwargs):
+            self.generation = args[0]
+
+        def start(self):
+            self.generation.ready.set()
+
+        def is_alive(self):
+            return False
+
+    class CaptureApi:
+        def __init__(self):
+            self.warps = []
+
+        def cursor_position(self):
+            return 1700, 900
+
+        def enumerate_monitors(self):
+            return (
+                Monitor("left", Rect(0, 0, 1920, 1080)),
+                Monitor("right", Rect(1920, 0, 1920, 1080)),
+            )
+
+        def set_cursor_position(self, x, y):
+            self.warps.append((x, y))
+
+    monkeypatch.setattr(
+        "shooklink.input.windows_backend.threading.Thread",
+        ImmediateThread,
+    )
+    api = CaptureApi()
+    backend._api = api
+
+    backend.start_capture(
+        lambda _event: None,
+        lambda _action: None,
+        suppress=True,
+    )
+
+    assert api.warps == [(960, 540)]
+    assert backend._mouse_anchor_position == (960, 540)
+    assert backend._last_mouse_position == (960, 540)
+    backend.stop_capture()
 
 
 def test_windows_private_marker_mouse_is_self_filtered():

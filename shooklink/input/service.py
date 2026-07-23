@@ -670,8 +670,8 @@ class InputService:
         session_id, x, y = self._position_message(message)
         self._require_being_controlled(session_id)
         self._inject(PointerPositionEvent(x, y), session_id)
-        applied_x, applied_y = self._applied_pointer_position()
-        self._send_pointer_state(session_id, 0, applied_x, applied_y)
+        # Native injection can apply asynchronously; acknowledge the logical target.
+        self._send_pointer_state(session_id, 0, x, y)
 
     def _handle_leave(self, message: Message) -> None:
         session_id, _x, _y = self._position_message(message)
@@ -748,7 +748,6 @@ class InputService:
             if motion_sequence <= self._last_received_motion_sequence:
                 return
         self._inject(PointerPositionEvent(x, y), session_id)
-        applied_x, applied_y = self._applied_pointer_position()
         with self._lock:
             if (
                 self._state is InputSessionState.BEING_CONTROLLED
@@ -758,8 +757,8 @@ class InputService:
         self._send_pointer_state(
             session_id,
             motion_sequence,
-            applied_x,
-            applied_y,
+            x,
+            y,
         )
 
     def _handle_wheel(self, message: Message) -> None:
@@ -1048,14 +1047,6 @@ class InputService:
                 listener(action)
             except Exception:
                 pass
-
-    def _applied_pointer_position(self) -> tuple[int, int]:
-        with self._lock:
-            topology = self._local_session_topology
-        if topology is None:
-            raise InputProtocolError("input session topology is unavailable")
-        x, y = self._backend.cursor_position()
-        return topology.nearest_point(x, y)
 
     def _inject(self, event: InputEvent, session_id: str) -> None:
         try:

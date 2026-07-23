@@ -1006,15 +1006,13 @@ def test_handler_send_failure_tears_down_incoming_session_and_releases_inputs():
     assert bus.sent[-1][0].message_type is MessageType.INPUT_STOP
 
 
-def test_pointer_state_reports_the_position_applied_by_the_os():
-    class ClampingBackend(FakeBackend):
+def test_pointer_state_reports_commanded_position_before_async_os_application():
+    class DeferredBackend(FakeBackend):
         def _inject_native(self, event):
-            super()._inject_native(event)
-            if isinstance(event, PointerPositionEvent):
-                self.position = (min(event.x, 10), event.y)
+            self.native_injected.append(event)
 
     bus = FakeBus()
-    backend = ClampingBackend()
+    backend = DeferredBackend()
     service = InputService(
         bus,
         backend,
@@ -1039,7 +1037,7 @@ def test_pointer_state_reports_the_position_applied_by_the_os():
 
     report = bus.sent[-1][0]
     assert report.message_type is MessageType.INPUT_POINTER_STATE
-    assert (report.metadata["x"], report.metadata["y"]) == (10, 50)
+    assert (report.metadata["x"], report.metadata["y"]) == (40, 50)
 
 
 def test_motion_scheduler_flushes_the_final_coalesced_position():

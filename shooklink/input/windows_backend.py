@@ -258,6 +258,7 @@ class WindowsInputBackend(BaseInputBackend):
         self._lock_modifiers = Modifiers.NONE
         self._captured_keys_down: set[int] = set()
         self._last_mouse_position: tuple[int, int] | None = None
+        self._mouse_anchor_position: tuple[int, int] | None = None
         self._hook_generation_number = 0
         self._hook_generation: _WindowsCaptureGeneration | None = None
         self._hook_generations: dict[int, _WindowsCaptureGeneration] = {}
@@ -286,6 +287,8 @@ class WindowsInputBackend(BaseInputBackend):
         if sys.platform != "win32":
             raise OSError("Windows input capture is only available on Windows")
         self._reset_capture_local_state()
+        if suppress:
+            self._start_suppressed_mouse_capture()
         self._hook_generation_number += 1
         generation = _WindowsCaptureGeneration(self._hook_generation_number)
         generation.thread = threading.Thread(
@@ -309,6 +312,30 @@ class WindowsInputBackend(BaseInputBackend):
         self._modifiers = Modifiers.NONE
         self._captured_keys_down.clear()
         self._last_mouse_position = None
+        self._mouse_anchor_position = None
+
+    def _start_suppressed_mouse_capture(self) -> None:
+        api = self._get_api()
+        position = api.cursor_position()
+        # Re-center suppressed capture so every hook coordinate remains a delta.
+        monitor = next(
+            (
+                item
+                for item in api.enumerate_monitors()
+                if item.rect.contains(*position)
+            ),
+            None,
+        )
+        if monitor is None:
+            anchor = position
+        else:
+            anchor = (
+                monitor.rect.x + monitor.rect.width // 2,
+                monitor.rect.y + monitor.rect.height // 2,
+            )
+        api.set_cursor_position(*anchor)
+        self._mouse_anchor_position = anchor
+        self._last_mouse_position = anchor
 
     def _stop_native_capture(self) -> None:
         generation = self._hook_generation
@@ -559,14 +586,31 @@ class WindowsInputBackend(BaseInputBackend):
         event: InputEvent | None = None
         position = (int(data.pt.x), int(data.pt.y))
         if message == 0x0200:
-            previous = self._last_mouse_position or position
-            self._last_mouse_position = position
+            anchor = (
+                self._mouse_anchor_position
+                if self._capture_suppress
+                else None
+            )
+            previous = anchor or self._last_mouse_position or position
             event = PointerMotionEvent(
                 position[0] - previous[0],
                 position[1] - previous[1],
                 injected=injected,
                 self_injected=self_injected,
             )
+            if anchor is not None:
+                if position != anchor:
+                    try:
+                        api.set_cursor_position(*anchor)
+                    except OSError:
+                        self._mouse_anchor_position = position
+                        self._last_mouse_position = position
+                    else:
+                        self._last_mouse_position = anchor
+                else:
+                    self._last_mouse_position = anchor
+            else:
+                self._last_mouse_position = position
         elif message in _WINDOWS_BUTTON_MESSAGES:
             button, action = _WINDOWS_BUTTON_MESSAGES[message]
             if message in (0x020B, 0x020C):
