@@ -458,6 +458,53 @@ def test_windows_suppressed_mouse_capture_reanchors_each_packet():
     assert api.warps == [(500, 500), (500, 500)]
 
 
+def test_windows_suppressed_capture_drops_anchor_and_bogus_warp_events():
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            assert suppress is True
+            self._mouse_anchor_position = (500, 500)
+            self._mouse_anchor_rect = Rect(0, 0, 1000, 1000)
+            self._last_mouse_position = (500, 500)
+
+        def _stop_native_capture(self):
+            pass
+
+    class MouseApi:
+        def __init__(self):
+            self.warps = []
+
+        def mouse_data(self, pointer):
+            return pointer
+
+        def set_cursor_position(self, x, y):
+            self.warps.append((x, y))
+
+        def call_next(self, *_args):
+            return 77
+
+    def movement(x, y):
+        return SimpleNamespace(
+            pt=SimpleNamespace(x=x, y=y),
+            mouseData=0,
+            flags=0,
+            dwExtraInfo=0,
+        )
+
+    backend = CallbackBackend()
+    api = MouseApi()
+    backend._api = api
+    captured = []
+    backend.start_capture(captured.append, lambda _action: None, suppress=True)
+
+    anchor_result = backend._mouse_callback(0, 0x0200, movement(500, 500))
+    bogus_result = backend._mouse_callback(0, 0x0200, movement(0, 500))
+
+    assert anchor_result == 1
+    assert bogus_result == 1
+    assert captured == []
+    assert api.warps == [(500, 500)]
+
+
 def test_windows_suppressed_capture_starts_at_current_monitor_center(monkeypatch):
     backend = WindowsInputBackend()
     monkeypatch.setattr("shooklink.input.windows_backend.sys.platform", "win32")
@@ -503,6 +550,7 @@ def test_windows_suppressed_capture_starts_at_current_monitor_center(monkeypatch
 
     assert api.warps == [(960, 540)]
     assert backend._mouse_anchor_position == (960, 540)
+    assert backend._mouse_anchor_rect == Rect(0, 0, 1920, 1080)
     assert backend._last_mouse_position == (960, 540)
     backend.stop_capture()
 
@@ -889,10 +937,7 @@ def test_windows_new_generation_resets_capture_local_state(monkeypatch):
     )
 
     key_event = next(event for event in captured if isinstance(event, KeyEvent))
-    motion_event = next(
-        event for event in captured if isinstance(event, PointerMotionEvent)
-    )
     assert key_event.repeat is False
     assert key_event.modifiers is Modifiers.NONE
-    assert (motion_event.dx, motion_event.dy) == (0, 0)
+    assert not any(isinstance(event, PointerMotionEvent) for event in captured)
     backend.stop_capture()

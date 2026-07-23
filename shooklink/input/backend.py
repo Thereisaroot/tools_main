@@ -14,6 +14,9 @@ from shooklink.input.events import (
     MouseButton,
     MouseButtonEvent,
 )
+from shooklink.input.topology import Rect
+
+_WARP_BOGUS_ZONE_SIZE = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +172,25 @@ class BaseInputBackend:
 
     def _inject_native(self, event: InputEvent) -> None:
         raise NotImplementedError
+
+
+def _anchored_pointer_delta(
+    position: tuple[int, int],
+    anchor: tuple[int, int],
+    bounds: Rect | None,
+) -> tuple[int, int] | None:
+    dx = position[0] - anchor[0]
+    dy = position[1] - anchor[1]
+    if dx == 0 and dy == 0:
+        return None
+    if bounds is not None and (
+        -dx + _WARP_BOGUS_ZONE_SIZE > anchor[0] - bounds.x
+        or dx + _WARP_BOGUS_ZONE_SIZE > bounds.right - anchor[0]
+        or -dy + _WARP_BOGUS_ZONE_SIZE > anchor[1] - bounds.y
+        or dy + _WARP_BOGUS_ZONE_SIZE > bounds.bottom - anchor[1]
+    ):
+        return None
+    return dx, dy
 
 
 def _emergency_action(event: InputEvent) -> str | None:

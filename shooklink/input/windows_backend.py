@@ -7,7 +7,11 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from shooklink.input.backend import BaseInputBackend, PermissionStatus
+from shooklink.input.backend import (
+    BaseInputBackend,
+    PermissionStatus,
+    _anchored_pointer_delta,
+)
 from shooklink.input.events import (
     InputEvent,
     KeyAction,
@@ -259,6 +263,7 @@ class WindowsInputBackend(BaseInputBackend):
         self._captured_keys_down: set[int] = set()
         self._last_mouse_position: tuple[int, int] | None = None
         self._mouse_anchor_position: tuple[int, int] | None = None
+        self._mouse_anchor_rect: Rect | None = None
         self._hook_generation_number = 0
         self._hook_generation: _WindowsCaptureGeneration | None = None
         self._hook_generations: dict[int, _WindowsCaptureGeneration] = {}
@@ -313,6 +318,7 @@ class WindowsInputBackend(BaseInputBackend):
         self._captured_keys_down.clear()
         self._last_mouse_position = None
         self._mouse_anchor_position = None
+        self._mouse_anchor_rect = None
 
     def _start_suppressed_mouse_capture(self) -> None:
         api = self._get_api()
@@ -335,6 +341,7 @@ class WindowsInputBackend(BaseInputBackend):
             )
         api.set_cursor_position(*anchor)
         self._mouse_anchor_position = anchor
+        self._mouse_anchor_rect = None if monitor is None else monitor.rect
         self._last_mouse_position = anchor
 
     def _stop_native_capture(self) -> None:
@@ -592,12 +599,21 @@ class WindowsInputBackend(BaseInputBackend):
                 else None
             )
             previous = anchor or self._last_mouse_position or position
-            event = PointerMotionEvent(
-                position[0] - previous[0],
-                position[1] - previous[1],
-                injected=injected,
-                self_injected=self_injected,
+            delta = (
+                _anchored_pointer_delta(
+                    position,
+                    anchor,
+                    self._mouse_anchor_rect,
+                )
+                if anchor is not None
+                else _anchored_pointer_delta(position, previous, None)
             )
+            if delta is not None:
+                event = PointerMotionEvent(
+                    *delta,
+                    injected=injected,
+                    self_injected=self_injected,
+                )
             if anchor is not None:
                 if position != anchor:
                     try:
@@ -634,6 +650,8 @@ class WindowsInputBackend(BaseInputBackend):
             consumed = self.emit_captured(event)
             if consumed or self._capture_suppress:
                 return 1
+        elif message == 0x0200 and self._capture_suppress:
+            return 1
         return api.call_next(hook, code, message, pointer)
 
     def _initialize_modifier_state(self, api) -> None:
