@@ -276,12 +276,19 @@ class InputService:
                 raise InputUnavailable("trust the connected peer before sharing input")
             if self._state is not InputSessionState.IDLE:
                 raise InputUnavailable("an input session is already active")
+            if enter_from_edge and not self._auto_edge_enabled:
+                raise InputUnavailable("automatic edge switching is disabled")
             status = self._backend.permission_status()
             if not status.capture_allowed:
                 raise InputUnavailable(status.detail)
             local_topology = self._local_topology()
             position = self._backend.cursor_position()
             side = self._peer_side
+            if enter_from_edge and not local_topology.is_on_outer_edge(
+                side,
+                *position,
+            ):
+                raise InputUnavailable("pointer is no longer on the configured edge")
             fraction = _entry_fraction(local_topology, side, position)
             return_position = _return_position(local_topology, side, position)
             session_id = self._session_factory()

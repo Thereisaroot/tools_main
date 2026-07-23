@@ -961,6 +961,28 @@ def test_auto_edge_timer_is_cancelled_on_disconnect_and_cannot_fire_stale(
     assert service.state is InputSessionState.IDLE
 
 
+def test_stale_auto_edge_request_rechecks_current_edge_and_setting():
+    backend = FakeBackend(position=(98, 50))
+    service = InputService(
+        FakeBus(),
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        peer_side=Side.RIGHT,
+        auto_edge_enabled=True,
+    )
+
+    with pytest.raises(InputUnavailable, match="edge"):
+        service._request_control(enter_from_edge=True)
+
+    backend.position = (99, 50)
+    service.set_auto_edge_enabled(False)
+    with pytest.raises(InputUnavailable, match="disabled"):
+        service._request_control(enter_from_edge=True)
+
+    assert service.state is InputSessionState.IDLE
+
+
 def test_auto_edge_setting_rolls_back_when_idle_capture_cannot_start():
     class FailingStartBackend(FakeBackend):
         def _start_native_capture(self, suppress):
