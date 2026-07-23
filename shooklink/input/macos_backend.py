@@ -7,7 +7,11 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from shooklink.input.backend import BaseInputBackend, PermissionStatus
+from shooklink.input.backend import (
+    BaseInputBackend,
+    PermissionStatus,
+    _anchored_pointer_delta,
+)
 from shooklink.input.events import (
     InputEvent,
     KeyAction,
@@ -168,6 +172,8 @@ class MacOSInputBackend(BaseInputBackend):
         self._event_tap = None
         self._tap_callback_ref = None
         self._modifier_keys_down: set[int] = set()
+        self._mouse_anchor_position: tuple[int, int] | None = None
+        self._mouse_anchor_rect: Rect | None = None
         self._tap_generation_number = 0
         self._tap_generation: _MacCaptureGeneration | None = None
 
@@ -220,6 +226,8 @@ class MacOSInputBackend(BaseInputBackend):
     def _start_native_capture(self, suppress: bool) -> None:
         self._require_input_permissions()
         self._reset_capture_local_state()
+        if suppress:
+            self._start_suppressed_mouse_capture()
         self._tap_generation_number += 1
         generation = _MacCaptureGeneration(self._tap_generation_number)
         generation.thread = threading.Thread(
@@ -238,6 +246,25 @@ class MacOSInputBackend(BaseInputBackend):
 
     def _reset_capture_local_state(self) -> None:
         self._modifier_keys_down.clear()
+        self._mouse_anchor_position = None
+        self._mouse_anchor_rect = None
+
+    def _start_suppressed_mouse_capture(self) -> None:
+        position = self.cursor_position()
+        monitor = next(
+            (item for item in self.monitors() if item.rect.contains(*position)),
+            None,
+        )
+        if monitor is None:
+            anchor = position
+        else:
+            anchor = (
+                monitor.rect.x + monitor.rect.width // 2,
+                monitor.rect.y + monitor.rect.height // 2,
+            )
+        self.warp_cursor(*anchor)
+        self._mouse_anchor_position = anchor
+        self._mouse_anchor_rect = None if monitor is None else monitor.rect
 
     def _initialize_modifier_key_state(
         self,
@@ -346,7 +373,7 @@ class MacOSInputBackend(BaseInputBackend):
             )
             self._publish_tap_generation(generation)
             generation.event_tap = Quartz.CGEventTapCreate(
-                Quartz.kCGSessionEventTap,
+                Quartz.kCGHIDEventTap,
                 Quartz.kCGHeadInsertEventTap,
                 Quartz.kCGEventTapOptionDefault,
                 mask,
@@ -410,7 +437,12 @@ class MacOSInputBackend(BaseInputBackend):
         if normalized is None:
             return event
         consumed = self.emit_captured(normalized)
-        if consumed or self._capture_suppress:
+        if consumed:
+            return None
+        if self._capture_suppress and _is_mouse_motion_type(event_type, Quartz):
+            # Quartz ignores a cursor warp if the intercepted move is discarded.
+            return event
+        if self._capture_suppress:
             return None
         return event
 
@@ -473,6 +505,24 @@ class MacOSInputBackend(BaseInputBackend):
             quartz.kCGEventRightMouseDragged,
             quartz.kCGEventOtherMouseDragged,
         }:
+            anchor = self._mouse_anchor_position if self._capture_suppress else None
+            if anchor is not None and not self_injected:
+                location = quartz.CGEventGetLocation(event)
+                position = (round(location.x), round(location.y))
+                delta = _anchored_pointer_delta(
+                    position,
+                    anchor,
+                    self._mouse_anchor_rect,
+                )
+                if position != anchor:
+                    self.warp_cursor(*anchor)
+                if delta is None:
+                    return None
+                return PointerMotionEvent(
+                    *delta,
+                    injected=False,
+                    self_injected=False,
+                )
             return PointerMotionEvent(
                 int(quartz.CGEventGetIntegerValueField(event, quartz.kCGMouseEventDeltaX)),
                 int(quartz.CGEventGetIntegerValueField(event, quartz.kCGMouseEventDeltaY)),
@@ -570,6 +620,18 @@ class MacOSInputBackend(BaseInputBackend):
             INJECTION_MARKER,
         )
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, quartz_event)
+
+
+def _is_mouse_motion_type(event_type: int, quartz) -> bool:
+    return event_type in {
+        getattr(quartz, name, None)
+        for name in (
+            "kCGEventMouseMoved",
+            "kCGEventLeftMouseDragged",
+            "kCGEventRightMouseDragged",
+            "kCGEventOtherMouseDragged",
+        )
+    }
 
 
 def _mac_modifier_action(

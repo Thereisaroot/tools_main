@@ -1,12 +1,13 @@
 import sys
 import threading
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from shooklink.input.backend import PermissionStatus
-from shooklink.input.events import KeyAction, KeyEvent
+from shooklink.input.events import KeyAction, KeyEvent, PointerMotionEvent
 from shooklink.input.macos_backend import MacOSInputBackend
+from shooklink.input.topology import Monitor, Rect
 
 
 @pytest.mark.parametrize(
@@ -55,6 +56,111 @@ def test_macos_injection_requires_capture_and_injection_permissions(
         backend.inject(KeyEvent(KeyAction.DOWN, usage=0x04))
 
     assert backend.pressed_keys == frozenset()
+
+
+def test_macos_suppressed_capture_starts_at_current_monitor_center(monkeypatch):
+    backend = MacOSInputBackend()
+    monkeypatch.setattr(
+        backend,
+        "permission_status",
+        lambda: PermissionStatus(True, True, "ready"),
+    )
+    monkeypatch.setattr(backend, "cursor_position", lambda: (1700, 900))
+    monkeypatch.setattr(
+        backend,
+        "monitors",
+        lambda: (
+            Monitor("left", Rect(0, 0, 1920, 1080)),
+            Monitor("right", Rect(1920, 0, 1920, 1080)),
+        ),
+    )
+    warps = []
+    monkeypatch.setattr(backend, "warp_cursor", lambda x, y: warps.append((x, y)))
+
+    class ImmediateThread:
+        def __init__(self, *, args, **_kwargs):
+            self.generation = args[0]
+
+        def start(self):
+            self.generation.ready.set()
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr("shooklink.input.macos_backend.threading.Thread", ImmediateThread)
+
+    backend.start_capture(
+        lambda _event: None,
+        lambda _action: None,
+        suppress=True,
+    )
+
+    assert warps == [(960, 540)]
+    assert backend._mouse_anchor_position == (960, 540)
+    assert backend._mouse_anchor_rect == Rect(0, 0, 1920, 1080)
+    backend.stop_capture()
+
+
+def test_macos_suppressed_motion_uses_event_location_and_reanchors(monkeypatch):
+    class Quartz:
+        kCGEventSourceUserData = 1
+        kCGEventKeyDown = 2
+        kCGEventKeyUp = 3
+        kCGEventFlagsChanged = 4
+        kCGEventMouseMoved = 5
+        kCGEventLeftMouseDragged = 6
+        kCGEventRightMouseDragged = 7
+        kCGEventOtherMouseDragged = 8
+        kCGEventScrollWheel = 9
+
+        @staticmethod
+        def CGEventGetIntegerValueField(_event, field):
+            assert field == Quartz.kCGEventSourceUserData
+            return 0
+
+        @staticmethod
+        def CGEventGetLocation(event):
+            return SimpleNamespace(x=event[0], y=event[1])
+
+    backend = MacOSInputBackend()
+    backend._capture_suppress = True
+    backend._mouse_anchor_position = (500, 500)
+    backend._mouse_anchor_rect = Rect(0, 0, 1000, 1000)
+    warps = []
+    monkeypatch.setattr(backend, "warp_cursor", lambda x, y: warps.append((x, y)))
+
+    event = backend._normalize_event(Quartz.kCGEventMouseMoved, (504, 497), Quartz)
+    bogus = backend._normalize_event(Quartz.kCGEventMouseMoved, (0, 500), Quartz)
+
+    assert isinstance(event, PointerMotionEvent)
+    assert (event.dx, event.dy) == (4, -3)
+    assert bogus is None
+    assert warps == [(500, 500), (500, 500)]
+
+
+def test_macos_suppressed_mouse_move_is_returned_so_quartz_applies_recenter(
+    monkeypatch,
+):
+    quartz = ModuleType("Quartz")
+    quartz.kCGEventTapDisabledByTimeout = 1
+    quartz.kCGEventTapDisabledByUserInput = 2
+    quartz.kCGEventMouseMoved = 3
+    quartz.CGEventTapEnable = lambda *_args: None
+    monkeypatch.setitem(sys.modules, "Quartz", quartz)
+
+    backend = MacOSInputBackend()
+    backend._capture_running = True
+    backend._capture_suppress = True
+    captured = []
+    backend._capture_callback = captured.append
+    normalized = PointerMotionEvent(3, -2)
+    monkeypatch.setattr(backend, "_normalize_event", lambda *_args: normalized)
+    native_event = object()
+
+    result = backend._tap_callback(None, quartz.kCGEventMouseMoved, native_event, None)
+
+    assert result is native_event
+    assert captured == [normalized]
 
 
 def test_macos_stop_preserves_native_state_when_run_loop_stop_fails(monkeypatch):
@@ -232,7 +338,7 @@ def test_macos_callback_thread_restart_isolated_from_stale_cleanup(monkeypatch):
     )
     for event_type, name in enumerate(event_names, start=1):
         setattr(quartz, name, event_type)
-    quartz.kCGSessionEventTap = 1
+    quartz.kCGHIDEventTap = 1
     quartz.kCGHeadInsertEventTap = 2
     quartz.kCGEventTapOptionDefault = 3
     quartz.kCGEventSourceStateCombinedSessionState = 4
