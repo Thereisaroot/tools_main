@@ -64,8 +64,8 @@ class FakeFileService:
 
 
 class FakeShellService:
-    def __init__(self):
-        self.allowed = False
+    def __init__(self, *, allowed=False):
+        self.allowed = allowed
         self.outputs = []
         self.states = []
         self.opened = []
@@ -87,6 +87,10 @@ class FakeShellService:
 
     def set_allow_remote_shell(self, allowed):
         self.allowed = allowed
+
+    @property
+    def allow_remote_shell(self):
+        return self.allowed
 
     def open_remote(self, *, columns, rows):
         self.opened.append((columns, rows))
@@ -111,11 +115,11 @@ class FakeShellService:
 
 
 class FakeInputService:
-    def __init__(self):
+    def __init__(self, *, allowed=False):
         self.state = InputSessionState.IDLE
         self.peer_side = Side.RIGHT
         self.auto_edge_enabled = False
-        self.allowed = False
+        self.allowed = allowed
         self.listeners = []
         self.emergency_listeners = []
         self.requests = 0
@@ -139,6 +143,10 @@ class FakeInputService:
 
     def set_allow_remote_input(self, allowed):
         self.allowed = allowed
+
+    @property
+    def allow_remote_input(self):
+        return self.allowed
 
     def set_peer_side(self, side):
         self.peer_side = side if isinstance(side, Side) else Side(side)
@@ -597,6 +605,32 @@ def test_input_share_controls_state_and_leave_chat_file_actions_enabled(qtbot, t
 
     qtbot.mouseClick(window.toggle_input_button, Qt.MouseButton.LeftButton)
     assert input_service.stops == ["manual"]
+
+
+def test_authorization_checkboxes_restore_service_state_and_emit_preferences(qtbot):
+    shell = FakeShellService(allowed=True)
+    input_service = FakeInputService(allowed=True)
+    window = MainWindow(
+        ChatService(FakeBus()),
+        None,
+        shell,
+        input_service,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    changes = []
+    window.preferences_changed.connect(lambda: changes.append(True))
+
+    assert window.allow_shell_checkbox.isChecked()
+    assert window.allow_input_checkbox.isChecked()
+    assert window.persistent_preferences()[-2:] == (True, True)
+
+    qtbot.mouseClick(window.allow_shell_checkbox, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window.allow_input_checkbox, Qt.MouseButton.LeftButton)
+
+    assert shell.allowed is False
+    assert input_service.allowed is False
+    assert len(changes) == 2
 
 
 def test_being_controlled_state_is_visible_and_listener_is_removed_on_close(qtbot):

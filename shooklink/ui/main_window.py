@@ -71,6 +71,8 @@ class FileUiService(Protocol):
 
 
 class ShellUiService(Protocol):
+    allow_remote_shell: bool
+
     def add_output_listener(self, listener) -> None: ...
 
     def remove_output_listener(self, listener) -> None: ...
@@ -98,6 +100,7 @@ class InputUiService(Protocol):
     state: InputSessionState
     peer_side: Side
     auto_edge_enabled: bool
+    allow_remote_input: bool
 
     def permission_status(self) -> PermissionStatus: ...
 
@@ -165,6 +168,7 @@ class MainWindow(QMainWindow):
     disconnect_requested = Signal()
     trust_requested = Signal(int, str)
     emergency_exit_requested = Signal()
+    preferences_changed = Signal()
     incoming_message = Signal(object)
     file_progress = Signal(object)
     file_prepared = Signal(object)
@@ -322,7 +326,6 @@ class MainWindow(QMainWindow):
         input_title = QLabel("INPUT SHARE")
         input_title.setObjectName("sectionLabel")
         self.allow_input_checkbox = QCheckBox("Allow Remote Input")
-        self.allow_input_checkbox.toggled.connect(self._set_input_permission)
         peer_side_label = QLabel("PEER SIDE")
         self.peer_side_combo = QComboBox()
         self.peer_side_combo.addItems(["Right", "Left", "Top", "Bottom"])
@@ -353,6 +356,9 @@ class MainWindow(QMainWindow):
         self.auto_edge_checkbox.setEnabled(input_enabled)
         self.toggle_input_button.setEnabled(input_enabled)
         if self._input_service is not None:
+            self.allow_input_checkbox.setChecked(
+                self._input_service.allow_remote_input
+            )
             self.peer_side_combo.setCurrentText(
                 self._input_service.peer_side.value.title()
             )
@@ -365,6 +371,7 @@ class MainWindow(QMainWindow):
             except Exception as error:
                 self.input_permission_status.setText(str(error))
             self._show_input_state(InputStateChange(self._input_service.state))
+        self.allow_input_checkbox.toggled.connect(self._set_input_permission)
         self.peer_side_combo.currentTextChanged.connect(self._set_input_side)
         self.auto_edge_checkbox.toggled.connect(self._set_auto_edge)
         layout.addWidget(input_panel)
@@ -377,7 +384,6 @@ class MainWindow(QMainWindow):
         shell_title = QLabel("REMOTE SHELL")
         shell_title.setObjectName("sectionLabel")
         self.allow_shell_checkbox = QCheckBox("Allow Remote Shell")
-        self.allow_shell_checkbox.toggled.connect(self._set_shell_permission)
         self.open_shell_button = QPushButton("Open Remote Shell")
         self.open_shell_button.clicked.connect(self._open_remote_shell)
         self.terminate_shell_button = QPushButton("Terminate Session")
@@ -394,6 +400,14 @@ class MainWindow(QMainWindow):
         self.allow_shell_checkbox.setEnabled(shell_enabled)
         self.open_shell_button.setEnabled(shell_enabled)
         self.terminate_shell_button.setEnabled(False)
+        if self._shell_service is not None:
+            self.allow_shell_checkbox.setChecked(
+                self._shell_service.allow_remote_shell
+            )
+            self.shell_status.setText(
+                "Armed" if self._shell_service.allow_remote_shell else "Disabled"
+            )
+        self.allow_shell_checkbox.toggled.connect(self._set_shell_permission)
         layout.addWidget(shell_panel)
 
         received_label = QLabel("LAST RECEIVED")
@@ -623,6 +637,7 @@ class MainWindow(QMainWindow):
         self._shell_service.set_allow_remote_shell(allowed)
         if self._active_shell_session is None:
             self.shell_status.setText("Armed" if allowed else "Disabled")
+        self.preferences_changed.emit()
 
     def _set_input_permission(self, allowed: bool) -> None:
         if self._input_service is None:
@@ -631,6 +646,8 @@ class MainWindow(QMainWindow):
             self._input_service.set_allow_remote_input(allowed)
         except Exception as error:
             self.input_status.setText(str(error))
+            return
+        self.preferences_changed.emit()
 
     def _set_input_side(self, label: str) -> None:
         if self._input_service is None:
@@ -642,6 +659,8 @@ class MainWindow(QMainWindow):
             self.peer_side_combo.setCurrentText(
                 self._input_service.peer_side.value.title()
             )
+            return
+        self.preferences_changed.emit()
 
     def _set_auto_edge(self, enabled: bool) -> None:
         if self._input_service is None:
@@ -653,6 +672,8 @@ class MainWindow(QMainWindow):
             self.auto_edge_checkbox.setChecked(
                 self._input_service.auto_edge_enabled
             )
+            return
+        self.preferences_changed.emit()
 
     def _toggle_input_control(self) -> None:
         if self._input_service is None:
@@ -830,7 +851,7 @@ class MainWindow(QMainWindow):
         if port and port in self.available_ports():
             self.port_combo.setCurrentText(port)
 
-    def persistent_preferences(self) -> tuple[str, int, str, bool]:
+    def persistent_preferences(self) -> tuple[str, int, str, bool, bool, bool]:
         try:
             baud_rate = int(self.baud_combo.currentText().strip())
         except ValueError:
@@ -844,11 +865,21 @@ class MainWindow(QMainWindow):
             self._input_service is not None
             and self._input_service.auto_edge_enabled
         )
+        allow_remote_shell = bool(
+            self._shell_service is not None
+            and self._shell_service.allow_remote_shell
+        )
+        allow_input = bool(
+            self._input_service is not None
+            and self._input_service.allow_remote_input
+        )
         return (
             self.port_combo.currentText().strip(),
             baud_rate,
             peer_side,
             auto_edge_enabled,
+            allow_remote_shell,
+            allow_input,
         )
 
     def set_connection_pending(self, port: str) -> None:

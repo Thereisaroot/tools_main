@@ -47,6 +47,8 @@ class SettingsStore:
         peer_side = raw.get("peer_side")
         auto_edge_enabled = raw.get("auto_edge_enabled")
         download_dir = raw.get("download_dir")
+        allow_remote_shell = raw.get("allow_remote_shell")
+        allow_input = raw.get("allow_input")
 
         return AppSettings(
             last_port=last_port if isinstance(last_port, str) else defaults.last_port,
@@ -71,14 +73,20 @@ class SettingsStore:
                 if isinstance(download_dir, str) and download_dir
                 else defaults.download_dir
             ),
-            allow_remote_shell=False,
-            allow_input=False,
+            allow_remote_shell=(
+                allow_remote_shell
+                if isinstance(allow_remote_shell, bool)
+                else defaults.allow_remote_shell
+            ),
+            allow_input=(
+                allow_input
+                if isinstance(allow_input, bool)
+                else defaults.allow_input
+            ),
         )
 
     def save(self, settings: AppSettings) -> None:
         payload = asdict(settings)
-        payload["allow_remote_shell"] = False
-        payload["allow_input"] = False
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None

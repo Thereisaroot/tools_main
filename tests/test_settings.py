@@ -15,7 +15,7 @@ def test_settings_round_trip(tmp_path):
     assert store.load() == expected
 
 
-def test_remote_permissions_never_restore_enabled(tmp_path):
+def test_remote_permissions_restore_enabled(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text(
         json.dumps({"allow_remote_shell": True, "allow_input": True}),
@@ -24,19 +24,30 @@ def test_remote_permissions_never_restore_enabled(tmp_path):
 
     settings = SettingsStore(path).load()
 
-    assert settings.allow_remote_shell is False
-    assert settings.allow_input is False
+    assert settings.allow_remote_shell is True
+    assert settings.allow_input is True
 
 
-def test_active_remote_permissions_are_never_persisted(tmp_path):
+def test_active_remote_permissions_are_persisted(tmp_path):
     path = tmp_path / "settings.json"
     store = SettingsStore(path)
 
     store.save(AppSettings(allow_remote_shell=True, allow_input=True))
 
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert persisted["allow_remote_shell"] is False
-    assert persisted["allow_input"] is False
+    assert persisted["allow_remote_shell"] is True
+    assert persisted["allow_input"] is True
+
+
+@pytest.mark.parametrize("name", ["allow_remote_shell", "allow_input"])
+@pytest.mark.parametrize("invalid", [1, "true", None, [], {}])
+def test_invalid_remote_permission_falls_back_to_disabled(tmp_path, name, invalid):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({name: invalid}), encoding="utf-8")
+
+    settings = SettingsStore(path).load()
+
+    assert getattr(settings, name) is False
 
 
 def test_invalid_peer_side_falls_back_to_default(tmp_path):

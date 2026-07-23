@@ -129,6 +129,7 @@ class ApplicationController(QObject):
         self._window.connect_requested.connect(self._connect_requested)
         self._window.disconnect_requested.connect(self._disconnect_requested)
         self._window.trust_requested.connect(self._trust_requested)
+        self._window.preferences_changed.connect(self._save_preferences)
         self._core.add_state_listener(self._core_listener)
         self._window.set_serial_defaults(
             self._settings.last_port,
@@ -174,6 +175,8 @@ class ApplicationController(QObject):
             peer_side=self._settings.peer_side,
             auto_edge_enabled=self._settings.auto_edge_enabled,
             download_dir=self._settings.download_dir,
+            allow_remote_shell=self._settings.allow_remote_shell,
+            allow_input=self._settings.allow_input,
         )
         self._submit("connect", self._core.connect_port, port, baud_rate)
 
@@ -229,7 +232,14 @@ class ApplicationController(QObject):
 
     def _save_preferences(self) -> None:
         try:
-            port, baud_rate, peer_side, auto_edge_enabled = (
+            (
+                port,
+                baud_rate,
+                peer_side,
+                auto_edge_enabled,
+                allow_remote_shell,
+                allow_input,
+            ) = (
                 self._window.persistent_preferences()
             )
             settings = AppSettings(
@@ -238,10 +248,19 @@ class ApplicationController(QObject):
                 peer_side=peer_side,
                 auto_edge_enabled=auto_edge_enabled,
                 download_dir=self._settings.download_dir,
+                allow_remote_shell=allow_remote_shell,
+                allow_input=allow_input,
             )
             self._settings_store.save(settings)
+            self._settings = settings
         except Exception:
             logger.exception("could not save application settings")
+
+
+def _apply_persisted_authorizations(core, settings: AppSettings) -> None:
+    core.shell.set_allow_remote_shell(settings.allow_remote_shell)
+    if core.input is not None:
+        core.input.set_allow_remote_input(settings.allow_input)
 
 
 def _future_error(future: Future) -> BaseException | None:
@@ -277,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
         auto_edge_enabled=settings.auto_edge_enabled,
         debug=arguments.debug,
     )
+    _apply_persisted_authorizations(core, settings)
     window = MainWindow(
         core.chat,
         file_service=core.files,

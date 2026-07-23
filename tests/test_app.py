@@ -59,6 +59,7 @@ class FakeWindow(QObject):
     connect_requested = Signal(str, int)
     disconnect_requested = Signal()
     trust_requested = Signal(int, str)
+    preferences_changed = Signal()
 
     def __init__(self, ports):
         super().__init__()
@@ -68,7 +69,7 @@ class FakeWindow(QObject):
         self.pending = []
         self.errors = []
         self.operation_errors = []
-        self.preferences = ("COM9", 460800, "left", True)
+        self.preferences = ("COM9", 460800, "left", True, True, True)
 
     def available_ports(self):
         return self._ports
@@ -147,6 +148,52 @@ def test_controller_autoconnects_only_when_saved_port_is_present(qtbot, tmp_path
     assert core.close_calls == 1
     assert executor.shutdown_calls == [(True, True)]
     assert SettingsStore(tmp_path / "settings.json").load().peer_side == "left"
+
+
+def test_controller_saves_authorizations_as_soon_as_preferences_change(tmp_path):
+    store = SettingsStore(tmp_path / "settings.json")
+    core = FakeCore()
+    window = FakeWindow(("COM9",))
+    controller = app.ApplicationController(
+        core,
+        window,
+        store,
+        AppSettings(),
+        executor=ImmediateExecutor(),
+    )
+
+    window.preferences_changed.emit()
+
+    saved = store.load()
+    assert saved.allow_remote_shell is True
+    assert saved.allow_input is True
+    controller.close()
+
+
+def test_persisted_authorizations_are_applied_before_window_creation():
+    class PermissionService:
+        def __init__(self):
+            self.allowed = None
+
+        def set_allow_remote_shell(self, allowed):
+            self.allowed = allowed
+
+        def set_allow_remote_input(self, allowed):
+            self.allowed = allowed
+
+    class Core:
+        shell = PermissionService()
+        input = PermissionService()
+
+    core = Core()
+
+    app._apply_persisted_authorizations(
+        core,
+        AppSettings(allow_remote_shell=True, allow_input=True),
+    )
+
+    assert core.shell.allowed is True
+    assert core.input.allowed is True
 
 
 def test_controller_does_not_autoconnect_a_missing_saved_port(qtbot, tmp_path):
