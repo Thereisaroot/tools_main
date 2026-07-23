@@ -31,6 +31,8 @@ INJECTION_MARKER = 0x53484F4F4B4C4E4B
 _LLKHF_INJECTED = 0x10
 _LLMHF_INJECTED = 0x01
 _WM_SHOOK_MOUSE_MOVE = 0x8000 + 0x51
+_WM_SHOOK_PRE_WARP = 0x8000 + 0x52
+_WM_SHOOK_POST_WARP = 0x8000 + 0x53
 
 _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_KEYUP = 0x0002
@@ -237,6 +239,7 @@ class _WindowsCaptureGeneration:
     mouse_moves: deque[tuple[tuple[int, int], bool, bool]] = field(
         default_factory=deque
     )
+    discard_mouse_moves_until_post_warp: bool = False
 
 
 def windows_key_to_usage(virtual_key: int, scan_code: int, extended: bool) -> int:
@@ -686,16 +689,26 @@ class WindowsInputBackend(BaseInputBackend):
         generation: _WindowsCaptureGeneration,
         message: int,
     ) -> bool:
+        if message == _WM_SHOOK_PRE_WARP:
+            generation.discard_mouse_moves_until_post_warp = True
+            return True
+        if message == _WM_SHOOK_POST_WARP:
+            generation.discard_mouse_moves_until_post_warp = False
+            return True
         if message != _WM_SHOOK_MOUSE_MOVE:
             return False
         if not generation.mouse_moves:
             return True
         position, injected, self_injected = generation.mouse_moves.popleft()
-        if self._hook_generation is generation:
+        if (
+            self._hook_generation is generation
+            and not generation.discard_mouse_moves_until_post_warp
+        ):
             self._process_suppressed_mouse_move(
                 position,
                 injected,
                 self_injected,
+                generation=generation,
             )
         return True
 
@@ -704,6 +717,8 @@ class WindowsInputBackend(BaseInputBackend):
         position: tuple[int, int],
         injected: bool,
         self_injected: bool,
+        *,
+        generation: _WindowsCaptureGeneration | None = None,
     ) -> None:
         anchor = self._mouse_anchor_position
         if anchor is None:
@@ -714,13 +729,38 @@ class WindowsInputBackend(BaseInputBackend):
             self._mouse_anchor_rect,
         )
         if position != anchor:
-            try:
-                self._get_api().set_cursor_position(*anchor)
-            except OSError:
-                self._mouse_anchor_position = position
-                self._last_mouse_position = position
-            else:
-                self._last_mouse_position = anchor
+            api = self._get_api()
+            pre_warp_posted = False
+            if generation is not None:
+                try:
+                    api.post_thread_message(
+                        generation.thread_id,
+                        _WM_SHOOK_PRE_WARP,
+                    )
+                except OSError:
+                    self._mouse_anchor_position = position
+                    self._last_mouse_position = position
+                else:
+                    pre_warp_posted = True
+            should_warp = generation is None or pre_warp_posted
+            if should_warp:
+                try:
+                    api.set_cursor_position(*anchor)
+                except OSError:
+                    self._mouse_anchor_position = position
+                    self._last_mouse_position = position
+                else:
+                    self._last_mouse_position = anchor
+                finally:
+                    if generation is not None and pre_warp_posted:
+                        try:
+                            api.post_thread_message(
+                                generation.thread_id,
+                                _WM_SHOOK_POST_WARP,
+                            )
+                        except OSError:
+                            generation.mouse_moves.clear()
+                            generation.discard_mouse_moves_until_post_warp = False
         else:
             self._last_mouse_position = anchor
         if delta is not None:

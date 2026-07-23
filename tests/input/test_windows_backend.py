@@ -496,6 +496,7 @@ def test_windows_hook_callback_defers_suppressed_motion_until_after_return():
         mouse_hook="mouse",
         thread_id=99,
         mouse_moves=deque(),
+        discard_mouse_moves_until_post_warp=False,
     )
     backend = CallbackBackend()
     api = MouseApi()
@@ -525,6 +526,9 @@ def test_windows_hook_callback_defers_suppressed_motion_until_after_return():
     assert handled is True
     assert [(event.dx, event.dy) for event in captured] == [(4, 0)]
     assert api.warps == [(500, 500)]
+    assert len(api.posts) == 3
+    backend._handle_hook_thread_message(generation, api.posts[1][1])
+    backend._handle_hook_thread_message(generation, api.posts[2][1])
 
     anchor_event = SimpleNamespace(
         pt=SimpleNamespace(x=500, y=500),
@@ -542,6 +546,193 @@ def test_windows_hook_callback_defers_suppressed_motion_until_after_return():
 
     assert [(event.dx, event.dy) for event in captured] == [(4, 0)]
     assert api.warps == [(500, 500)]
+
+
+def test_windows_warp_generated_motion_is_discarded_before_edge_logic():
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            assert suppress is True
+            self._mouse_anchor_position = (500, 500)
+            self._last_mouse_position = (500, 500)
+
+        def _stop_native_capture(self):
+            pass
+
+    class MouseApi:
+        def __init__(self):
+            self.posts = []
+            self.warps = []
+            self.emitted_warp_motion = False
+
+        def mouse_data(self, pointer):
+            return pointer
+
+        def post_thread_message(self, thread_id, message, wparam=0, lparam=0):
+            self.posts.append((thread_id, message, wparam, lparam))
+
+        def set_cursor_position(self, x, y):
+            self.warps.append((x, y))
+            if self.emitted_warp_motion:
+                return
+            self.emitted_warp_motion = True
+            warp_motion = SimpleNamespace(
+                pt=SimpleNamespace(x=496, y=500),
+                mouseData=0,
+                flags=0,
+                dwExtraInfo=0,
+            )
+            backend._mouse_callback(
+                0,
+                0x0200,
+                warp_motion,
+                _generation=generation,
+            )
+
+        def call_next(self, *_args):
+            return 77
+
+    physical_motion = SimpleNamespace(
+        pt=SimpleNamespace(x=504, y=500),
+        mouseData=0,
+        flags=0,
+        dwExtraInfo=0,
+    )
+    generation = SimpleNamespace(
+        mouse_hook="mouse",
+        thread_id=99,
+        mouse_moves=deque(),
+        discard_mouse_moves_until_post_warp=False,
+    )
+    backend = CallbackBackend()
+    api = MouseApi()
+    backend._api = api
+    backend._hook_generation = generation
+    captured = []
+    backend.start_capture(captured.append, lambda _action: None, suppress=True)
+
+    backend._mouse_callback(
+        0,
+        0x0200,
+        physical_motion,
+        _generation=generation,
+    )
+    while api.posts:
+        _thread_id, message, _wparam, _lparam = api.posts.pop(0)
+        backend._handle_hook_thread_message(generation, message)
+
+    assert [(event.dx, event.dy) for event in captured] == [(4, 0)]
+    assert api.warps == [(500, 500)]
+
+
+def test_windows_physical_motion_queued_before_pre_warp_is_preserved():
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            assert suppress is True
+            self._mouse_anchor_position = (500, 500)
+            self._last_mouse_position = (500, 500)
+
+        def _stop_native_capture(self):
+            pass
+
+    class MouseApi:
+        def __init__(self):
+            self.posts = []
+
+        def mouse_data(self, pointer):
+            return pointer
+
+        def post_thread_message(self, thread_id, message, wparam=0, lparam=0):
+            self.posts.append((thread_id, message, wparam, lparam))
+
+        def set_cursor_position(self, _x, _y):
+            pass
+
+        def call_next(self, *_args):
+            return 77
+
+    def movement(x):
+        return SimpleNamespace(
+            pt=SimpleNamespace(x=x, y=500),
+            mouseData=0,
+            flags=0,
+            dwExtraInfo=0,
+        )
+
+    generation = SimpleNamespace(
+        mouse_hook="mouse",
+        thread_id=99,
+        mouse_moves=deque(),
+        discard_mouse_moves_until_post_warp=False,
+    )
+    backend = CallbackBackend()
+    api = MouseApi()
+    backend._api = api
+    backend._hook_generation = generation
+    captured = []
+    backend.start_capture(captured.append, lambda _action: None, suppress=True)
+
+    backend._mouse_callback(
+        0,
+        0x0200,
+        movement(504),
+        _generation=generation,
+    )
+    backend._mouse_callback(
+        0,
+        0x0200,
+        movement(505),
+        _generation=generation,
+    )
+    while api.posts:
+        _thread_id, message, _wparam, _lparam = api.posts.pop(0)
+        backend._handle_hook_thread_message(generation, message)
+
+    assert [(event.dx, event.dy) for event in captured] == [(4, 0), (5, 0)]
+
+
+def test_windows_failed_warp_still_closes_discard_window():
+    class CallbackBackend(WindowsInputBackend):
+        def _start_native_capture(self, suppress):
+            assert suppress is True
+            self._mouse_anchor_position = (500, 500)
+            self._last_mouse_position = (500, 500)
+
+        def _stop_native_capture(self):
+            pass
+
+    class MouseApi:
+        def __init__(self):
+            self.posts = []
+
+        def post_thread_message(self, thread_id, message, wparam=0, lparam=0):
+            self.posts.append((thread_id, message, wparam, lparam))
+
+        def set_cursor_position(self, _x, _y):
+            raise OSError("warp failed")
+
+    generation = SimpleNamespace(
+        thread_id=99,
+        mouse_moves=deque(),
+        discard_mouse_moves_until_post_warp=False,
+    )
+    backend = CallbackBackend()
+    api = MouseApi()
+    backend._api = api
+    backend._hook_generation = generation
+    captured = []
+    backend.start_capture(captured.append, lambda _action: None, suppress=True)
+
+    backend._process_suppressed_mouse_move(
+        (504, 500),
+        False,
+        False,
+        generation=generation,
+    )
+    for _thread_id, message, _wparam, _lparam in api.posts:
+        backend._handle_hook_thread_message(generation, message)
+
+    assert [(event.dx, event.dy) for event in captured] == [(4, 0)]
+    assert generation.discard_mouse_moves_until_post_warp is False
 
 
 def test_windows_suppressed_capture_drops_anchor_and_bogus_warp_events():
