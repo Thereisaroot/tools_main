@@ -19,15 +19,35 @@ def test_internal_seam_is_not_an_outer_edge():
     assert not topology.is_on_outer_edge(Side.LEFT, 1920, 500)
 
 
-def test_right_edge_exists_only_over_extreme_monitor_span():
+def test_right_edge_follows_exposed_stair_step_monitor_spans():
     topology = staggered_topology()
 
     assert topology.edge_segments(Side.RIGHT) == (
+        EdgeSegment(Side.RIGHT, 1919, 0, 200),
         EdgeSegment(Side.RIGHT, 3199, 200, 1224),
     )
     assert topology.is_on_outer_edge(Side.RIGHT, 3199, 500)
     assert not topology.is_on_outer_edge(Side.RIGHT, 3199, 100)
-    assert not topology.is_on_outer_edge(Side.RIGHT, 1919, 100)
+    assert topology.is_on_outer_edge(Side.RIGHT, 1919, 100)
+
+
+def test_all_sides_follow_the_outer_skyline_without_internal_seams():
+    topology = staggered_topology()
+
+    assert topology.edge_segments(Side.LEFT) == (
+        EdgeSegment(Side.LEFT, 0, 0, 1080),
+        EdgeSegment(Side.LEFT, 1920, 1080, 1224),
+    )
+    assert topology.edge_segments(Side.TOP) == (
+        EdgeSegment(Side.TOP, 0, 0, 1920),
+        EdgeSegment(Side.TOP, 200, 1920, 3200),
+    )
+    assert topology.edge_segments(Side.BOTTOM) == (
+        EdgeSegment(Side.BOTTOM, 1079, 0, 1920),
+        EdgeSegment(Side.BOTTOM, 1223, 1920, 3200),
+    )
+    assert not topology.is_on_outer_edge(Side.RIGHT, 1919, 500)
+    assert not topology.is_on_outer_edge(Side.LEFT, 1920, 500)
 
 
 def test_negative_coordinate_monitors_are_supported():
@@ -41,9 +61,11 @@ def test_negative_coordinate_monitors_are_supported():
     assert topology.contains(-1279, -199)
     assert topology.edge_segments(Side.LEFT) == (
         EdgeSegment(Side.LEFT, -1280, -200, 824),
+        EdgeSegment(Side.LEFT, 0, 824, 1080),
     )
     assert topology.edge_segments(Side.TOP) == (
         EdgeSegment(Side.TOP, -200, -1280, 0),
+        EdgeSegment(Side.TOP, 0, 0, 1920),
     )
 
 

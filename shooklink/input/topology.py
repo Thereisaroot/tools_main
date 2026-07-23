@@ -190,53 +190,49 @@ class Topology:
         return source.rect.clamp_point(target_x, target_y)
 
     def _build_edge_segments(self, side: Side) -> tuple[EdgeSegment, ...]:
-        if side is Side.LEFT:
-            boundary = min(monitor.rect.x for monitor in self.monitors)
-            spans = [
-                (monitor.rect.y, monitor.rect.bottom)
+        vertical = side in (Side.LEFT, Side.RIGHT)
+        boundaries = sorted(
+            {
+                value
                 for monitor in self.monitors
-                if monitor.rect.x == boundary
-            ]
-            coordinate = boundary
-        elif side is Side.RIGHT:
-            boundary = max(monitor.rect.right for monitor in self.monitors)
-            spans = [
-                (monitor.rect.y, monitor.rect.bottom)
-                for monitor in self.monitors
-                if monitor.rect.right == boundary
-            ]
-            coordinate = boundary - 1
-        elif side is Side.TOP:
-            boundary = min(monitor.rect.y for monitor in self.monitors)
-            spans = [
-                (monitor.rect.x, monitor.rect.right)
-                for monitor in self.monitors
-                if monitor.rect.y == boundary
-            ]
-            coordinate = boundary
-        else:
-            boundary = max(monitor.rect.bottom for monitor in self.monitors)
-            spans = [
-                (monitor.rect.x, monitor.rect.right)
-                for monitor in self.monitors
-                if monitor.rect.bottom == boundary
-            ]
-            coordinate = boundary - 1
-        merged = _merge_spans(spans)
-        return tuple(
-            EdgeSegment(side, coordinate, start, end)
-            for start, end in merged
+                for value in (
+                    (monitor.rect.y, monitor.rect.bottom)
+                    if vertical
+                    else (monitor.rect.x, monitor.rect.right)
+                )
+            }
         )
-
-
-def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[list[int]] = []
-    for start, end in sorted(spans):
-        if not merged or start > merged[-1][1]:
-            merged.append([start, end])
-        else:
-            merged[-1][1] = max(merged[-1][1], end)
-    return [(start, end) for start, end in merged]
+        segments: list[EdgeSegment] = []
+        for start, end in zip(boundaries, boundaries[1:]):
+            candidates = [
+                monitor.rect
+                for monitor in self.monitors
+                if (
+                    monitor.rect.y <= start and end <= monitor.rect.bottom
+                    if vertical
+                    else monitor.rect.x <= start and end <= monitor.rect.right
+                )
+            ]
+            if not candidates:
+                continue
+            if side is Side.LEFT:
+                coordinate = min(rect.x for rect in candidates)
+            elif side is Side.RIGHT:
+                coordinate = max(rect.right for rect in candidates) - 1
+            elif side is Side.TOP:
+                coordinate = min(rect.y for rect in candidates)
+            else:
+                coordinate = max(rect.bottom for rect in candidates) - 1
+            if (
+                segments
+                and segments[-1].coordinate == coordinate
+                and segments[-1].end == start
+            ):
+                previous = segments[-1]
+                segments[-1] = EdgeSegment(side, coordinate, previous.start, end)
+            else:
+                segments.append(EdgeSegment(side, coordinate, start, end))
+        return tuple(segments)
 
 
 __all__ = ["EdgeSegment", "Monitor", "Rect", "Side", "Topology"]
