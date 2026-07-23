@@ -114,17 +114,24 @@ computer that will execute the shell:
 3. Use `Terminate Session`, disable `Allow Remote Shell`, disconnect, or quit to
    stop the child process.
 
-`Allow Remote Shell` is off by default and is never restored as enabled on the
-next launch. A peer cannot enable it remotely. Only one shell session per peer is
-accepted, and all shell input and output is encrypted. macOS hosts the user's
-login shell; Windows hosts PowerShell and falls back to `cmd.exe` when needed.
+`Allow Remote Shell` is off by default. Its local checkbox state is saved and
+restored on the next launch; a peer still cannot enable it remotely. Only one
+shell session per peer is accepted, and all shell input and output is encrypted.
+macOS hosts the user's login shell; Windows hosts PowerShell and falls back to
+`cmd.exe` when needed.
 
 ## Keyboard and Mouse Sharing
 
 Enable `Allow Remote Input` on the computer that may be controlled. Choose which
 side of the local desktop touches the peer, then use `Toggle Remote Control` or
-enable `Auto Edge Toggle`. Input permission is local, requires trust, and is not
-restored as enabled on restart.
+enable `Auto Edge (This Computer -> Peer)`. Input permission is local, requires
+trust, and its local checkbox state is restored on restart.
+
+Auto edge is a controller-side option. To use one computer's physical mouse to
+enter the peer and return, enable auto edge only on that controller; the peer
+only needs `Allow Remote Input`. To let either computer initiate from its own
+physical mouse, enable auto edge on both and configure mirrored sides, such as
+`Right` on one computer and `Left` on the other.
 
 While input capture is active, these local emergency shortcuts are consumed
 before they can be sent to the peer:

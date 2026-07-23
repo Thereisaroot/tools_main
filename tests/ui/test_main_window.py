@@ -633,6 +633,19 @@ def test_authorization_checkboxes_restore_service_state_and_emit_preferences(qtb
     assert len(changes) == 2
 
 
+def test_auto_edge_control_explains_its_local_direction(qtbot):
+    window = MainWindow(
+        ChatService(FakeBus()),
+        None,
+        None,
+        FakeInputService(),
+    )
+    qtbot.addWidget(window)
+
+    assert "This Computer -> Peer" in window.auto_edge_checkbox.text()
+    assert "Return works" in window.auto_edge_checkbox.toolTip()
+
+
 def test_being_controlled_state_is_visible_and_listener_is_removed_on_close(qtbot):
     input_service = FakeInputService()
     window = MainWindow(ChatService(FakeBus()), None, None, input_service)
