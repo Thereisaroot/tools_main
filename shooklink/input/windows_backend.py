@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,6 +30,7 @@ from shooklink.input.topology import Monitor, Rect
 INJECTION_MARKER = 0x53484F4F4B4C4E4B
 _LLKHF_INJECTED = 0x10
 _LLMHF_INJECTED = 0x01
+_WM_SHOOK_MOUSE_MOVE = 0x8000 + 0x51
 
 _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_KEYUP = 0x0002
@@ -232,6 +234,9 @@ class _WindowsCaptureGeneration:
     mouse_hook: Any = None
     keyboard_callback_ref: Any = None
     mouse_callback_ref: Any = None
+    mouse_moves: deque[tuple[tuple[int, int], bool, bool]] = field(
+        default_factory=deque
+    )
 
 
 def windows_key_to_usage(virtual_key: int, scan_code: int, extended: bool) -> int:
@@ -495,7 +500,12 @@ class WindowsInputBackend(BaseInputBackend):
             )
             self._publish_hook_generation(generation)
             generation.ready.set()
-            api.message_loop()
+            api.message_loop(
+                lambda message, _wparam, _lparam: self._handle_hook_thread_message(
+                    generation,
+                    message,
+                )
+            )
         except BaseException as error:
             generation.error = error
             self._publish_hook_generation(generation)
@@ -598,6 +608,23 @@ class WindowsInputBackend(BaseInputBackend):
                 if self._capture_suppress
                 else None
             )
+            if anchor is not None and _generation is not None:
+                _generation.mouse_moves.append(
+                    (position, injected, self_injected)
+                )
+                try:
+                    api.post_thread_message(
+                        _generation.thread_id,
+                        _WM_SHOOK_MOUSE_MOVE,
+                    )
+                except OSError:
+                    _generation.mouse_moves.pop()
+                    self._process_suppressed_mouse_move(
+                        position,
+                        injected,
+                        self_injected,
+                    )
+                return 1
             previous = anchor or self._last_mouse_position or position
             delta = (
                 _anchored_pointer_delta(
@@ -653,6 +680,57 @@ class WindowsInputBackend(BaseInputBackend):
         elif message == 0x0200 and self._capture_suppress:
             return 1
         return api.call_next(hook, code, message, pointer)
+
+    def _handle_hook_thread_message(
+        self,
+        generation: _WindowsCaptureGeneration,
+        message: int,
+    ) -> bool:
+        if message != _WM_SHOOK_MOUSE_MOVE:
+            return False
+        if not generation.mouse_moves:
+            return True
+        position, injected, self_injected = generation.mouse_moves.popleft()
+        if self._hook_generation is generation:
+            self._process_suppressed_mouse_move(
+                position,
+                injected,
+                self_injected,
+            )
+        return True
+
+    def _process_suppressed_mouse_move(
+        self,
+        position: tuple[int, int],
+        injected: bool,
+        self_injected: bool,
+    ) -> None:
+        anchor = self._mouse_anchor_position
+        if anchor is None:
+            return
+        delta = _anchored_pointer_delta(
+            position,
+            anchor,
+            self._mouse_anchor_rect,
+        )
+        if position != anchor:
+            try:
+                self._get_api().set_cursor_position(*anchor)
+            except OSError:
+                self._mouse_anchor_position = position
+                self._last_mouse_position = position
+            else:
+                self._last_mouse_position = anchor
+        else:
+            self._last_mouse_position = anchor
+        if delta is not None:
+            self.emit_captured(
+                PointerMotionEvent(
+                    *delta,
+                    injected=injected,
+                    self_injected=self_injected,
+                )
+            )
 
     def _initialize_modifier_state(self, api) -> None:
         self._modifier_keys_down = {
@@ -966,11 +1044,26 @@ class _Win32Api:
         if not self.user32.PostThreadMessageW(thread_id, 0x0012, 0, 0):
             raise self.ctypes.WinError(self.ctypes.get_last_error())
 
+    def post_thread_message(
+        self,
+        thread_id: int,
+        message: int,
+        wparam: int = 0,
+        lparam: int = 0,
+    ) -> None:
+        if not self.user32.PostThreadMessageW(
+            thread_id,
+            message,
+            wparam,
+            lparam,
+        ):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+
     def ensure_message_queue(self) -> None:
         message = self.Message()
         self.user32.PeekMessageW(self.ctypes.byref(message), None, 0, 0, 0)
 
-    def message_loop(self) -> None:
+    def message_loop(self, on_message=None) -> None:
         message = self.Message()
         while True:
             result = self.user32.GetMessageW(
@@ -983,6 +1076,12 @@ class _Win32Api:
                 raise self.ctypes.WinError(self.ctypes.get_last_error())
             if result == 0:
                 return
+            if on_message is not None and on_message(
+                int(message.message),
+                int(message.wParam),
+                int(message.lParam),
+            ):
+                continue
             self.user32.TranslateMessage(self.ctypes.byref(message))
             self.user32.DispatchMessageW(self.ctypes.byref(message))
 
