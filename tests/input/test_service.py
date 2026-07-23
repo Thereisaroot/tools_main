@@ -17,6 +17,7 @@ from shooklink.input.events import (
     PointerPositionEvent,
 )
 from shooklink.input.service import (
+    EDGE_HOLD_SECONDS,
     MOTION_INTERVAL_SECONDS,
     InputService,
     InputSessionState,
@@ -164,6 +165,36 @@ class FakeBackend(BaseInputBackend):
     def emergency_exit(self):
         assert self.emergency_callback is not None
         self.emergency_callback("exit")
+
+
+class ManualTimer:
+    def __init__(self, delay, callback):
+        self.delay = delay
+        self.callback = callback
+        self.daemon = False
+        self.started = False
+        self.cancelled = False
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        self.callback()
+
+
+def install_manual_timers(monkeypatch):
+    timers = []
+
+    def factory(delay, callback):
+        timer = ManualTimer(delay, callback)
+        timers.append(timer)
+        return timer
+
+    monkeypatch.setattr("shooklink.input.service.threading.Timer", factory)
+    return timers
 
 
 def monitors_metadata(*rectangles):
@@ -832,7 +863,10 @@ def test_emergency_exit_is_available_during_idle_auto_edge_capture():
     ]
 
 
-def test_auto_edge_hold_enters_and_remote_return_edge_leaves_without_dead_space():
+def test_auto_edge_hold_enters_and_remote_return_edge_leaves_without_dead_space(
+    monkeypatch,
+):
+    timers = install_manual_timers(monkeypatch)
     clock = FakeClock(20.0)
     bus = FakeBus()
     backend = FakeBackend(position=(99, 50))
@@ -849,8 +883,10 @@ def test_auto_edge_hold_enters_and_remote_return_edge_leaves_without_dead_space(
     assert backend.capture_starts == [False]
 
     backend.capture(PointerMotionEvent(2, 0))
-    clock.value += 0.51
-    backend.capture(PointerMotionEvent(1, 0))
+    assert len(timers) == 1
+    assert timers[0].delay == EDGE_HOLD_SECONDS
+    assert timers[0].started is True
+    timers[0].fire()
 
     assert service.state is InputSessionState.REQUESTING
     assert backend.capture_running is False
@@ -872,6 +908,57 @@ def test_auto_edge_hold_enters_and_remote_return_edge_leaves_without_dead_space(
     ]
     assert all(item[2] is Priority.INTERACTIVE for item in bus.sent)
     assert backend.capture_starts[-1] is False
+
+
+def test_auto_edge_timer_survives_zero_motion_but_cancels_after_leaving_edge(
+    monkeypatch,
+):
+    timers = install_manual_timers(monkeypatch)
+    backend = FakeBackend(position=(99, 50))
+    service = InputService(
+        FakeBus(),
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        peer_side=Side.RIGHT,
+    )
+    service.set_auto_edge_enabled(True)
+
+    backend.capture(PointerMotionEvent(1, 0))
+    timer = timers[-1]
+    backend.capture(PointerMotionEvent(0, 0))
+
+    assert timer.cancelled is False
+
+    backend.position = (98, 50)
+    backend.capture(PointerMotionEvent(-1, 0))
+    assert timer.cancelled is True
+
+    timer.fire()
+    assert service.state is InputSessionState.IDLE
+
+
+def test_auto_edge_timer_is_cancelled_on_disconnect_and_cannot_fire_stale(
+    monkeypatch,
+):
+    timers = install_manual_timers(monkeypatch)
+    backend = FakeBackend(position=(99, 50))
+    service = InputService(
+        FakeBus(),
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        peer_side=Side.RIGHT,
+    )
+    service.set_auto_edge_enabled(True)
+    backend.capture(PointerMotionEvent(1, 0))
+    timer = timers[-1]
+
+    service.disconnect()
+
+    assert timer.cancelled is True
+    timer.fire()
+    assert service.state is InputSessionState.IDLE
 
 
 def test_auto_edge_setting_rolls_back_when_idle_capture_cannot_start():

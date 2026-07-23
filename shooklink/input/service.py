@@ -151,7 +151,7 @@ class InputService:
         self._next_motion_sequence = 1
         self._last_motion_sequence = 0
         self._last_received_motion_sequence = 0
-        self._edge_hold_started_at: float | None = None
+        self._edge_timer: threading.Timer | None = None
         self._motion_timer: threading.Timer | None = None
         self._state_listeners: list[Callable[[InputStateChange], None]] = []
         self._emergency_listeners: list[Callable[[str], None]] = []
@@ -371,6 +371,7 @@ class InputService:
     def disconnect(self) -> None:
         with self._lock:
             self._connected = False
+            self._reset_edge_hold_locked()
         self._finish_session(reason="disconnected", send_remote=False)
         self._stop_capture_if_running()
 
@@ -382,6 +383,7 @@ class InputService:
             self._connected = False
             self._auto_edge_enabled = False
             self._allow_remote_input = False
+            self._reset_edge_hold_locked()
         try:
             self._finish_session(reason="closed", send_remote=False)
         except Exception:
@@ -856,22 +858,14 @@ class InputService:
         position = self._backend.cursor_position()
         outward = _moves_outward(side, event.dx, event.dy)
         at_edge = topology.is_on_outer_edge(side, *position)
-        now = self._clock()
-        trigger = False
         with self._lock:
-            if not outward or not at_edge:
+            if not at_edge:
                 self._reset_edge_hold_locked()
                 return
-            if self._edge_hold_started_at is None:
-                self._edge_hold_started_at = now
-            elif now - self._edge_hold_started_at >= EDGE_HOLD_SECONDS:
+            if outward:
+                self._start_edge_timer_locked(side)
+            elif _moves_inward(side, event.dx, event.dy):
                 self._reset_edge_hold_locked()
-                trigger = True
-        if trigger:
-            try:
-                self._request_control(enter_from_edge=True)
-            except InputUnavailable:
-                pass
 
     def _captured_controlling_event(self, event: InputEvent) -> None:
         with self._lock:
@@ -1257,7 +1251,49 @@ class InputService:
         )
 
     def _reset_edge_hold_locked(self) -> None:
-        self._edge_hold_started_at = None
+        timer = self._edge_timer
+        self._edge_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _start_edge_timer_locked(self, side: Side) -> None:
+        if self._edge_timer is not None:
+            return
+        timer = threading.Timer(
+            EDGE_HOLD_SECONDS,
+            lambda: self._edge_timer_elapsed(timer, side),
+        )
+        timer.daemon = True
+        self._edge_timer = timer
+        timer.start()
+
+    def _edge_timer_elapsed(self, timer: threading.Timer, side: Side) -> None:
+        with self._lock:
+            if self._edge_timer is not timer:
+                return
+            self._edge_timer = None
+            eligible = (
+                not self._closed
+                and self._connected
+                and self._bus.trusted
+                and self._auto_edge_enabled
+                and self._state is InputSessionState.IDLE
+                and self._session_id is None
+                and self._peer_side is side
+            )
+        if not eligible:
+            return
+        try:
+            topology = self._local_topology()
+            position = self._backend.cursor_position()
+        except (InputUnavailable, OSError, TypeError, ValueError):
+            return
+        if not topology.is_on_outer_edge(side, *position):
+            return
+        try:
+            self._request_control(enter_from_edge=True)
+        except InputUnavailable:
+            pass
 
     def _notify_state(self, change: InputStateChange) -> None:
         with self._lock:
@@ -1385,6 +1421,10 @@ def _moves_outward(side: Side, dx: int, dy: int) -> bool:
         Side.TOP: dy < 0,
         Side.BOTTOM: dy > 0,
     }[side]
+
+
+def _moves_inward(side: Side, dx: int, dy: int) -> bool:
+    return _moves_outward(side.opposite, dx, dy)
 
 
 def _encode_key(session_id: str, event: KeyEvent) -> dict[str, Any]:
