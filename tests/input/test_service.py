@@ -816,6 +816,37 @@ def test_manual_and_emergency_stop_release_remote_session():
     ]
 
 
+def test_capture_stop_ignores_native_tail_event_before_idle_rearm(monkeypatch):
+    timers = install_manual_timers(monkeypatch)
+
+    class TailEventBackend(FakeBackend):
+        def _stop_native_capture(self):
+            super()._stop_native_capture()
+            self.emit_captured(PointerMotionEvent(1, 0))
+
+    bus = FakeBus()
+    backend = TailEventBackend(position=(99, 50))
+    service = InputService(
+        bus,
+        backend,
+        local_peer_id="peer-a",
+        peer_id="peer-b",
+        peer_side=Side.RIGHT,
+        auto_edge_enabled=True,
+        session_factory=lambda: LOCAL_SESSION,
+    )
+    session_id = service.request_control()
+    assert service.handle_message(input_accept(session_id))
+    timers.clear()
+
+    service.stop_control(reason="manual")
+
+    assert service.state is InputSessionState.IDLE
+    assert backend.capture_running is True
+    assert backend.capture_starts[-1] is False
+    assert timers == []
+
+
 def test_emergency_exit_releases_session_and_notifies_local_application():
     service, bus, backend, _session_id = start_controlling()
     exits = []

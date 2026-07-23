@@ -134,6 +134,7 @@ class InputService:
         self._session_factory = session_factory
         self._lock = threading.RLock()
         self._capture_transition_lock = threading.RLock()
+        self._capture_transition_depth = 0
         self._state = InputSessionState.IDLE
         self._session_id: str | None = None
         self._allow_remote_input = False
@@ -851,6 +852,8 @@ class InputService:
     def _captured_event(self, event: InputEvent) -> None:
         try:
             with self._lock:
+                if self._capture_transition_depth:
+                    return
                 state = self._state
             if state is InputSessionState.IDLE:
                 self._captured_idle_event(event)
@@ -1192,29 +1195,42 @@ class InputService:
                 )
                 running = self._backend.capture_running
             if should_capture and not running:
-                self._backend.start_capture(
-                    self._captured_event,
-                    self._emergency_stop,
-                    suppress=False,
+                self._perform_capture_transition(
+                    lambda: self._backend.start_capture(
+                        self._captured_event,
+                        self._emergency_stop,
+                        suppress=False,
+                    )
                 )
             elif not should_capture and running:
-                self._backend.stop_capture()
+                self._perform_capture_transition(self._backend.stop_capture)
 
     def _refresh_idle_capture_if_idle(self) -> None:
         self._refresh_idle_capture()
 
     def _start_capture(self, on_event, on_emergency, *, suppress: bool) -> None:
-        with self._capture_transition_lock:
-            self._backend.start_capture(
+        self._perform_capture_transition(
+            lambda: self._backend.start_capture(
                 on_event,
                 on_emergency,
                 suppress=suppress,
             )
+        )
 
     def _stop_capture_if_running(self) -> None:
         with self._capture_transition_lock:
             if self._backend.capture_running:
-                self._backend.stop_capture()
+                self._perform_capture_transition(self._backend.stop_capture)
+
+    def _perform_capture_transition(self, operation: Callable[[], None]) -> None:
+        with self._capture_transition_lock:
+            with self._lock:
+                self._capture_transition_depth += 1
+            try:
+                operation()
+            finally:
+                with self._lock:
+                    self._capture_transition_depth -= 1
 
     def _require_being_controlled(self, session_id: str) -> None:
         with self._lock:
