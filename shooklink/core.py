@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from collections import deque
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from shooklink.input.backend import BaseInputBackend
 from shooklink.input.service import InputService
 from shooklink.input.topology import Side
 from shooklink.protocol.crypto import (
+    HandshakeError,
     Identity,
     SecureSession,
     TrustStatus,
@@ -101,6 +103,10 @@ class _Connection:
     input_bound: bool = False
     local_hello_sent: bool = False
     remote_hello_received: bool = False
+    remote_hello_body: bytes | None = None
+    retired_remote_hellos: deque[bytes] = field(
+        default_factory=lambda: deque(maxlen=16)
+    )
     handshake_timer: threading.Timer | None = None
     hello_attempts: int = 0
     plain_receive_sequences: dict[int, int] = field(default_factory=dict)
@@ -743,7 +749,7 @@ class ShookLinkCore:
         message = decode_message(payload)
         if message is None or message.message_type is not message_type:
             return
-        if not secure:
+        if not secure and message_type is not MessageType.HELLO:
             with self._lock:
                 connection = self._connection
                 if connection is None or connection.connection_id != connection_id:
@@ -786,15 +792,79 @@ class ShookLinkCore:
                 return
             duplicate = connection.remote_hello_received
             secure_session = connection.secure_session
-        secure_session.receive_hello(message.body)
+        try:
+            secure_session.receive_hello(message.body)
+        except HandshakeError:
+            if not duplicate:
+                raise
+            replacement = SecureSession(self.identity)
+            replacement.receive_hello(message.body)
+            self._restart_peer_session(
+                connection_id,
+                replacement,
+                message.body,
+            )
+            return
         with self._lock:
             connection = self._connection
             if connection is None or connection.connection_id != connection_id:
                 return
             connection.remote_hello_received = True
+            connection.remote_hello_body = message.body
             send_trust = connection.local_hello_sent
         if send_trust:
             self._send_trust(connection_id, force=duplicate)
+
+    def _restart_peer_session(
+        self,
+        connection_id: int,
+        secure_session: SecureSession,
+        remote_hello: bytes,
+    ) -> None:
+        remote_fingerprint = secure_session.remote_fingerprint
+        if remote_fingerprint is None:
+            raise HandshakeError("replacement handshake has no peer identity")
+        with self._lock:
+            connection = self._connection
+            if connection is None or connection.connection_id != connection_id:
+                return
+            expected_fingerprint = connection.secure_session.remote_fingerprint
+            if (
+                expected_fingerprint is not None
+                and remote_fingerprint != expected_fingerprint
+            ):
+                raise HandshakeError("peer identity changed during reconnect")
+            if remote_hello in connection.retired_remote_hellos:
+                raise HandshakeError("peer replayed a retired handshake")
+            if connection.remote_hello_body is not None:
+                connection.retired_remote_hellos.append(
+                    connection.remote_hello_body
+                )
+            shell_allowed = self.shell.allow_remote_shell
+            self._cancel_handshake_retry_locked(connection)
+            connection.secure_session = secure_session
+            connection.remote_peer_id = None
+            connection.remote_fingerprint = None
+            connection.trust_status = TrustStatus.UNKNOWN
+            connection.remote_approved = False
+            connection.remote_features = frozenset()
+            connection.last_accepts_fingerprint = None
+            connection.trust_sent = False
+            connection.input_bound = False
+            connection.local_hello_sent = False
+            connection.remote_hello_received = True
+            connection.remote_hello_body = remote_hello
+            connection.hello_attempts = 0
+            connection.plain_receive_sequences.clear()
+        self.files.disconnect()
+        self.files.connection_changed(True)
+        self.shell.close()
+        self.shell.set_allow_remote_shell(shell_allowed)
+        if self.input is not None:
+            self.input.disconnect()
+        self._publish_current()
+        self._queue_hello(connection_id, retry=False)
+        self._schedule_handshake_retry(connection_id)
 
     def _handle_trust(self, connection_id: int, message: Message) -> None:
         metadata = _validate_trust_metadata(message.metadata)

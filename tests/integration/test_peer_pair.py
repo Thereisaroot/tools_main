@@ -912,6 +912,48 @@ def test_handshake_recovers_when_the_first_hello_is_lost(tmp_path):
         right.close()
 
 
+def test_peer_reconnects_while_other_serial_port_stays_open(tmp_path):
+    left, *_ = build_core(tmp_path, "left-asymmetric-reconnect")
+    right, *_ = build_core(tmp_path, "right-asymmetric-reconnect")
+    left_endpoint, right_endpoint = endpoint_pair()
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+
+    received = []
+    left.chat.add_message_listener(received.append)
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        approve_pair(left, right)
+
+        right.disconnect()
+        assert wait_for(lambda: right.snapshot.state is CoreState.DISCONNECTED)
+        assert left.snapshot.state is CoreState.READY
+
+        replacement = MemoryEndpoint()
+        left_endpoint.connect(replacement)
+        replacement.connect(left_endpoint)
+        right.connect_endpoint(replacement)
+
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.READY
+            and right.snapshot.state is CoreState.READY,
+            timeout=2,
+        )
+        right.chat.send_secure("asymmetric reconnect")
+        assert wait_for(
+            lambda: any(
+                item.secure and item.text == "asymmetric reconnect"
+                for item in received
+            )
+        )
+    finally:
+        left.close()
+        right.close()
+
+
 def test_ready_transition_starts_persisted_auto_edge_capture(tmp_path):
     left, left_input, _ = build_core(
         tmp_path,
