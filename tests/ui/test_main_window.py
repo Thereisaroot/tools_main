@@ -4,9 +4,9 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QMimeData, Qt, QUrl
+from PySide6.QtCore import QMimeData, QRect, Qt, QUrl
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 from shooklink.chat.service import ChatService
 from shooklink.core import CoreSnapshot, CoreState
@@ -232,6 +232,66 @@ def test_connection_shell_contains_expected_controls(qtbot):
     assert window.baud_combo.isEditable()
     assert window.connect_button.text() == "Connect"
     assert window.connection_status.text() == "Disconnected"
+
+
+def test_default_window_height_fits_full_content_on_tall_screen(
+    qtbot,
+    tmp_path,
+    monkeypatch,
+):
+    screen = type(
+        "TallScreen",
+        (),
+        {"availableGeometry": lambda self: QRect(0, 0, 2560, 1440)},
+    )()
+    monkeypatch.setattr(
+        QApplication,
+        "primaryScreen",
+        staticmethod(lambda: screen),
+    )
+    window = MainWindow(
+        ChatService(FakeBus()),
+        FakeFileService(tmp_path),
+        FakeShellService(),
+        FakeInputService(),
+    )
+    qtbot.addWidget(window)
+
+    scroll_area = window.centralWidget()
+    assert isinstance(scroll_area, QScrollArea)
+    assert window.height() >= scroll_area.widget().sizeHint().height()
+    assert window.height() > 760
+
+
+def test_short_screen_keeps_window_visible_and_scrolls_content(
+    qtbot,
+    tmp_path,
+    monkeypatch,
+):
+    screen = type(
+        "ShortScreen",
+        (),
+        {"availableGeometry": lambda self: QRect(0, 0, 1280, 800)},
+    )()
+    monkeypatch.setattr(
+        QApplication,
+        "primaryScreen",
+        staticmethod(lambda: screen),
+    )
+    window = MainWindow(
+        ChatService(FakeBus()),
+        FakeFileService(tmp_path),
+        FakeShellService(),
+        FakeInputService(),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    QApplication.processEvents()
+
+    scroll_area = window.centralWidget()
+    assert isinstance(scroll_area, QScrollArea)
+    assert window.height() <= 800 - 64
+    assert scroll_area.verticalScrollBar().maximum() > 0
 
 
 def test_light_surface_text_remains_dark_with_a_dark_system_palette(qtbot):

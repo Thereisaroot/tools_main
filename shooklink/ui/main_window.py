@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpacerItem,
     QVBoxLayout,
@@ -56,6 +57,12 @@ COMMON_BAUD_RATES = (
     1_500_000,
     2_000_000,
 )
+
+MINIMUM_WINDOW_WIDTH = 760
+MINIMUM_WINDOW_HEIGHT = 640
+DEFAULT_WINDOW_WIDTH = 960
+DEFAULT_WINDOW_HEIGHT = 900
+SCREEN_EDGE_MARGIN = 64
 
 
 class FileUiService(Protocol):
@@ -206,9 +213,9 @@ class MainWindow(QMainWindow):
         self._input_state_listener = self.input_state.emit
         self._input_emergency_listener = self._show_input_emergency
         self.setWindowTitle("ShookLink")
-        self.setMinimumSize(760, 640)
-        self.resize(920, 760)
+        self.setMinimumSize(MINIMUM_WINDOW_WIDTH, MINIMUM_WINDOW_HEIGHT)
         self._build_ui()
+        self._resize_for_content()
         self._install_shortcuts()
         self._refresh_ports()
         self.incoming_message.connect(self._show_received_message)
@@ -463,12 +470,49 @@ class MainWindow(QMainWindow):
         send_row.addWidget(self.send_secure_button)
         layout.addLayout(send_row)
 
-        self.setCentralWidget(root)
+        self.content_scroll = QScrollArea(self)
+        self.content_scroll.setObjectName("mainScroll")
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.content_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.content_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.content_scroll.setWidget(root)
+        self.setCentralWidget(self.content_scroll)
         self._apply_style()
+
+    def _resize_for_content(self) -> None:
+        content = self.content_scroll.widget()
+        content.ensurePolished()
+        content_hint = content.sizeHint()
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(
+                max(DEFAULT_WINDOW_WIDTH, content_hint.width()),
+                max(DEFAULT_WINDOW_HEIGHT, content_hint.height()),
+            )
+            return
+        available = screen.availableGeometry()
+        maximum_width = max(
+            MINIMUM_WINDOW_WIDTH,
+            available.width() - SCREEN_EDGE_MARGIN,
+        )
+        maximum_height = max(
+            MINIMUM_WINDOW_HEIGHT,
+            available.height() - SCREEN_EDGE_MARGIN,
+        )
+        self.resize(
+            min(max(DEFAULT_WINDOW_WIDTH, content_hint.width()), maximum_width),
+            min(max(DEFAULT_WINDOW_HEIGHT, content_hint.height()), maximum_height),
+        )
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
+            QScrollArea#mainScroll { border: none; background: #f2efe7; }
             QWidget#root { background: #f2efe7; color: #172421; }
             QWidget#root QLabel, QWidget#root QCheckBox { color: #172421; }
             QLabel#title { color: #0b3d36; font-size: 23px; font-weight: 800; }
