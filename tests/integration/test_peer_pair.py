@@ -330,6 +330,10 @@ def test_fragmented_peer_pair_runs_all_services_and_reconnects_cleanly(tmp_path)
         left_input.capture(PointerMotionEvent(10, 0))
         assert wait_for(lambda: right_input.position == (60, 50))
         left_input.capture(PointerMotionEvent(-1000, 0))
+        assert wait_for(lambda: right_input.position == (0, 50))
+        assert left.input.state is InputSessionState.CONTROLLING
+        assert right.input.state is InputSessionState.BEING_CONTROLLED
+        left.input.stop_control(reason="manual")
         assert wait_for(
             lambda: left.input.state is InputSessionState.IDLE
             and right.input.state is InputSessionState.IDLE

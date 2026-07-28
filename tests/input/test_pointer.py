@@ -53,13 +53,16 @@ def test_monitor_gap_motion_is_discarded_instead_of_becoming_debt():
     assert transition.position == (1918, 100)
 
 
-def test_connected_return_edge_emits_leave_instead_of_clamping():
+def test_connected_return_edge_requires_resistance_before_leave():
     topology = Topology((Monitor("display", Rect(0, 0, 1920, 1080)),))
     pointer = LogicalPointer(topology, return_side=Side.LEFT)
     pointer.enter(Side.LEFT, 0.5)
 
+    resisted = pointer.move(-31, 0)
     transition = pointer.move(-1, 0)
 
+    assert resisted.kind is TransitionKind.MOVE
+    assert resisted.position == (0, 540)
     assert transition.kind is TransitionKind.LEAVE
     assert transition.position == (0, 540)
 
@@ -69,10 +72,32 @@ def test_large_delta_crossing_connected_return_edge_emits_leave():
     pointer = LogicalPointer(topology, return_side=Side.LEFT)
     pointer.set_position(5, 540)
 
-    transition = pointer.move(-10, 0)
+    transition = pointer.move(-37, 0)
 
     assert transition.kind is TransitionKind.LEAVE
     assert transition.position == (0, 540)
+
+
+def test_return_resistance_uses_multimonitor_outer_edge_not_internal_seam():
+    topology = Topology(
+        (
+            Monitor("left", Rect(0, 0, 100, 100)),
+            Monitor("right", Rect(100, 0, 100, 100)),
+        )
+    )
+    pointer = LogicalPointer(topology, return_side=Side.LEFT)
+    pointer.set_position(100, 50)
+
+    internal = pointer.move(-100, 0)
+    resisted = pointer.move(-31, 0)
+    transition = pointer.move(-1, 0)
+
+    assert internal.kind is TransitionKind.MOVE
+    assert internal.position == (0, 50)
+    assert resisted.kind is TransitionKind.MOVE
+    assert resisted.position == (0, 50)
+    assert transition.kind is TransitionKind.LEAVE
+    assert transition.position == (0, 50)
 
 
 def test_large_delta_into_monitor_gap_stays_on_source_monitor():

@@ -337,6 +337,25 @@ def test_manual_request_starts_at_the_remote_cursor_without_immediate_leave(
         service.close()
 
 
+def test_manual_control_without_auto_edge_cannot_leave_from_remote_edge():
+    service, bus, backend, _session_id = start_controlling(
+        auto_edge=False,
+        remote_cursor=(0, 50),
+    )
+    bus.sent.clear()
+
+    try:
+        backend.capture(PointerMotionEvent(-100, 0))
+
+        assert service.state is InputSessionState.CONTROLLING
+        assert all(
+            item[0].message_type is not MessageType.INPUT_LEAVE
+            for item in bus.sent
+        )
+    finally:
+        service.close()
+
+
 def test_cancelled_request_is_followed_by_stop_when_request_send_finishes_late():
     request_started = threading.Event()
     release_request = threading.Event()
@@ -929,11 +948,20 @@ def test_auto_edge_hold_enters_and_remote_return_edge_leaves_without_dead_space(
     assert (enter.metadata["x"], enter.metadata["y"]) == (0, 50)
     bus.sent.clear()
 
+    backend.capture(PointerMotionEvent(-31, 0))
+
+    assert service.state is InputSessionState.CONTROLLING
+    assert all(
+        item[0].message_type is not MessageType.INPUT_LEAVE
+        for item in bus.sent
+    )
+
     backend.capture(PointerMotionEvent(-1, 0))
 
     assert service.state is InputSessionState.IDLE
     assert backend.warps[-1] == (98, 50)
     assert [item[0].message_type for item in bus.sent] == [
+        MessageType.INPUT_MOVE,
         MessageType.INPUT_RELEASE_ALL,
         MessageType.INPUT_LEAVE,
     ]

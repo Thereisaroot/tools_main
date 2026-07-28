@@ -23,10 +23,12 @@ for the first ShookLink release.
 
 ## Install and Run
 
-The launchers check that `shooklink`, `PySide6`, `serial`, `cryptography`, and
-`pyte` can be imported. They install `requirements.txt` only when one of those
-imports is missing, then start the package entry point. Platform-marked packages
-install PyObjC only on macOS and `pywinpty` only on Windows.
+The Windows launcher first runs `git pull --ff-only` and stops if the update
+fails. The launchers then check that `shooklink`, `PySide6`, `serial`,
+`cryptography`, and `pyte` can be imported. They install `requirements.txt`
+only when one of those imports is missing, then start the package entry point.
+Platform-marked packages install PyObjC only on macOS and `pywinpty` only on
+Windows.
 
 macOS:
 
@@ -133,6 +135,10 @@ enter the peer and return, enable auto edge only on that controller; the peer
 only needs `Allow Remote Input`. To let either computer initiate from its own
 physical mouse, enable auto edge on both and configure mirrored sides, such as
 `Right` on one computer and `Left` on the other.
+
+Automatic return is disabled when Auto Edge is off. When enabled, the remote
+pointer must reach the peer's real multi-monitor outer edge and continue moving
+outward through a small resistance zone before control returns locally.
 
 While input capture is active, these local emergency shortcuts are consumed
 before they can be sent to the peer:

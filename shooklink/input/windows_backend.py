@@ -240,6 +240,7 @@ class _WindowsCaptureGeneration:
         default_factory=deque
     )
     discard_mouse_moves_until_post_warp: bool = False
+    mouse_delta_origin: tuple[int, int] | None = None
 
 
 def windows_key_to_usage(virtual_key: int, scan_code: int, extended: bool) -> int:
@@ -694,6 +695,7 @@ class WindowsInputBackend(BaseInputBackend):
             return True
         if message == _WM_SHOOK_POST_WARP:
             generation.discard_mouse_moves_until_post_warp = False
+            generation.mouse_delta_origin = self._mouse_anchor_position
             return True
         if message != _WM_SHOOK_MOUSE_MOVE:
             return False
@@ -723,11 +725,26 @@ class WindowsInputBackend(BaseInputBackend):
         anchor = self._mouse_anchor_position
         if anchor is None:
             return
-        delta = _anchored_pointer_delta(
+        anchored_delta = _anchored_pointer_delta(
             position,
             anchor,
             self._mouse_anchor_rect,
         )
+        delta = None
+        if anchored_delta is not None:
+            origin = (
+                anchor
+                if generation is None
+                else getattr(generation, "mouse_delta_origin", None) or anchor
+            )
+            incremental = (
+                position[0] - origin[0],
+                position[1] - origin[1],
+            )
+            if incremental != (0, 0):
+                delta = incremental
+            if generation is not None:
+                generation.mouse_delta_origin = position
         if position != anchor:
             api = self._get_api()
             pre_warp_posted = False
@@ -740,6 +757,7 @@ class WindowsInputBackend(BaseInputBackend):
                 except OSError:
                     self._mouse_anchor_position = position
                     self._last_mouse_position = position
+                    generation.mouse_delta_origin = position
                 else:
                     pre_warp_posted = True
             should_warp = generation is None or pre_warp_posted
@@ -749,6 +767,8 @@ class WindowsInputBackend(BaseInputBackend):
                 except OSError:
                     self._mouse_anchor_position = position
                     self._last_mouse_position = position
+                    if generation is not None:
+                        generation.mouse_delta_origin = position
                 else:
                     self._last_mouse_position = anchor
                 finally:
@@ -761,6 +781,7 @@ class WindowsInputBackend(BaseInputBackend):
                         except OSError:
                             generation.mouse_moves.clear()
                             generation.discard_mouse_moves_until_post_warp = False
+                            generation.mouse_delta_origin = self._mouse_anchor_position
         else:
             self._last_mouse_position = anchor
         if delta is not None:

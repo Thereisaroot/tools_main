@@ -583,7 +583,11 @@ class InputService:
                 raise InputProtocolError("stale input accept")
             pointer = LogicalPointer(
                 topology,
-                return_side=self._session_peer_side.opposite,
+                return_side=(
+                    self._session_peer_side.opposite
+                    if self._auto_edge_enabled
+                    else None
+                ),
             )
             if self._enter_from_edge:
                 transition = pointer.enter(

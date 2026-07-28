@@ -339,8 +339,9 @@ class MainWindow(QMainWindow):
         self.peer_side_combo.addItems(["Right", "Left", "Top", "Bottom"])
         self.auto_edge_checkbox = QCheckBox("Auto Edge (This Computer -> Peer)")
         self.auto_edge_checkbox.setToolTip(
-            "Enable this only on the computer whose mouse starts control. "
-            "Return works automatically without enabling Auto Edge on the peer."
+            "Enable this on the computer whose mouse starts control. "
+            "Return works only while Auto Edge is enabled and requires a short "
+            "outward push at the peer's real outer edge."
         )
         self.toggle_input_button = QPushButton("Toggle Remote Control")
         self.toggle_input_button.clicked.connect(self._toggle_input_control)

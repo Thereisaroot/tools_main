@@ -624,7 +624,7 @@ def test_windows_warp_generated_motion_is_discarded_before_edge_logic():
     assert api.warps == [(500, 500)]
 
 
-def test_windows_physical_motion_queued_before_pre_warp_is_preserved():
+def test_windows_physical_motion_queued_before_pre_warp_keeps_incremental_delta():
     class CallbackBackend(WindowsInputBackend):
         def _start_native_capture(self, suppress):
             assert suppress is True
@@ -687,7 +687,7 @@ def test_windows_physical_motion_queued_before_pre_warp_is_preserved():
         _thread_id, message, _wparam, _lparam = api.posts.pop(0)
         backend._handle_hook_thread_message(generation, message)
 
-    assert [(event.dx, event.dy) for event in captured] == [(4, 0), (5, 0)]
+    assert [(event.dx, event.dy) for event in captured] == [(4, 0), (1, 0)]
 
 
 def test_windows_failed_warp_still_closes_discard_window():
