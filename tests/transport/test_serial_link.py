@@ -66,6 +66,17 @@ class BrokenWriteEndpoint(MemoryEndpoint):
         raise OSError("write failed")
 
 
+class BlockingFlushEndpoint(MemoryEndpoint):
+    def __init__(self):
+        super().__init__()
+        self.flush_started = threading.Event()
+        self.release_flush = threading.Event()
+
+    def flush(self):
+        self.flush_started.set()
+        self.release_flush.wait(2)
+
+
 class BlockingBrokenWriteEndpoint(BrokenWriteEndpoint):
     def __init__(self):
         super().__init__()
@@ -236,6 +247,47 @@ def test_writer_notifies_item_only_after_frame_is_written():
 
     left.close()
     right.close()
+
+
+def test_file_write_completion_does_not_block_later_queued_frames_on_flush():
+    left_endpoint = BlockingFlushEndpoint()
+    right_endpoint = MemoryEndpoint()
+    left_endpoint.connect(right_endpoint)
+    right_endpoint.connect(left_endpoint)
+    received = []
+    left = SerialLink(left_endpoint, lambda frame: None, lambda error: None)
+    right = SerialLink(right_endpoint, received.append, lambda error: None)
+    left.start()
+    right.start()
+
+    try:
+        left.send(
+            OutboundItem(
+                Priority.FILE,
+                4,
+                b"file payload",
+                message_type=22,
+                on_written=lambda: None,
+            )
+        )
+        assert wait_for(lambda: len(received) == 1)
+
+        left.send(
+            OutboundItem(
+                Priority.NORMAL,
+                5,
+                b"chat payload",
+                message_type=10,
+            )
+        )
+
+        assert wait_for(lambda: len(received) == 2, timeout=0.2)
+        assert received[-1].payload == b"chat payload"
+        assert not left_endpoint.flush_started.is_set()
+    finally:
+        left_endpoint.release_flush.set()
+        left.close()
+        right.close()
 
 
 def test_explicit_sequence_is_preserved_for_retransmission():

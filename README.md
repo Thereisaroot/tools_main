@@ -91,6 +91,7 @@ The connection screen provides these common rates:
 - `115200` (default)
 - `230400`
 - `460800`
+- `750000`
 - `921600`
 - `1000000`
 - `1500000`

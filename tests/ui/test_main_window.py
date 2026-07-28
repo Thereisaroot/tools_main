@@ -230,6 +230,7 @@ def test_connection_shell_contains_expected_controls(qtbot):
 
     assert window.port_combo.isEditable()
     assert window.baud_combo.isEditable()
+    assert window.baud_combo.findText("750000") >= 0
     assert window.connect_button.text() == "Connect"
     assert window.connection_status.text() == "Disconnected"
 
@@ -536,7 +537,9 @@ def test_file_drop_progress_and_cancel_leave_chat_enabled(qtbot, tmp_path):
             1024.0,
         )
     )
-    assert str(final_path) in window.file_progress_label.text()
+    assert path.name in window.file_progress_label.text()
+    assert "complete" in window.file_progress_label.text()
+    assert str(final_path) not in window.file_progress_label.text()
 
 
 def test_unrelated_completion_does_not_clear_active_transfer(qtbot, tmp_path):

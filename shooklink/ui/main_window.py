@@ -52,6 +52,7 @@ COMMON_BAUD_RATES = (
     115_200,
     230_400,
     460_800,
+    750_000,
     921_600,
     1_000_000,
     1_500_000,
@@ -871,11 +872,6 @@ class MainWindow(QMainWindow):
             f"{progress.name} · {percent}% · {_format_bytes(progress.transferred)} / "
             f"{_format_bytes(progress.total)} · "
             f"{_format_bytes(progress.throughput_bps)}/s · {progress.state}"
-            + (
-                f" · {progress.path}"
-                if progress.state == "complete" and progress.path is not None
-                else ""
-            )
         )
         finished = progress.state in {"complete", "failed", "cancelled"}
         self.file_cancel_button.setEnabled(not finished)
