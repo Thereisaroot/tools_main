@@ -283,6 +283,12 @@ class SerialLink:
                         payload=item.payload,
                     )
                     self._write_all(encode_frame(frame))
+                    if item.on_written is not None:
+                        self._endpoint.flush()
+                        try:
+                            item.on_written()
+                        except BaseException:
+                            logger.exception("serial write completion callback failed")
                 finally:
                     self._multiplexer.task_done(item)
         except BaseException as error:

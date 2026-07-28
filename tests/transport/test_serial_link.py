@@ -211,6 +211,33 @@ def test_links_exchange_fragmented_frames_and_sequence_per_stream():
     assert not right.threads_alive
 
 
+def test_writer_notifies_item_only_after_frame_is_written():
+    left_endpoint, right_endpoint = endpoint_pair(max_read=3, max_write=2)
+    received = []
+    written = threading.Event()
+    left = SerialLink(left_endpoint, lambda frame: None, lambda error: None)
+    right = SerialLink(right_endpoint, received.append, lambda error: None)
+    left.start()
+    right.start()
+
+    left.send(
+        OutboundItem(
+            Priority.FILE,
+            4,
+            b"payload",
+            message_type=22,
+            on_written=written.set,
+        )
+    )
+
+    assert written.wait(1)
+    assert wait_for(lambda: len(received) == 1)
+    assert received[0].payload == b"payload"
+
+    left.close()
+    right.close()
+
+
 def test_explicit_sequence_is_preserved_for_retransmission():
     left_endpoint, right_endpoint = endpoint_pair()
     received = []

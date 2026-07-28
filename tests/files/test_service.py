@@ -26,17 +26,31 @@ from shooklink.transport.multiplexer import Priority
 
 
 class QueueBus:
-    def __init__(self, trusted=True, authenticated=True):
+    def __init__(self, trusted=True, authenticated=True, complete_writes=True):
         self.trusted = trusted
         self.authenticated = authenticated
+        self.complete_writes = complete_writes
         self.queue = deque()
         self.sent = []
         self.decrypt_calls = []
+        self.write_callbacks = deque()
 
-    def send(self, message, *, secure=True, priority=Priority.NORMAL):
+    def send(
+        self,
+        message,
+        *,
+        secure=True,
+        priority=Priority.NORMAL,
+        on_written=None,
+    ):
         item = (message, secure, priority)
         self.queue.append(item)
         self.sent.append(item)
+        if on_written is not None:
+            if self.complete_writes:
+                on_written()
+            else:
+                self.write_callbacks.append(on_written)
 
     def decrypt_secure(self, message):
         self.decrypt_calls.append(message)
@@ -181,6 +195,8 @@ def test_selective_repeat_requeues_only_reported_holes_and_bounds_window(tmp_pat
     messages = sender.next_messages(now=1.0)
     assert len(messages) == 16
     assert sender.in_flight_count <= 16
+    for message in messages:
+        sender.mark_transmitted(message.metadata["index"], now=1.0)
 
     for message in messages:
         index = message.metadata["index"]
@@ -188,6 +204,9 @@ def test_selective_repeat_requeues_only_reported_holes_and_bounds_window(tmp_pat
         if index != 3:
             received.add(index)
     messages = sender.acknowledge(build_ack_metadata(received), now=2.0)
+    for message in messages:
+        if message.message_type is MessageType.FILE_CHUNK:
+            sender.mark_transmitted(message.metadata["index"], now=2.0)
     for message in messages:
         if message.message_type is not MessageType.FILE_CHUNK:
             continue
@@ -200,6 +219,9 @@ def test_selective_repeat_requeues_only_reported_holes_and_bounds_window(tmp_pat
     assert sender.in_flight_count <= 16
 
     messages = sender.acknowledge(build_ack_metadata(received), now=3.0)
+    for message in messages:
+        if message.message_type is MessageType.FILE_CHUNK:
+            sender.mark_transmitted(message.metadata["index"], now=3.0)
     for message in messages:
         if message.message_type is not MessageType.FILE_CHUNK:
             continue
@@ -230,11 +252,38 @@ def test_retransmit_timeout_only_resends_expired_chunks(tmp_path):
     )
     sender.accept()
     sender.next_messages(now=10.0)
+    sender.mark_transmitted(0, now=10.0)
+    sender.mark_transmitted(1, now=10.0)
 
     assert sender.retransmit_expired(now=10.49) == []
     retried = sender.retransmit_expired(now=10.5)
 
     assert [message.metadata["index"] for message in retried] == [0, 1]
+
+
+def test_retransmit_timeout_starts_after_transport_writes_chunk(tmp_path):
+    path = tmp_path / "queued.bin"
+    path.write_bytes(b"queued")
+    sender = OutgoingTransfer.from_path(
+        path,
+        transfer_id="e" * 32,
+        chunk_size=8,
+        window_size=1,
+        retransmit_timeout=0.5,
+    )
+    sender.accept()
+    sender.next_messages(now=1.0)
+
+    assert sender.retransmit_expired(now=100.0) == []
+
+    sender.mark_transmitted(0, now=100.0)
+
+    assert sender.retransmit_expired(now=100.49) == []
+    assert [
+        message.metadata["index"]
+        for message in sender.retransmit_expired(now=100.5)
+    ] == [0]
+    assert sender.retransmit_expired(now=200.0) == []
 
 
 def test_late_ack_and_timer_after_finish_are_harmless(tmp_path):
@@ -318,6 +367,31 @@ def test_service_hashes_offer_off_thread_and_starts_with_a_bounded_window(tmp_pa
     assert len(chunks) == 16
     assert all(item[1] is True for item in chunks)
     assert all(item[2] is Priority.FILE for item in chunks)
+    service.close()
+
+
+def test_service_does_not_requeue_chunks_still_waiting_for_serial_writer(tmp_path):
+    path = tmp_path / "slow-link.bin"
+    path.write_bytes(b"x" * (20 * CHUNK_SIZE))
+    bus = QueueBus(complete_writes=False)
+    service = FileService(bus, tmp_path / "downloads")
+    transfer_id = service.send_file(path).result(timeout=2)
+
+    service.handle_message(
+        Message(MessageType.FILE_ACCEPT, {"transfer_id": transfer_id})
+    )
+    initial_chunks = [
+        item for item in bus.sent if item[0].message_type is MessageType.FILE_CHUNK
+    ]
+    assert len(initial_chunks) == WINDOW_SIZE
+
+    service.poll(now=time.monotonic() + 60.0)
+
+    queued_chunks = [
+        item for item in bus.sent if item[0].message_type is MessageType.FILE_CHUNK
+    ]
+    assert len(queued_chunks) == WINDOW_SIZE
+    assert len(bus.write_callbacks) == WINDOW_SIZE
     service.close()
 
 

@@ -77,6 +77,7 @@ class FileBus(Protocol):
         *,
         secure: bool = True,
         priority: Priority = Priority.NORMAL,
+        on_written: Callable[[], None] | None = None,
     ) -> None: ...
 
     def decrypt_secure(self, message: Message) -> bytes: ...
@@ -164,7 +165,8 @@ class FileProgress:
 class _PendingChunk:
     index: int
     body: bytes
-    sent_at: float
+    sent_at: float | None = None
+    queued_count: int = 1
     gap_retried: bool = False
 
 
@@ -555,7 +557,7 @@ class OutgoingTransfer:
             if 0 <= offset < span and not bitmap & (1 << offset):
                 if not pending.gap_retried:
                     pending.gap_retried = True
-                    pending.sent_at = timestamp
+                    pending.queued_count += 1
                     messages.append(self._chunk_message(pending))
         messages.extend(self.next_messages(now=timestamp))
         return messages
@@ -565,10 +567,23 @@ class OutgoingTransfer:
         timestamp = time.monotonic() if now is None else now
         messages = []
         for pending in sorted(self._pending.values(), key=lambda item: item.index):
-            if timestamp - pending.sent_at >= self.retransmit_timeout:
-                pending.sent_at = timestamp
+            if pending.queued_count:
+                continue
+            if (
+                pending.sent_at is None
+                or timestamp - pending.sent_at >= self.retransmit_timeout
+            ):
+                pending.queued_count += 1
                 messages.append(self._chunk_message(pending))
         return messages
+
+    def mark_transmitted(self, index: int, *, now: float | None = None) -> None:
+        pending = self._pending.get(index)
+        if pending is None or pending.queued_count == 0:
+            return
+        pending.queued_count -= 1
+        if pending.queued_count == 0:
+            pending.sent_at = time.monotonic() if now is None else now
 
     def retry_control(self, *, now: float | None = None) -> list[Message]:
         if self._cancelled or self._completed:
@@ -618,7 +633,7 @@ class OutgoingTransfer:
         )
         if len(body) != expected:
             raise FileTransferError("source file changed during transfer")
-        pending = _PendingChunk(index, body, timestamp)
+        pending = _PendingChunk(index, body)
         self._pending[index] = pending
         self._next_index += 1
         return self._chunk_message(pending)
@@ -838,7 +853,7 @@ class FileService:
                         pending_messages.extend(transfer.retransmit_expired(now=now))
                 except FileTransferError:
                     pass
-                self._send_many(pending_messages)
+                self._send_many(pending_messages, transfer=transfer)
             for transfer_id, pending in self._pending_cancels.items():
                 if timestamp - pending.last_sent_at >= RETRANSMIT_TIMEOUT:
                     pending.last_sent_at = timestamp
@@ -1063,7 +1078,7 @@ class FileService:
                 self._queue_cancel_locked(transfer_id, "outgoing")
                 self._notify_outgoing(transfer, "failed")
                 return
-            self._send_many(messages)
+            self._send_many(messages, transfer=transfer)
             self._notify_outgoing(transfer, "sending")
 
     def _handle_chunk(self, message: Message) -> None:
@@ -1129,7 +1144,7 @@ class FileService:
                 self._queue_cancel_locked(transfer_id, "outgoing")
                 self._notify_outgoing(transfer, "failed")
                 return
-            self._send_many(messages)
+            self._send_many(messages, transfer=transfer)
             if self._outgoing.get(transfer_id) is transfer:
                 self._notify_outgoing(transfer, "sending")
 
@@ -1301,14 +1316,32 @@ class FileService:
             raise FileProtocolError("unknown incoming transfer")
         return transfer
 
-    def _send_many(self, messages: Iterable[Message]) -> None:
+    def _send_many(
+        self,
+        messages: Iterable[Message],
+        *,
+        transfer: OutgoingTransfer | None = None,
+    ) -> None:
         for message in messages:
             priority = (
                 Priority.FILE
                 if message.message_type is MessageType.FILE_CHUNK
                 else Priority.NORMAL
             )
-            self._send(message, priority)
+            on_written = None
+            if transfer is not None and message.message_type is MessageType.FILE_CHUNK:
+                index = message.metadata["index"]
+                on_written = lambda index=index: self._chunk_written(
+                    transfer,
+                    index,
+                )
+            self._send(message, priority, on_written=on_written)
+
+    def _chunk_written(self, transfer: OutgoingTransfer, index: int) -> None:
+        with self._lock:
+            if self._outgoing.get(transfer.offer.transfer_id) is not transfer:
+                return
+            transfer.mark_transmitted(index)
 
     def _send_accept(self, transfer_id: str) -> None:
         self._send(
@@ -1382,8 +1415,19 @@ class FileService:
             )
         while len(self._cancelled_incoming) > MAX_COMPLETED_TRANSFERS:
             self._cancelled_incoming.popitem(last=False)
-    def _send(self, message: Message, priority: Priority) -> None:
-        self._bus.send(message, secure=True, priority=priority)
+    def _send(
+        self,
+        message: Message,
+        priority: Priority,
+        *,
+        on_written: Callable[[], None] | None = None,
+    ) -> None:
+        self._bus.send(
+            message,
+            secure=True,
+            priority=priority,
+            on_written=on_written,
+        )
 
     def _ensure_trusted(self) -> None:
         if not self._bus.trusted:

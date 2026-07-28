@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
@@ -353,10 +354,16 @@ class ShookLinkCore:
         *,
         secure: bool = False,
         priority: Priority = Priority.NORMAL,
+        on_written: Callable[[], None] | None = None,
     ) -> None:
         if message.message_type in {MessageType.HELLO, MessageType.TRUST}:
             raise CoreError("handshake messages are managed by the core")
-        self._send_user(message, secure=secure, priority=priority)
+        self._send_user(
+            message,
+            secure=secure,
+            priority=priority,
+            on_written=on_written,
+        )
 
     def decrypt_secure(self, message: Message) -> bytes:
         if _authenticated_message.get() is not message:
@@ -406,11 +413,14 @@ class ShookLinkCore:
         *,
         secure: bool,
         priority: Priority,
+        on_written: Callable[[], None] | None,
     ) -> None:
         if not isinstance(message, Message):
             raise TypeError("message must be a Message")
         if not isinstance(priority, Priority):
             raise TypeError("priority must be a Priority")
+        if on_written is not None and not callable(on_written):
+            raise TypeError("on_written must be callable")
         expected_secure = message.message_type not in _PLAIN_TYPES
         if secure != expected_secure:
             raise CoreError("message security does not match its protocol type")
@@ -432,6 +442,7 @@ class ShookLinkCore:
             secure=secure,
             priority=priority,
             allow_untrusted=False,
+            on_written=on_written,
         )
 
     def _send_internal(
@@ -442,6 +453,7 @@ class ShookLinkCore:
         secure: bool,
         priority: Priority,
         allow_untrusted: bool,
+        on_written: Callable[[], None] | None = None,
     ) -> None:
         with self._send_lock:
             self._send_internal_serialized(
@@ -450,6 +462,7 @@ class ShookLinkCore:
                 secure=secure,
                 priority=priority,
                 allow_untrusted=allow_untrusted,
+                on_written=on_written,
             )
 
     def _send_internal_serialized(
@@ -460,6 +473,7 @@ class ShookLinkCore:
         secure: bool,
         priority: Priority,
         allow_untrusted: bool,
+        on_written: Callable[[], None] | None,
     ) -> None:
         with self._lock:
             connection = self._connection
@@ -516,6 +530,7 @@ class ShookLinkCore:
                     message_type=int(message.message_type),
                     flags=flags,
                     sequence=sequence,
+                    on_written=on_written,
                 )
             else:
                 link.send(
@@ -526,6 +541,7 @@ class ShookLinkCore:
                         message_type=int(message.message_type),
                         flags=flags,
                         sequence=sequence,
+                        on_written=on_written,
                     )
                 )
         except BaseException:

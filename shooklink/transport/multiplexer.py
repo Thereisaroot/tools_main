@@ -5,7 +5,8 @@ from __future__ import annotations
 import heapq
 import itertools
 import time
-from dataclasses import dataclass, replace
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from threading import Condition
 
@@ -44,6 +45,11 @@ class OutboundItem:
     flags: int = 0
     acknowledgement: int = 0
     sequence: int | None = None
+    on_written: Callable[[], None] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 def _validate_uint(name: str, value: int, maximum: int) -> None:
@@ -66,6 +72,8 @@ def _validate_item(item: OutboundItem) -> None:
         raise TypeError("payload must be bytes")
     if len(item.payload) > MAX_PAYLOAD_SIZE:
         raise ValueError(f"payload cannot exceed {MAX_PAYLOAD_SIZE} bytes")
+    if item.on_written is not None and not callable(item.on_written):
+        raise TypeError("on_written must be callable")
 
 
 class Multiplexer:
@@ -184,6 +192,7 @@ class Multiplexer:
         flags: int = 0,
         acknowledgement: int = 0,
         sequence: int | None = None,
+        on_written: Callable[[], None] | None = None,
     ) -> OutboundItem:
         item = OutboundItem(
             priority,
@@ -193,6 +202,7 @@ class Multiplexer:
             flags,
             acknowledgement,
             sequence,
+            on_written,
         )
         _validate_item(item)
         with self._condition:
