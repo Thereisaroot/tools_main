@@ -1,4 +1,5 @@
 import os
+import threading
 from concurrent.futures import Future
 from pathlib import Path
 
@@ -25,9 +26,11 @@ class FakeBus:
         self.trusted = trusted
         self.decrypted_body = decrypted_body
         self.sent = []
+        self.on_written_callbacks = []
 
-    def send(self, message, *, secure=False):
+    def send(self, message, *, secure=False, on_written=None):
         self.sent.append((message, secure))
+        self.on_written_callbacks.append(on_written)
 
     def decrypt_secure(self, _message):
         if not self.trusted or self.decrypted_body is None:
@@ -190,6 +193,24 @@ def test_main_window_sends_korean_and_punctuation(qtbot):
 
     assert [item[0].body.decode() for item in bus.sent] == [text, text]
     assert [item[1] for item in bus.sent] == [False, True]
+
+
+def test_send_status_changes_from_queued_to_sent_after_serial_write(qtbot):
+    bus = FakeBus()
+    window = MainWindow(ChatService(bus))
+    qtbot.addWidget(window)
+    window.show()
+    window.message_editor.setPlainText("after file")
+
+    qtbot.mouseClick(window.send_plain_button, Qt.MouseButton.LeftButton)
+
+    assert window.action_status.text() == "Queued"
+    callback = bus.on_written_callbacks[-1]
+    assert callback is not None
+    writer = threading.Thread(target=callback)
+    writer.start()
+    writer.join(timeout=1)
+    qtbot.waitUntil(lambda: window.action_status.text() == "Sent")
 
 
 def test_copy_actions_target_last_received_text(qtbot):

@@ -27,7 +27,13 @@ class ChatTextTooLarge(ChatError):
 class ChatBus(Protocol):
     trusted: bool
 
-    def send(self, message: Message, *, secure: bool = False) -> None:
+    def send(
+        self,
+        message: Message,
+        *,
+        secure: bool = False,
+        on_written: Callable[[], None] | None = None,
+    ) -> None:
         """Queue a typed message for transport."""
 
     def decrypt_secure(self, message: Message) -> bytes:
@@ -70,15 +76,33 @@ class ChatService:
             except ValueError:
                 pass
 
-    def send_plain(self, text: str) -> None:
+    def send_plain(
+        self,
+        text: str,
+        *,
+        on_written: Callable[[], None] | None = None,
+    ) -> None:
         body = self._encode_text(text)
-        self._bus.send(Message(MessageType.CHAT_PLAIN, {}, body), secure=False)
+        self._bus.send(
+            Message(MessageType.CHAT_PLAIN, {}, body),
+            secure=False,
+            on_written=on_written,
+        )
 
-    def send_secure(self, text: str) -> None:
+    def send_secure(
+        self,
+        text: str,
+        *,
+        on_written: Callable[[], None] | None = None,
+    ) -> None:
         if not self.secure_available:
             raise PeerNotTrusted("trust the connected peer before sending secure text")
         body = self._encode_text(text)
-        self._bus.send(Message(MessageType.CHAT_SECURE, {}, body), secure=True)
+        self._bus.send(
+            Message(MessageType.CHAT_SECURE, {}, body),
+            secure=True,
+            on_written=on_written,
+        )
 
     def handle_message(self, message: Message) -> bool:
         if message.message_type not in (

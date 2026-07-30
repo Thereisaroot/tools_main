@@ -183,6 +183,7 @@ class MainWindow(QMainWindow):
     shell_output = Signal(object)
     shell_state = Signal(object)
     input_state = Signal(object)
+    chat_written = Signal(int)
 
     def __init__(
         self,
@@ -206,6 +207,8 @@ class MainWindow(QMainWindow):
         self._active_transfer_id: str | None = None
         self._file_transfers: OrderedDict[str, FileProgress] = OrderedDict()
         self._active_shell_session: str | None = None
+        self._chat_send_id = 0
+        self._pending_chat_send_id: int | None = None
         self.terminal_window: TerminalWindow | None = None
         self._chat_listener = self.incoming_message.emit
         self._file_listener = self.file_progress.emit
@@ -225,6 +228,7 @@ class MainWindow(QMainWindow):
         self.shell_output.connect(self._show_shell_output)
         self.shell_state.connect(self._show_shell_state)
         self.input_state.connect(self._show_input_state)
+        self.chat_written.connect(self._show_chat_written)
         self._chat_service.add_message_listener(self._chat_listener)
         if self._file_service is not None:
             self._file_service.add_progress_listener(self._file_listener)
@@ -1031,12 +1035,26 @@ class MainWindow(QMainWindow):
         self._run_send(self._chat_service.send_secure)
 
     def _run_send(self, sender) -> None:
+        self._chat_send_id += 1
+        send_id = self._chat_send_id
+        self._pending_chat_send_id = send_id
+        self.action_status.setText("Queued")
         try:
-            sender(self.message_editor.toPlainText())
+            sender(
+                self.message_editor.toPlainText(),
+                on_written=lambda: self.chat_written.emit(send_id),
+            )
         except Exception as error:
+            if self._pending_chat_send_id == send_id:
+                self._pending_chat_send_id = None
             self.action_status.setText(str(error))
             return
-        self.action_status.setText("Queued")
+
+    def _show_chat_written(self, send_id: int) -> None:
+        if self._pending_chat_send_id != send_id:
+            return
+        self._pending_chat_send_id = None
+        self.action_status.setText("Sent")
 
     def _show_received_message(self, message: ChatMessage) -> None:
         self.received_view.setPlainText(message.text)

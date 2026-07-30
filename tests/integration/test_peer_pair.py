@@ -288,7 +288,9 @@ def test_fragmented_peer_pair_runs_all_services_and_reconnects_cleanly(tmp_path)
         file_data = file_data[: (WINDOW_SIZE + 2) * CHUNK_SIZE + 123]
         source = tmp_path / "multi-window.bin"
         source.write_bytes(file_data)
+        left_progress = []
         right_progress = []
+        left.files.add_progress_listener(left_progress.append)
         right.files.add_progress_listener(right_progress.append)
         transfer_id = left.files.send_file(source).result(timeout=2)
         assert wait_for(
@@ -298,7 +300,25 @@ def test_fragmented_peer_pair_runs_all_services_and_reconnects_cleanly(tmp_path)
             ),
             timeout=10,
         )
+        assert wait_for(
+            lambda: any(
+                item.transfer_id == transfer_id and item.state == "complete"
+                for item in left_progress
+            ),
+            timeout=10,
+        )
         assert (right.files.download_dir / source.name).read_bytes() == file_data
+        post_file_messages = []
+        post_file_written = threading.Event()
+        right.chat.add_message_listener(post_file_messages.append)
+        left.chat.send_plain(
+            "plain after file",
+            on_written=post_file_written.set,
+        )
+        assert post_file_written.wait(timeout=2)
+        assert wait_for(
+            lambda: any(item.text == "plain after file" for item in post_file_messages)
+        )
 
         shell_output = []
         left.shell.add_output_listener(shell_output.append)

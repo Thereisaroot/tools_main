@@ -14,9 +14,11 @@ class FakeBus:
         self.decrypted_body = decrypted_body
         self.decrypt_calls = []
         self.sent = []
+        self.on_written_callbacks = []
 
-    def send(self, message, *, secure=False):
+    def send(self, message, *, secure=False, on_written=None):
         self.sent.append((message, secure))
+        self.on_written_callbacks.append(on_written)
 
     def decrypt_secure(self, message):
         self.decrypt_calls.append(message)
@@ -38,6 +40,19 @@ def test_plain_chat_sends_utf8_without_transport_encryption():
         "한글 message ./?=+-_0)".encode(),
     )
     assert secure is False
+
+
+def test_plain_chat_forwards_transport_write_completion_callback():
+    bus = FakeBus()
+    service = ChatService(bus)
+    completed = []
+
+    service.send_plain("written", on_written=lambda: completed.append(True))
+
+    callback = bus.on_written_callbacks[-1]
+    assert callback is not None
+    callback()
+    assert completed == [True]
 
 
 def test_secure_chat_requires_trust():
