@@ -23,12 +23,11 @@ for the first ShookLink release.
 
 ## Install and Run
 
-The Windows launcher first runs `git pull --ff-only` and stops if the update
-fails. The launchers then check that `shooklink`, `PySide6`, `serial`,
-`cryptography`, and `pyte` can be imported. They install `requirements.txt`
-only when one of those imports is missing, then start the package entry point.
-Platform-marked packages install PyObjC only on macOS and `pywinpty` only on
-Windows.
+The launchers do not update the Git checkout automatically. They check that
+`shooklink`, `PySide6`, `serial`, `cryptography`, and `pyte` can be imported,
+install `requirements.txt` only when one of those imports is missing, then
+start the package entry point. Platform-marked packages install PyObjC only on
+macOS and `pywinpty` only on Windows.
 
 macOS:
 

@@ -4,14 +4,6 @@ setlocal
 pushd "%~dp0"
 if errorlevel 1 exit /b 1
 
-echo Updating ShookLink
-git pull --ff-only
-if errorlevel 1 (
-    echo Failed to update ShookLink.
-    popd
-    exit /b 1
-)
-
 py -3 -c "import shooklink, PySide6, serial, cryptography, pyte" >nul 2>&1
 if errorlevel 1 (
     echo Installing ShookLink dependencies from requirements.txt
