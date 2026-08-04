@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from shooklink import __version__
-from shooklink.chat.service import ChatService
+from shooklink.chat.service import CHAT_ACK_FEATURE, ChatService
 from shooklink.files.service import FileService
 from shooklink.input.backend import BaseInputBackend
 from shooklink.input.service import InputService
@@ -51,12 +51,18 @@ logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = 1
 AEAD_TAG_SIZE = 16
 HANDSHAKE_RETRY_SECONDS = 0.5
-LOCAL_FEATURES = frozenset({"chat", "files", "shell", "input"})
+LOCAL_FEATURES = frozenset(
+    {"chat", CHAT_ACK_FEATURE, "files", "shell", "input"}
+)
 MAX_FEATURES = 32
 MAX_PEER_ID_BYTES = 256
 
 _authenticated_message: ContextVar[Message | None] = ContextVar(
     "shooklink_authenticated_message",
+    default=None,
+)
+_dispatch_connection_id: ContextVar[int | None] = ContextVar(
+    "shooklink_dispatch_connection_id",
     default=None,
 )
 
@@ -246,6 +252,24 @@ class ShookLinkCore:
             return self._trusted_locked()
 
     @property
+    def chat_ack_available(self) -> bool:
+        with self._lock:
+            connection = self._connection
+            return bool(
+                connection is not None
+                and CHAT_ACK_FEATURE in connection.remote_features
+            )
+
+    @property
+    def chat_connection_id(self) -> int | None:
+        dispatch_connection_id = _dispatch_connection_id.get()
+        if dispatch_connection_id is not None:
+            return dispatch_connection_id
+        with self._lock:
+            connection = self._connection
+            return None if connection is None else connection.connection_id
+
+    @property
     def snapshot(self) -> CoreSnapshot:
         with self._lock:
             return self._snapshot_locked()
@@ -361,6 +385,7 @@ class ShookLinkCore:
         secure: bool = False,
         priority: Priority = Priority.NORMAL,
         on_written: Callable[[], None] | None = None,
+        expected_connection_id: int | None = None,
     ) -> None:
         if message.message_type in {MessageType.HELLO, MessageType.TRUST}:
             raise CoreError("handshake messages are managed by the core")
@@ -369,6 +394,7 @@ class ShookLinkCore:
             secure=secure,
             priority=priority,
             on_written=on_written,
+            expected_connection_id=expected_connection_id,
         )
 
     def decrypt_secure(self, message: Message) -> bytes:
@@ -408,6 +434,7 @@ class ShookLinkCore:
                 connection.link.close()
             except BaseException:
                 pass
+        self.chat.disconnect()
         self.files.close()
         self.shell.close()
         if self.input is not None:
@@ -420,6 +447,7 @@ class ShookLinkCore:
         secure: bool,
         priority: Priority,
         on_written: Callable[[], None] | None,
+        expected_connection_id: int | None,
     ) -> None:
         if not isinstance(message, Message):
             raise TypeError("message must be a Message")
@@ -427,6 +455,11 @@ class ShookLinkCore:
             raise TypeError("priority must be a Priority")
         if on_written is not None and not callable(on_written):
             raise TypeError("on_written must be callable")
+        if expected_connection_id is not None and (
+            type(expected_connection_id) is not int
+            or expected_connection_id <= 0
+        ):
+            raise ValueError("expected_connection_id must be positive")
         expected_secure = message.message_type not in _PLAIN_TYPES
         if secure != expected_secure:
             raise CoreError("message security does not match its protocol type")
@@ -434,6 +467,11 @@ class ShookLinkCore:
             connection = self._connection
             if connection is None:
                 raise CoreError("connect a serial peer first")
+            if (
+                expected_connection_id is not None
+                and connection.connection_id != expected_connection_id
+            ):
+                raise CoreError("serial connection changed")
             if priority not in _ALLOWED_PRIORITIES[message.message_type]:
                 raise CoreError("message priority is invalid for its protocol type")
             feature = _FEATURE_BY_TYPE[message.message_type]
@@ -781,7 +819,7 @@ class ShookLinkCore:
                 return
             if feature not in connection.remote_features:
                 return
-        self._dispatch(message, feature)
+        self._dispatch(connection_id, message, feature)
 
     def _handle_hello(self, connection_id: int, message: Message) -> None:
         if message.metadata != {"protocol": PROTOCOL_VERSION}:
@@ -857,6 +895,7 @@ class ShookLinkCore:
             connection.hello_attempts = 0
             connection.plain_receive_sequences.clear()
         self.files.disconnect()
+        self.chat.disconnect()
         self.files.connection_changed(True)
         self.shell.close()
         self.shell.set_allow_remote_shell(shell_allowed)
@@ -909,7 +948,12 @@ class ShookLinkCore:
         self._refresh_input_if_ready(connection_id)
         self._publish_current()
 
-    def _dispatch(self, message: Message, feature: str | None) -> None:
+    def _dispatch(
+        self,
+        connection_id: int,
+        message: Message,
+        feature: str | None,
+    ) -> None:
         if feature == "chat":
             service = self.chat
         elif feature == "files":
@@ -923,9 +967,11 @@ class ShookLinkCore:
         token = _authenticated_message.set(
             message if message.message_type not in _PLAIN_TYPES else None
         )
+        connection_token = _dispatch_connection_id.set(connection_id)
         try:
             service.handle_message(message)
         finally:
+            _dispatch_connection_id.reset(connection_token)
             _authenticated_message.reset(token)
 
     def _on_disconnect(
@@ -950,6 +996,7 @@ class ShookLinkCore:
                 None if disconnect_requested or error is None else str(error)
             )
             self._disconnect_requested.clear()
+        self.chat.disconnect()
         self.files.disconnect()
         self.shell.close()
         if self.input is not None:

@@ -174,6 +174,9 @@ the remote peer partial control; text, file, and shell features remain separate.
 
 - `Send Plain` sends visible UTF-8 without application encryption.
 - `Send Secure` requires completed trust and sends authenticated encrypted text.
+- Current ShookLink peers acknowledge text delivery and automatically retry a
+  lost message or acknowledgement. `Sent` means the peer acknowledged the
+  message; exhausted retries are reported as `Delivery failed`.
 - `Choose File` and the drop target use the same encrypted, windowed transfer
   service.
 - Received files are finalized only after SHA-256 verification and are stored in

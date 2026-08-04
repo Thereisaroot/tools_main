@@ -1,3 +1,6 @@
+import threading
+import time
+
 import pytest
 
 from shooklink.chat.service import (
@@ -9,16 +12,41 @@ from shooklink.protocol.messages import Message, MessageType
 
 
 class FakeBus:
-    def __init__(self, trusted=False, decrypted_body=None):
+    def __init__(
+        self,
+        trusted=False,
+        decrypted_body=None,
+        *,
+        chat_ack_available=False,
+        auto_write=False,
+        chat_connection_id=1,
+    ):
         self.trusted = trusted
         self.decrypted_body = decrypted_body
+        self.chat_ack_available = chat_ack_available
+        self.chat_connection_id = chat_connection_id
+        self.auto_write = auto_write
         self.decrypt_calls = []
         self.sent = []
         self.on_written_callbacks = []
 
-    def send(self, message, *, secure=False, on_written=None):
+    def send(
+        self,
+        message,
+        *,
+        secure=False,
+        on_written=None,
+        expected_connection_id=None,
+    ):
+        if (
+            expected_connection_id is not None
+            and expected_connection_id != self.chat_connection_id
+        ):
+            raise RuntimeError("serial connection changed")
         self.sent.append((message, secure))
         self.on_written_callbacks.append(on_written)
+        if self.auto_write and on_written is not None:
+            on_written()
 
     def decrypt_secure(self, message):
         self.decrypt_calls.append(message)
@@ -53,6 +81,137 @@ def test_plain_chat_forwards_transport_write_completion_callback():
     assert callback is not None
     callback()
     assert completed == [True]
+
+
+def test_ack_capable_chat_reports_delivery_only_after_peer_ack():
+    bus = FakeBus(chat_ack_available=True, auto_write=True)
+    service = ChatService(bus)
+    delivered = []
+
+    service.send_plain("reliable", on_delivered=lambda: delivered.append(True))
+
+    message = bus.sent[-1][0]
+    message_id = message.metadata["message_id"]
+    assert delivered == []
+    assert service.handle_message(
+        Message(MessageType.CHAT_PLAIN, {"ack_id": message_id}, b"")
+    )
+    assert delivered == [True]
+
+
+def test_ack_capable_chat_deduplicates_retries_and_acknowledges_each_copy():
+    bus = FakeBus(chat_ack_available=True)
+    service = ChatService(bus)
+    received = []
+    service.add_message_listener(received.append)
+    message = Message(
+        MessageType.CHAT_PLAIN,
+        {"message_id": "a" * 32},
+        b"only once",
+    )
+
+    assert service.handle_message(message)
+    assert service.handle_message(message)
+
+    assert [item.text for item in received] == ["only once"]
+    acknowledgements = [item[0] for item in bus.sent]
+    assert [item.metadata for item in acknowledgements] == [
+        {"ack_id": "a" * 32},
+        {"ack_id": "a" * 32},
+    ]
+
+
+def test_ack_capable_chat_reports_failure_after_bounded_retries():
+    bus = FakeBus(chat_ack_available=True, auto_write=True)
+    service = ChatService(bus, retry_interval=0.01, max_attempts=2)
+    failed = []
+    failure_reported = threading.Event()
+
+    service.send_plain(
+        "never acknowledged",
+        on_failed=lambda reason: (failed.append(reason), failure_reported.set()),
+    )
+
+    assert failure_reported.wait(1)
+    assert len(bus.sent) == 2
+    assert failed == ["Delivery failed"]
+
+
+def test_legacy_chat_reports_delivery_when_local_write_completes():
+    bus = FakeBus(auto_write=True)
+    service = ChatService(bus)
+    delivered = []
+
+    service.send_plain("legacy", on_delivered=lambda: delivered.append(True))
+
+    assert bus.sent[-1][0].metadata == {}
+    assert delivered == [True]
+
+
+def test_legacy_chat_cannot_cross_into_a_replacement_connection():
+    class ReconnectingBus(FakeBus):
+        def send(self, message, **kwargs):
+            self.chat_connection_id = 2
+            return super().send(message, **kwargs)
+
+    bus = ReconnectingBus()
+    service = ChatService(bus)
+
+    with pytest.raises(RuntimeError, match="serial connection changed"):
+        service.send_plain("old peer")
+
+    assert bus.sent == []
+
+
+def test_disconnect_cancels_pending_chat_retries():
+    bus = FakeBus(chat_ack_available=True, auto_write=True)
+    service = ChatService(bus, retry_interval=0.01, max_attempts=10)
+    failed = []
+    service.send_plain("disconnect", on_failed=failed.append)
+    deadline = time.monotonic() + 1
+    while len(bus.sent) < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    service.disconnect()
+    sent_count = len(bus.sent)
+    time.sleep(0.05)
+
+    assert len(bus.sent) == sent_count
+    assert failed == ["Disconnected"]
+
+
+def test_retry_cannot_cross_into_a_replacement_connection():
+    class BlockingRetryBus(FakeBus):
+        def __init__(self):
+            super().__init__(chat_ack_available=True, auto_write=True)
+            self.retry_started = threading.Event()
+            self.release_retry = threading.Event()
+
+        def send(self, message, **kwargs):
+            if self.sent:
+                self.retry_started.set()
+                assert self.release_retry.wait(1)
+            return super().send(message, **kwargs)
+
+    bus = BlockingRetryBus()
+    service = ChatService(bus, retry_interval=0.01, max_attempts=3)
+    failed = []
+    service.send_plain("old peer", on_failed=failed.append)
+    assert bus.retry_started.wait(1)
+
+    service.disconnect()
+    bus.chat_connection_id = 2
+    bus.release_retry.set()
+    time.sleep(0.05)
+
+    assert len(bus.sent) == 1
+    assert failed == ["Disconnected"]
+
+
+@pytest.mark.parametrize("retry_interval", [float("nan"), float("inf")])
+def test_chat_rejects_non_finite_retry_intervals(retry_interval):
+    with pytest.raises(ValueError):
+        ChatService(FakeBus(), retry_interval=retry_interval)
 
 
 def test_secure_chat_requires_trust():

@@ -22,13 +22,34 @@ from shooklink.ui.main_window import FileDropZone, MainWindow
 
 
 class FakeBus:
-    def __init__(self, trusted=True, decrypted_body=None):
+    def __init__(
+        self,
+        trusted=True,
+        decrypted_body=None,
+        *,
+        chat_ack_available=False,
+        chat_connection_id=1,
+    ):
         self.trusted = trusted
         self.decrypted_body = decrypted_body
+        self.chat_ack_available = chat_ack_available
+        self.chat_connection_id = chat_connection_id
         self.sent = []
         self.on_written_callbacks = []
 
-    def send(self, message, *, secure=False, on_written=None):
+    def send(
+        self,
+        message,
+        *,
+        secure=False,
+        on_written=None,
+        expected_connection_id=None,
+    ):
+        if (
+            expected_connection_id is not None
+            and expected_connection_id != self.chat_connection_id
+        ):
+            raise RuntimeError("serial connection changed")
         self.sent.append((message, secure))
         self.on_written_callbacks.append(on_written)
 
@@ -195,9 +216,10 @@ def test_main_window_sends_korean_and_punctuation(qtbot):
     assert [item[1] for item in bus.sent] == [False, True]
 
 
-def test_send_status_changes_from_queued_to_sent_after_serial_write(qtbot):
-    bus = FakeBus()
-    window = MainWindow(ChatService(bus))
+def test_send_status_changes_to_sent_only_after_peer_ack(qtbot):
+    bus = FakeBus(chat_ack_available=True)
+    service = ChatService(bus)
+    window = MainWindow(service)
     qtbot.addWidget(window)
     window.show()
     window.message_editor.setPlainText("after file")
@@ -210,6 +232,15 @@ def test_send_status_changes_from_queued_to_sent_after_serial_write(qtbot):
     writer = threading.Thread(target=callback)
     writer.start()
     writer.join(timeout=1)
+    assert window.action_status.text() == "Queued"
+
+    message_id = bus.sent[-1][0].metadata["message_id"]
+    reader = threading.Thread(
+        target=service.handle_message,
+        args=(Message(MessageType.CHAT_PLAIN, {"ack_id": message_id}, b""),),
+    )
+    reader.start()
+    reader.join(timeout=1)
     qtbot.waitUntil(lambda: window.action_status.text() == "Sent")
 
 

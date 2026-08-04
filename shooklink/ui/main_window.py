@@ -183,7 +183,8 @@ class MainWindow(QMainWindow):
     shell_output = Signal(object)
     shell_state = Signal(object)
     input_state = Signal(object)
-    chat_written = Signal(int)
+    chat_delivered = Signal(int)
+    chat_failed = Signal(int, str)
 
     def __init__(
         self,
@@ -228,7 +229,8 @@ class MainWindow(QMainWindow):
         self.shell_output.connect(self._show_shell_output)
         self.shell_state.connect(self._show_shell_state)
         self.input_state.connect(self._show_input_state)
-        self.chat_written.connect(self._show_chat_written)
+        self.chat_delivered.connect(self._show_chat_delivered)
+        self.chat_failed.connect(self._show_chat_failed)
         self._chat_service.add_message_listener(self._chat_listener)
         if self._file_service is not None:
             self._file_service.add_progress_listener(self._file_listener)
@@ -1042,7 +1044,8 @@ class MainWindow(QMainWindow):
         try:
             sender(
                 self.message_editor.toPlainText(),
-                on_written=lambda: self.chat_written.emit(send_id),
+                on_delivered=lambda: self.chat_delivered.emit(send_id),
+                on_failed=lambda reason: self.chat_failed.emit(send_id, reason),
             )
         except Exception as error:
             if self._pending_chat_send_id == send_id:
@@ -1050,11 +1053,17 @@ class MainWindow(QMainWindow):
             self.action_status.setText(str(error))
             return
 
-    def _show_chat_written(self, send_id: int) -> None:
+    def _show_chat_delivered(self, send_id: int) -> None:
         if self._pending_chat_send_id != send_id:
             return
         self._pending_chat_send_id = None
         self.action_status.setText("Sent")
+
+    def _show_chat_failed(self, send_id: int, reason: str) -> None:
+        if self._pending_chat_send_id != send_id:
+            return
+        self._pending_chat_send_id = None
+        self.action_status.setText(reason)
 
     def _show_received_message(self, message: ChatMessage) -> None:
         self.received_view.setPlainText(message.text)

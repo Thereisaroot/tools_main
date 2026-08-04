@@ -936,6 +936,104 @@ def test_handshake_recovers_when_the_first_hello_is_lost(tmp_path):
         right.close()
 
 
+def test_plain_chat_recovers_when_the_first_frame_is_lost(tmp_path):
+    left, *_ = build_core(tmp_path, "left-lost-chat")
+    right, *_ = build_core(tmp_path, "right-lost-chat")
+    left_endpoint = GatedMemoryEndpoint()
+    right_endpoint = GatedMemoryEndpoint()
+    left_endpoint.connect(right_endpoint)
+    right_endpoint.connect(left_endpoint)
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+
+    received = []
+    right.chat.add_message_listener(received.append)
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        right_endpoint.accepting = False
+
+        left.chat.send_plain("one click")
+
+        assert wait_for(lambda: left_endpoint.dropped_bytes > 0, timeout=1)
+        right_endpoint.accepting = True
+        assert wait_for(
+            lambda: [message.text for message in received] == ["one click"],
+            timeout=2,
+        )
+    finally:
+        left.close()
+        right.close()
+
+
+def test_plain_chat_ack_loss_retries_without_duplicate_display(tmp_path):
+    left, *_ = build_core(tmp_path, "left-lost-chat-ack")
+    right, *_ = build_core(tmp_path, "right-lost-chat-ack")
+    left_endpoint = GatedMemoryEndpoint()
+    right_endpoint = GatedMemoryEndpoint()
+    left_endpoint.connect(right_endpoint)
+    right_endpoint.connect(left_endpoint)
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+
+    received = []
+    delivered = threading.Event()
+    right.chat.add_message_listener(received.append)
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        left_endpoint.accepting = False
+
+        left.chat.send_plain("exactly once", on_delivered=delivered.set)
+
+        assert wait_for(lambda: [item.text for item in received] == ["exactly once"])
+        assert wait_for(lambda: right_endpoint.dropped_bytes > 0, timeout=1)
+        left_endpoint.accepting = True
+        assert delivered.wait(2)
+        assert [item.text for item in received] == ["exactly once"]
+    finally:
+        left.close()
+        right.close()
+
+
+def test_secure_chat_recovers_when_the_first_frame_is_lost(tmp_path):
+    left, *_ = build_core(tmp_path, "left-lost-secure-chat")
+    right, *_ = build_core(tmp_path, "right-lost-secure-chat")
+    left_endpoint = GatedMemoryEndpoint()
+    right_endpoint = GatedMemoryEndpoint()
+    left_endpoint.connect(right_endpoint)
+    right_endpoint.connect(left_endpoint)
+    left.connect_endpoint(left_endpoint)
+    right.connect_endpoint(right_endpoint)
+
+    received = []
+    delivered = threading.Event()
+    right.chat.add_message_listener(received.append)
+    try:
+        assert wait_for(
+            lambda: left.snapshot.state is CoreState.UNTRUSTED
+            and right.snapshot.state is CoreState.UNTRUSTED
+        )
+        approve_pair(left, right)
+        right_endpoint.accepting = False
+
+        left.chat.send_secure("secure one click", on_delivered=delivered.set)
+
+        assert wait_for(lambda: left_endpoint.dropped_bytes > 0, timeout=1)
+        right_endpoint.accepting = True
+        assert delivered.wait(2)
+        assert wait_for(
+            lambda: [message.text for message in received] == ["secure one click"]
+        )
+    finally:
+        left.close()
+        right.close()
+
+
 def test_peer_reconnects_while_other_serial_port_stays_open(tmp_path):
     left, *_ = build_core(tmp_path, "left-asymmetric-reconnect")
     right, *_ = build_core(tmp_path, "right-asymmetric-reconnect")
