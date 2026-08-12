@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication
 
 from shooklink.core import CoreSnapshot, ShookLinkCore
 from shooklink.input.topology import Side
+from shooklink.local_control.server import LocalControlServer
 from shooklink.protocol.crypto import IdentityStore, TrustStore
 from shooklink.settings import AppSettings, SettingsStore
 from shooklink.ui.main_window import MainWindow
@@ -107,6 +108,7 @@ class ApplicationController(QObject):
         settings: AppSettings,
         *,
         executor: Executor | None = None,
+        local_control_server=None,
     ) -> None:
         super().__init__()
         self._core = core
@@ -117,6 +119,7 @@ class ApplicationController(QObject):
             max_workers=1,
             thread_name_prefix="shooklink-control",
         )
+        self._local_control_server = local_control_server
         self._bridge = _ControllerBridge(self)
         self._bridge.snapshot_received.connect(self._apply_snapshot)
         self._bridge.operation_finished.connect(self._operation_finished)
@@ -141,6 +144,11 @@ class ApplicationController(QObject):
         if self._closed or self._started:
             return
         self._started = True
+        if self._local_control_server is not None:
+            try:
+                self._local_control_server.start()
+            except Exception:
+                logger.exception("could not start local control server")
         if (
             self._settings.last_port
             and self._settings.last_port in self._window.available_ports()
@@ -162,6 +170,8 @@ class ApplicationController(QObject):
         except (AttributeError, ValueError):
             pass
         self._save_preferences()
+        if self._local_control_server is not None:
+            self._local_control_server.close()
         self._core.close()
         self._executor.shutdown(wait=True, cancel_futures=True)
 
@@ -297,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         debug=arguments.debug,
     )
     _apply_persisted_authorizations(core, settings)
+    local_control_server = LocalControlServer(core, data_dir / "control.json")
     window = MainWindow(
         core.chat,
         file_service=core.files,
@@ -308,6 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         window,
         settings_store,
         settings,
+        local_control_server=local_control_server,
     )
     qt_app.aboutToQuit.connect(controller.close)
     window.emergency_exit_requested.connect(qt_app.quit)

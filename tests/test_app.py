@@ -55,6 +55,18 @@ class FakeCore:
         self.close_calls += 1
 
 
+class FakeLocalControlServer:
+    def __init__(self):
+        self.start_calls = 0
+        self.close_calls = 0
+
+    def start(self):
+        self.start_calls += 1
+
+    def close(self):
+        self.close_calls += 1
+
+
 class FakeWindow(QObject):
     connect_requested = Signal(str, int)
     disconnect_requested = Signal()
@@ -148,6 +160,24 @@ def test_controller_autoconnects_only_when_saved_port_is_present(qtbot, tmp_path
     assert core.close_calls == 1
     assert executor.shutdown_calls == [(True, True)]
     assert SettingsStore(tmp_path / "settings.json").load().peer_side == "left"
+
+
+def test_controller_starts_and_closes_local_control_server(tmp_path):
+    local_control = FakeLocalControlServer()
+    controller = app.ApplicationController(
+        FakeCore(),
+        FakeWindow(()),
+        SettingsStore(tmp_path / "settings.json"),
+        AppSettings(),
+        executor=ImmediateExecutor(),
+        local_control_server=local_control,
+    )
+
+    controller.start()
+    controller.close()
+
+    assert local_control.start_calls == 1
+    assert local_control.close_calls == 1
 
 
 def test_controller_saves_authorizations_as_soon_as_preferences_change(tmp_path):

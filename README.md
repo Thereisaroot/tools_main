@@ -178,6 +178,26 @@ the remote peer partial control; text, file, and shell features remain separate.
   message; exhausted retries are reported as `Delivery failed`.
 - `Choose File` and the drop target use the same encrypted, windowed transfer
   service.
+
+### Local Control CLI
+
+An already-running GUI exposes a token-authenticated control endpoint on
+`127.0.0.1`. This lets scripts or local automation send through the GUI without
+closing it or trying to open its serial port a second time:
+
+```bash
+shooklinkctl status
+shooklinkctl send-file "/path/to/file.html"
+shooklinkctl send-plain "plain message"
+shooklinkctl send-secure "secure message"
+```
+
+Without an installed console script, use
+`python3 -m shooklink.local_control.cli` followed by the same arguments. File
+commands return only after final hash verification by the peer. Text commands
+return only after peer acknowledgement. This is a local application feature;
+the remote peer does not need an update unless it should also accept local CLI
+commands.
 - Received files are finalized only after SHA-256 verification and are stored in
   `~/Downloads/ShookLink` by default.
 - Chat remains usable while a file or input session is active.
