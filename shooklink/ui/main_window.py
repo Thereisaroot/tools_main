@@ -263,6 +263,7 @@ class MainWindow(QMainWindow):
         )
         self.connection_status = QLabel("Disconnected")
         self.connection_status.setObjectName("connectionStatus")
+        self.connection_status.setTextFormat(Qt.TextFormat.PlainText)
         heading_row.addWidget(self.connection_status)
         layout.addLayout(heading_row)
 
@@ -969,6 +970,15 @@ class MainWindow(QMainWindow):
                 CoreState.READY: "Ready",
                 CoreState.ERROR: "Error",
             }[snapshot.state]
+        if snapshot.state is CoreState.READY and snapshot.peer_version:
+            version = "".join(c for c in snapshot.peer_version[:128] if c.isprintable()).strip()
+            if version:
+                version = self.connection_status.fontMetrics().elidedText(
+                    version, Qt.TextElideMode.ElideRight, 145
+                )
+                status += f" · Peer v{version}"
+                if snapshot.peer_revision:
+                    status += f" ({snapshot.peer_revision[:12]})"
         self.connection_status.setText(status)
         if snapshot.error:
             self.action_status.setText(snapshot.error)

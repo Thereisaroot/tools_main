@@ -381,6 +381,30 @@ def test_light_surface_text_remains_dark_with_a_dark_system_palette(qtbot):
         application.setPalette(original_palette)
 
 
+def test_ready_shows_the_connected_peers_version_and_optional_build(qtbot):
+    window = MainWindow(ChatService(FakeBus()))
+    qtbot.addWidget(window)
+    revision = "1234567890abcdef" * 4
+
+    for build, expected in (
+        (None, "Ready · Peer v7.2.1"),
+        (revision, "Ready · Peer v7.2.1 (1234567890ab)"),
+        ("checkout", "Ready · Peer v7.2.1 (checkout)"),
+    ):
+        window.apply_core_snapshot(
+            CoreSnapshot(1, CoreState.READY, peer_version="7.2.1", peer_revision=build)
+        )
+        assert window.connection_status.text() == expected
+
+    for state, expected in (
+        (CoreState.HANDSHAKING, "Handshaking"),
+        (CoreState.DISCONNECTED, "Disconnected"),
+        (CoreState.READY, "Ready"),
+    ):
+        window.apply_core_snapshot(CoreSnapshot(2, state))
+        assert window.connection_status.text() == expected
+
+
 def test_connection_state_exposes_trust_approval_and_disconnect(qtbot):
     bus = FakeBus(trusted=False)
     window = MainWindow(ChatService(bus))

@@ -153,6 +153,8 @@ class LocalControlServer:
                 "connection_id": snapshot.connection_id,
                 "state": state,
                 "peer_id": snapshot.peer_id,
+                "peer_version": snapshot.peer_version,
+                "peer_revision": snapshot.peer_revision,
                 "trusted": bool(
                     snapshot.local_approved and snapshot.remote_approved
                 ),

@@ -78,6 +78,11 @@ identity for later connections. If the identity fingerprint changes, ShookLink
 blocks protected features; investigate and verify the new identity instead of
 approving an unexpected change.
 
+Next to `Ready`, `Peer v…` shows the version running on the other computer.
+Peers that support build reporting also show the first 12 characters of the
+running release commit (or `checkout` for a source run). Older peers show
+only the version; this does not confirm that a particular update was installed.
+
 Plain text is intentionally unencrypted and can be sent before trust is
 established. Secure text, file contents, shell traffic, and shared input are
 authenticated and encrypted after trust.

@@ -1037,6 +1037,7 @@ def test_secure_chat_recovers_when_the_first_frame_is_lost(tmp_path):
 def test_peer_reconnects_while_other_serial_port_stays_open(tmp_path):
     left, *_ = build_core(tmp_path, "left-asymmetric-reconnect")
     right, *_ = build_core(tmp_path, "right-asymmetric-reconnect")
+    right.updates.revision = "a" * 40
     left_endpoint, right_endpoint = endpoint_pair()
     left.connect_endpoint(left_endpoint)
     right.connect_endpoint(right_endpoint)
@@ -1049,14 +1050,17 @@ def test_peer_reconnects_while_other_serial_port_stays_open(tmp_path):
             and right.snapshot.state is CoreState.UNTRUSTED
         )
         approve_pair(left, right)
+        assert wait_for(lambda: left.snapshot.peer_revision == "a" * 40)
 
         right.disconnect()
         assert wait_for(lambda: right.snapshot.state is CoreState.DISCONNECTED)
+        assert right.snapshot.peer_version is None and right.snapshot.peer_revision is None
         assert left.snapshot.state is CoreState.READY
 
         replacement = MemoryEndpoint()
         left_endpoint.connect(replacement)
         replacement.connect(left_endpoint)
+        right.updates.revision = "b" * 40
         right.connect_endpoint(replacement)
 
         assert wait_for(
@@ -1064,6 +1068,7 @@ def test_peer_reconnects_while_other_serial_port_stays_open(tmp_path):
             and right.snapshot.state is CoreState.READY,
             timeout=2,
         )
+        assert wait_for(lambda: left.snapshot.peer_revision == "b" * 40)
         right.chat.send_secure("asymmetric reconnect")
         assert wait_for(
             lambda: any(

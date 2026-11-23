@@ -21,6 +21,8 @@ class FakeSnapshot:
     remote_approved: bool = True
     features: frozenset[str] = frozenset({"chat", "files", "shell"})
     error: str | None = None
+    peer_version: str | None = "7.2.1"
+    peer_revision: str | None = None
 
     def __post_init__(self):
         if self.state is None:
@@ -123,6 +125,8 @@ def test_status_reports_live_core_snapshot(running_server):
         "connection_id": 7,
         "state": "ready",
         "peer_id": "peer-1",
+        "peer_version": "7.2.1",
+        "peer_revision": None,
         "trusted": True,
         "features": ["chat", "files", "shell"],
     }

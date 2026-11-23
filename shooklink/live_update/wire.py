@@ -93,6 +93,11 @@ class UpdateService:
                         pending[1].put_nowait(fields)
                     except queue.Full:
                         pass
+            if pending is None and fields.get("ok") is True:
+                result = fields.get("result")
+                revision = result.get("revision") if isinstance(result, dict) else None
+                if revision == "checkout" or hex_id(revision, 40) or hex_id(revision, 64):
+                    self.core.record_peer_revision(snapshot.connection_id, nonce, revision)
             return
         try:
             job = fields.get("job")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import uuid
 from collections import deque
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -94,6 +95,8 @@ class CoreSnapshot:
     remote_approved: bool = False
     features: frozenset[str] = frozenset()
     error: str | None = None
+    peer_version: str | None = None
+    peer_revision: str | None = None
 
 
 @dataclass(slots=True)
@@ -106,6 +109,9 @@ class _Connection:
     trust_status: TrustStatus = TrustStatus.UNKNOWN
     remote_approved: bool = False
     remote_features: frozenset[str] = frozenset()
+    remote_version: str | None = None
+    remote_revision: str | None = None
+    revision_probe_nonce: str | None = None
     last_accepts_fingerprint: str | None = None
     trust_sent: bool = False
     input_bound: bool = False
@@ -387,8 +393,7 @@ class ShookLinkCore:
                 self._send_trust(connection_id)
             except LinkClosedError:
                 pass
-        self._refresh_input_if_ready(connection_id)
-        self._publish_current()
+        self._publish_trust_state(connection_id)
 
     def send(
         self,
@@ -898,6 +903,9 @@ class ShookLinkCore:
             connection.trust_status = TrustStatus.UNKNOWN
             connection.remote_approved = False
             connection.remote_features = frozenset()
+            connection.remote_version = None
+            connection.remote_revision = None
+            connection.revision_probe_nonce = None
             connection.last_accepts_fingerprint = None
             connection.trust_sent = False
             connection.input_bound = False
@@ -944,6 +952,7 @@ class ShookLinkCore:
             connection.remote_fingerprint = fingerprint
             connection.trust_status = trust_status
             connection.remote_features = frozenset(metadata["features"])
+            connection.remote_version = metadata["app_version"]
             connection.remote_approved = (
                 metadata["accepts_fingerprint"] == self.identity.fingerprint
             )
@@ -957,7 +966,45 @@ class ShookLinkCore:
                 if current is not None and current.connection_id == connection_id:
                     current.input_bound = True
         self._send_trust(connection_id)
+        self._publish_trust_state(connection_id)
+
+    def _publish_trust_state(self, connection_id: int) -> None:
         self._refresh_input_if_ready(connection_id)
+        self._publish_current()
+        with self._lock:
+            connection = self._connection
+            if (
+                connection is None
+                or connection.connection_id != connection_id
+                or not self._trusted_locked()
+                or UPDATE_FEATURE not in connection.remote_features
+                or UPDATE_FEATURE not in self._local_features()
+                or connection.remote_revision is not None
+                or connection.revision_probe_nonce is not None
+            ):
+                return
+            nonce = connection.revision_probe_nonce = uuid.uuid4().hex
+        try:
+            self.send(
+                Message(MessageType.UPDATE_PROBE, {"nonce": nonce, "job": ""}),
+                secure=True, priority=Priority.INTERACTIVE,
+                expected_connection_id=connection_id,
+            )
+        except (RuntimeError, OSError) as error:
+            logger.debug("Optional peer build probe was not sent: %s", error)
+
+    def record_peer_revision(self, connection_id: int, nonce: str, revision: str) -> None:
+        with self._lock:
+            connection = self._connection
+            if (
+                connection is None
+                or connection.connection_id != connection_id
+                or not self._trusted_locked()
+                or connection.revision_probe_nonce != nonce
+            ):
+                return
+            connection.revision_probe_nonce = None
+            connection.remote_revision = revision
         self._publish_current()
 
     def _dispatch(
@@ -1058,6 +1105,8 @@ class ShookLinkCore:
             connection.trust_status is TrustStatus.TRUSTED,
             connection.remote_approved,
             connection.remote_features,
+            peer_version=connection.remote_version if state is CoreState.READY else None,
+            peer_revision=connection.remote_revision if state is CoreState.READY else None,
         )
 
     def _publish_current(self) -> None:
