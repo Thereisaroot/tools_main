@@ -338,11 +338,16 @@ def test_lock_setup_failure_closes_open_file(tmp_path, monkeypatch):
         opened_files.append(opened_file)
         return opened_file
 
-    def denied_chmod(_path, _mode):
+    def denied_setup(*_args):
         raise PermissionError("denied")
 
     monkeypatch.setattr(Path, "open", tracked_open)
-    monkeypatch.setattr(Path, "chmod", denied_chmod)
+    if os.name == "nt":
+        import msvcrt
+
+        monkeypatch.setattr(msvcrt, "locking", denied_setup)
+    else:
+        monkeypatch.setattr(Path, "chmod", denied_setup)
     lock = crypto._InterProcessFileLock(tmp_path / "target")
 
     with pytest.raises(PermissionError):
