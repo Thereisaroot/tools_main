@@ -4,10 +4,10 @@ import threading
 
 import pytest
 
+if os.name != "posix":
+    pytest.skip("Unix PTY only", allow_module_level=True)
+
 from shooklink.shell.unix_pty import UnixPtyProcess
-
-
-pytestmark = pytest.mark.skipif(os.name != "posix", reason="Unix PTY only")
 
 
 @pytest.mark.filterwarnings("error:This process.*fork")

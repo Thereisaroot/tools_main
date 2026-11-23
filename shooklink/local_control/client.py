@@ -16,11 +16,7 @@ class LocalControlError(RuntimeError):
     """Raised when the local GUI cannot complete a control request."""
 
 
-def default_endpoint_path() -> Path:
-    override = os.environ.get("SHOOKLINK_CONTROL_ENDPOINT")
-    if override:
-        return Path(override).expanduser()
-
+def application_data_dir() -> Path:
     from PySide6.QtCore import QCoreApplication, QStandardPaths
 
     QCoreApplication.setApplicationName("ShookLink")
@@ -29,8 +25,15 @@ def default_endpoint_path() -> Path:
         QStandardPaths.StandardLocation.AppDataLocation
     )
     if location:
-        return Path(location) / "control.json"
-    return Path.home() / ".shooklink" / "control.json"
+        return Path(location)
+    return Path.home() / ".shooklink"
+
+
+def default_endpoint_path() -> Path:
+    override = os.environ.get("SHOOKLINK_CONTROL_ENDPOINT")
+    if override:
+        return Path(override).expanduser()
+    return application_data_dir() / "control.json"
 
 
 class LocalControlClient:

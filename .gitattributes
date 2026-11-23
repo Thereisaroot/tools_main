@@ -1,2 +1,3 @@
 /run_serial_text_chat.bat text eol=crlf
 /run_serial_text_chat.sh text eol=lf
+/shooklink/__init__.py export-subst

@@ -19,6 +19,8 @@ from shooklink.files.service import FileService
 from shooklink.input.backend import BaseInputBackend
 from shooklink.input.service import InputService
 from shooklink.input.topology import Side
+from shooklink.live_update.release import FEATURE as UPDATE_FEATURE
+from shooklink.live_update.wire import UpdateService
 from shooklink.protocol.crypto import (
     HandshakeError,
     Identity,
@@ -52,7 +54,7 @@ PROTOCOL_VERSION = 1
 AEAD_TAG_SIZE = 16
 HANDSHAKE_RETRY_SECONDS = 0.5
 LOCAL_FEATURES = frozenset(
-    {"chat", CHAT_ACK_FEATURE, "files", "shell", "input"}
+    {"chat", CHAT_ACK_FEATURE, "files", "shell", "input", UPDATE_FEATURE}
 )
 MAX_FEATURES = 32
 MAX_PEER_ID_BYTES = 256
@@ -119,6 +121,10 @@ class _Connection:
 
 
 _FEATURE_BY_TYPE = {
+    MessageType.UPDATE_PROBE: UPDATE_FEATURE,
+    MessageType.UPDATE_APPLY: UPDATE_FEATURE,
+    MessageType.UPDATE_REPORT: UPDATE_FEATURE,
+    MessageType.UPDATE_CONFIRM: UPDATE_FEATURE,
     MessageType.CHAT_PLAIN: "chat",
     MessageType.CHAT_SECURE: "chat",
     MessageType.FILE_OFFER: "files",
@@ -151,6 +157,10 @@ _FEATURE_BY_TYPE = {
 _PLAIN_TYPES = frozenset({MessageType.HELLO, MessageType.CHAT_PLAIN})
 
 _ALLOWED_PRIORITIES = {
+    MessageType.UPDATE_PROBE: frozenset({Priority.INTERACTIVE}),
+    MessageType.UPDATE_APPLY: frozenset({Priority.INTERACTIVE}),
+    MessageType.UPDATE_REPORT: frozenset({Priority.INTERACTIVE}),
+    MessageType.UPDATE_CONFIRM: frozenset({Priority.INTERACTIVE}),
     MessageType.HELLO: frozenset({Priority.INTERACTIVE}),
     MessageType.TRUST: frozenset({Priority.INTERACTIVE}),
     MessageType.CHAT_PLAIN: frozenset({Priority.NORMAL}),
@@ -198,6 +208,7 @@ class ShookLinkCore:
         peer_side: Side = Side.RIGHT,
         auto_edge_enabled: bool = False,
         debug: bool = False,
+        update_receiver=None,
     ) -> None:
         _validate_peer_id(local_peer_id)
         if not isinstance(identity, Identity):
@@ -221,6 +232,7 @@ class ShookLinkCore:
         self._links: list[SerialLink] = []
 
         self.chat = ChatService(self)
+        self.updates = UpdateService(self, update_receiver)
         self.files = FileService(self, download_dir)
         self.files.disconnect()
         self.shell = (
@@ -960,6 +972,8 @@ class ShookLinkCore:
             service = self.files
         elif feature == "shell":
             service = self.shell
+        elif feature == UPDATE_FEATURE:
+            service = self.updates
         elif feature == "input" and self.input is not None:
             service = self.input
         else:

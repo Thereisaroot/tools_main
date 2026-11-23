@@ -231,6 +231,86 @@ not bundled. For a fully offline machine, dependencies for that release must
 already be installed or supplied separately. On macOS use the `.sh` launcher
 in the extracted release.
 
+### Managed live updates on one serial port
+
+The sending GUI keeps its port open. The Windows GUI receives the ZIP and
+stages it while connected. A small foreground supervisor waits for that GUI
+process to exit before starting the candidate on the same COM port, with the
+same saved settings and identity. There is a brief gap in communication.
+The supervisor never opens COM. Management is limited to probing the running
+app and activating a publisher-signed ShookLink release.
+
+**One-time bootstrap**
+
+1. On a trusted release-signing computer, create a dedicated Ed25519 key
+   outside the checkout and downloads folder. Keep the private file with the
+   publisher. Give the **printed 64-digit public key** to the Windows operator
+   through an independently trusted channel.
+
+   ```bash
+   python3 -m shooklink.local_control.cli release-keygen ~/.shooklink-release.key
+   ```
+
+2. Use the ordinary `send-update` procedure above for an old receiver. Extract
+   this bootstrap once into a permanent directory, close the old GUI, and from
+   that directory run this on Windows, substituting the public key:
+
+   ```bat
+   run_serial_text_chat.bat --managed --publisher PUBLIC_KEY_HEX
+   ```
+
+   Connect and approve the peer normally. On subsequent manual launches use
+   `run_serial_text_chat.bat --managed` **from the same bootstrap directory**.
+   It remembers the publisher and last healthy slot. Keep this launcher open
+   while using ShookLink. The managed GUI title shows its build and update
+   phase. An ordinary GUI launch does not enable release activation.
+
+3. Run the sending GUI from this version or newer. Agent/CLI commands talk
+   to that GUI over its existing local control endpoint. Check the actual
+   peer with `python3 -m shooklink.local_control.cli peer-update-status`. Its
+   reply includes `managed`, `publisher`, `highest`, `revision`, `instance`,
+   and the most recent transaction. A legacy peer requires the local bootstrap.
+
+**Publish and apply a release**
+
+From the release checkout on the signing computer, choose a positive sequence
+greater than the receiver's `highest`:
+
+```bash
+python3 -m shooklink.local_control.cli sign-update --key ~/.shooklink-release.key --sequence 1
+```
+
+Give the generated ZIP and matching `.release.json` to the controller, in the
+same folder. Replace `COMMIT_PREFIX` below with the 12 hex digits in the name:
+
+```bash
+python3 -m shooklink.local_control.cli live-update dist/ShookLink-COMMIT_PREFIX.release.json
+```
+
+The controller checks for an idle, trusted, enrolled peer before sending. The
+receiver accepts only a verified file transfer from that connection, checks the
+release signature, ZIP digest, full revision and allowed archive contents, and
+stages a fresh slot. It checks again for active file, shell and input sessions
+before switching. Staged sequences are consumed even if rolled back; use a new
+higher sequence for a new attempt. Repeating an already-running release reports
+`already_running` without restarting it.
+
+After reconnecting, the controller must get a fresh authenticated reply from
+the same peer identity and installation, carrying the new process instance,
+transaction ID and exact build. The controller acknowledges that instance,
+the candidate's GUI event loop reports healthy, and the supervisor commits
+the slot. Only a subsequent live reply for the committed slot yields
+`verified`. A lost apply reply is safe to retry within the same transaction.
+
+A failed start or a trial without this round trip for 60 seconds brings back
+the previous healthy slot. An interrupted trial is also recovered on the next
+managed launch. The CLI has a 180-second overall deadline (override with
+`--timeout SECONDS`). If the cable is out, the local timeout cannot establish
+the remote outcome. Reconnect and use `peer-update-status --job JOB_ID` to
+inspect the last transaction and its reason. No remote shell, admin rights, second port, or
+online package install is part of the handoff. Changes to the stable supervisor
+itself require a new local bootstrap.
+
 ## Development
 
 Install test dependencies and run the same portable checks used by CI:

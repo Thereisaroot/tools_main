@@ -9,6 +9,7 @@ import secrets
 import socketserver
 import tempfile
 import threading
+import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,25 @@ class LocalControlServer:
         return {"ok": True, "result": result}
 
     def _dispatch(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if command == "peer-update-status":
+            from shooklink.live_update.release import hex_id
+            from shooklink.protocol.messages import MessageType
+
+            job = payload.get("job", "")
+            if set(payload) - {"job"} or not (job == "" or hex_id(job, 32)):
+                raise ValueError("invalid update status request")
+            report = self._core.updates.exchange(MessageType.UPDATE_PROBE, {"job": job})
+            if job and report.get("job") != job:
+                raise ValueError("this job is not the receiver's most recent transaction")
+            return report
+        if command == "live-update":
+            from shooklink.live_update.deployment import deploy
+            from shooklink.live_update.release import Release
+
+            if set(payload) != {"path", "release", "job", "timeout"}:
+                raise ValueError("invalid live update request")
+            return deploy(self._core, self._send_file, Path(payload["path"]),
+                          Release.parse(payload["release"]), payload["job"], payload["timeout"])
         if command == "status":
             if payload:
                 raise ValueError("status payload must be empty")
@@ -171,7 +191,8 @@ class LocalControlServer:
             raise RuntimeError(str(outcome["error"]))
         return {"kind": kind, "delivered": True}
 
-    def _send_file(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _send_file(self, payload: dict[str, Any], *, deadline: float | None = None,
+                   expected_epoch: int | None = None) -> dict[str, Any]:
         if set(payload) != {"path"} or not isinstance(payload["path"], str):
             raise ValueError("file payload must contain one path string")
         path = Path(payload["path"]).expanduser().resolve()
@@ -191,18 +212,35 @@ class LocalControlServer:
 
         self._core.files.add_progress_listener(progress_changed)
         try:
+            remaining = 30 if deadline is None else min(30, deadline - time.monotonic())
+            if remaining <= 0:
+                raise TimeoutError("update timed out before file preparation")
+            options = {} if expected_epoch is None else {"expected_epoch": expected_epoch}
+            future = self._core.files.send_file(path, **options)
             try:
-                transfer_id = self._core.files.send_file(path).result(timeout=30)
+                transfer_id = future.result(timeout=remaining)
             except FutureTimeoutError as error:
+                if deadline is not None and not future.cancel():
+                    def cancel_late(done):
+                        if done.exception() is None:
+                            self._core.files.cancel(done.result())
+                    future.add_done_callback(cancel_late)
                 raise TimeoutError("file preparation timed out") from error
-            with progress_condition:
-                available = progress_condition.wait_for(
-                    lambda: transfer_id in terminal,
-                    timeout=self._file_timeout,
-                )
-                if not available:
-                    raise TimeoutError("file transfer timed out")
-                progress = terminal.get(transfer_id)
+            end = time.monotonic() + self._file_timeout if deadline is None else deadline
+            while True:
+                if expected_epoch is not None and self._core.files.connection_epoch != expected_epoch:
+                    raise RuntimeError("connection changed during update transfer; activation was not requested")
+                remaining = end - time.monotonic()
+                with progress_condition:
+                    progress = terminal.get(transfer_id)
+                    if progress is not None:
+                        break
+                    if remaining > 0:
+                        progress_condition.wait(remaining if deadline is None else min(0.5, remaining))
+                        continue
+                if expected_epoch is not None:
+                    self._core.files.cancel(transfer_id)
+                raise TimeoutError("file transfer timed out")
             if progress.state != "complete":
                 raise RuntimeError(f"file transfer failed: {progress.state}")
             return {

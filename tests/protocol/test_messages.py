@@ -125,6 +125,10 @@ def test_all_required_message_types_are_stable_and_unique():
         "INPUT_POINTER_STATE": 49,
         "INPUT_STOP": 50,
         "INPUT_RELEASE_ALL": 51,
+        "UPDATE_PROBE": 60,
+        "UPDATE_APPLY": 61,
+        "UPDATE_REPORT": 62,
+        "UPDATE_CONFIRM": 63,
     }
 
     assert required == {member.name: member.value for member in MessageType}

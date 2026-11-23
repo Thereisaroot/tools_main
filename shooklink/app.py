@@ -12,11 +12,12 @@ import uuid
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QStandardPaths, QTimer, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication
 
 from shooklink.core import CoreSnapshot, ShookLinkCore
 from shooklink.input.topology import Side
+from shooklink.local_control.client import application_data_dir
 from shooklink.local_control.server import LocalControlServer
 from shooklink.protocol.crypto import IdentityStore, TrustStore
 from shooklink.settings import AppSettings, SettingsStore
@@ -33,6 +34,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="enable protocol diagnostics without logging secure payloads",
     )
+    parser.add_argument("--managed", action="store_true", help="run under the local update supervisor")
+    parser.add_argument("--publisher", help="enroll the release public key on the first managed launch")
     return parser
 
 
@@ -81,15 +84,6 @@ def _load_or_create_peer_id(path: str | Path) -> str:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
     return peer_id
-
-
-def _application_data_dir() -> Path:
-    location = QStandardPaths.writableLocation(
-        QStandardPaths.StandardLocation.AppDataLocation
-    )
-    if location:
-        return Path(location)
-    return Path.home() / ".shooklink"
 
 
 class _ControllerBridge(QObject):
@@ -281,7 +275,16 @@ def _future_error(future: Future) -> BaseException | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    arguments = build_argument_parser().parse_args(argv)
+    parser = build_argument_parser()
+    arguments = parser.parse_args(argv)
+    if arguments.managed:
+        from shooklink.live_update.supervisor import run_launcher
+        try:
+            return run_launcher(arguments.publisher, arguments.debug)
+        except (OSError, ValueError) as error:
+            parser.exit(1, f"ShookLink: {error}\n")
+    if arguments.publisher:
+        parser.error("--publisher requires --managed")
     logging.basicConfig(
         level=logging.DEBUG if arguments.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -292,10 +295,22 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.debug:
         qt_app.setProperty("shooklinkDebug", True)
 
-    data_dir = _application_data_dir()
+    data_dir = application_data_dir()
     settings_store = SettingsStore(data_dir / "settings.json")
     settings = settings_store.load()
     identity = IdentityStore(data_dir / "identity.key").load_or_create()
+    from shooklink.live_update.manager import MANAGED_ENV, SWITCH_EXIT, ManagedReceiver
+
+    receiver = None
+    if os.environ.get(MANAGED_ENV):
+        from PySide6.QtCore import QLockFile
+
+        managed_home = Path(os.environ[MANAGED_ENV])
+        owner = QLockFile(str(managed_home / "child.lock"))
+        owner.setStaleLockTime(0)
+        if not owner.tryLock(0):
+            parser.exit(1, "ShookLink: another managed GUI is still running\n")
+        receiver = ManagedReceiver(managed_home)
     core = ShookLinkCore(
         identity=identity,
         trust_store=TrustStore(data_dir / "trusted-peers.json"),
@@ -305,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
         peer_side=Side(settings.peer_side),
         auto_edge_enabled=settings.auto_edge_enabled,
         debug=arguments.debug,
+        update_receiver=receiver,
     )
     _apply_persisted_authorizations(core, settings)
     local_control_server = LocalControlServer(core, data_dir / "control.json")
@@ -325,10 +341,27 @@ def main(argv: list[str] | None = None) -> int:
     window.emergency_exit_requested.connect(qt_app.quit)
     window.show()
     controller.start()
+    if receiver is not None:
+        def poll_update():
+            if core.updates.tick():
+                qt_app.exit(SWITCH_EXIT)
+                return
+            phase = receiver.report()["phase"]
+            title = f"ShookLink | Managed updates | {core.updates.revision[:12]} | {phase}"
+            if window.windowTitle() != title:
+                window.setWindowTitle(title)
+
+        timer = QTimer(controller)
+        timer.timeout.connect(poll_update)
+        timer.start(200)
     try:
         return qt_app.exec()
     finally:
         controller.close()
+        if receiver is not None:
+            timer.stop()
+            receiver.close()
+            owner.unlock()
 
 
 __all__ = [

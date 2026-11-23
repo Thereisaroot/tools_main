@@ -282,9 +282,11 @@ def test_win32_key_text_uses_supplied_state_without_get_keyboard_state(win32_api
     user32.GetKeyboardLayout.result = 1
 
     def translate(_virtual_key, _scan_code, state, buffer, *_args):
-        assert state[0x10] == 0x80
-        assert state[0xA0] == 0x80
-        assert state[0xBF] == 0x80
+        # Older ctypes.wintypes exposes BYTE as signed; Win32 consumes raw bytes.
+        raw = bytes(state)
+        assert raw[0x10] == 0x80
+        assert raw[0xA0] == 0x80
+        assert raw[0xBF] == 0x80
         buffer[0] = "?"
         return 1
 

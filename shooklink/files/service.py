@@ -742,13 +742,34 @@ class FileService:
             except ValueError:
                 pass
 
-    def send_file(self, path: str | Path) -> Future[str]:
+    @property
+    def connection_epoch(self) -> int:
+        with self._lock:
+            return self._connection_epoch
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return bool(self._preparing_count or self._outgoing or self._incoming
+                        or self._finalizing or self._pending_cancels)
+
+    def completed_path(self, transfer_id: str, digest: str) -> Path | None:
+        """Look up only a finalized inbound transfer from the current connection."""
+        with self._lock:
+            item = self._completed_incoming.get(transfer_id)
+            if item and item[1] == "ok" and item[0].sha256 == digest:
+                return item[2]
+            return None
+
+    def send_file(self, path: str | Path, *, expected_epoch: int | None = None) -> Future[str]:
         self._ensure_trusted()
         with self._lock:
             if self._closed:
                 raise FileTransferError("file service is closed")
             if not self._connected:
                 raise FileTransferError("file service is not connected")
+            if expected_epoch is not None and self._connection_epoch != expected_epoch:
+                raise FileTransferError("file transfer connection changed before sending")
             if (
                 len(self._outgoing)
                 + self._preparing_count
