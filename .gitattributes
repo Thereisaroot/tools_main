@@ -1,0 +1,2 @@
+/run_serial_text_chat.bat text eol=crlf
+/run_serial_text_chat.sh text eol=lf

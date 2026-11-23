@@ -178,6 +178,9 @@ the remote peer partial control; text, file, and shell features remain separate.
   message; exhausted retries are reported as `Delivery failed`.
 - `Choose File` and the drop target use the same encrypted, windowed transfer
   service.
+- Received files are finalized only after SHA-256 verification and are stored in
+  `~/Downloads/ShookLink` by default.
+- Chat remains usable while a file or input session is active.
 
 ### Local Control CLI
 
@@ -198,9 +201,35 @@ commands return only after final hash verification by the peer. Text commands
 return only after peer acknowledgement. This is a local application feature;
 the remote peer does not need an update unless it should also accept local CLI
 commands.
-- Received files are finalized only after SHA-256 verification and are stored in
-  `~/Downloads/ShookLink` by default.
-- Chat remains usable while a file or input session is active.
+
+### Update a peer over serial
+
+From the ShookLink Git checkout on the sending computer, run:
+
+```bash
+python3 -m shooklink.local_control.cli send-update
+```
+
+This packages the current **committed HEAD** as `dist/ShookLink-<commit>.zip` and
+sends it through the running GUI. The ZIP contains the tracked ShookLink Python
+modules, launchers, requirements, project metadata and README. Use `pack-update`
+instead of `send-update` to prepare the ZIP offline for `Choose File` or drag and
+drop. Both commands accept `--repo PATH` and `--output-dir PATH`.
+
+Any ShookLink peer that already supports encrypted file transfers can receive
+the first update. After reception reports `complete`, on Windows:
+
+1. Click `Open Downloads`. In Explorer, select the ZIP and choose **Extract All**
+   into a fresh folder. The release folder name includes the sender's commit ID.
+2. Close the running ShookLink, then run `run_serial_text_chat.bat` in the new
+   release folder using the same Windows account and Python environment.
+3. To return to the previous release, close the new one and start the old launcher.
+
+The new release reuses the account's saved settings, identity and downloads.
+Windows does not need Git or GitHub access. Python and dependency wheels are
+not bundled. For a fully offline machine, dependencies for that release must
+already be installed or supplied separately. On macOS use the `.sh` launcher
+in the extracted release.
 
 ## Development
 
