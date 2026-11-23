@@ -13,6 +13,7 @@ import uuid
 
 import pytest
 
+from shooklink.live_update.enrollment import PublisherPin, local_signer
 from shooklink.live_update.manager import MANAGED_ENV, State
 from shooklink.live_update.release import Release
 from shooklink.live_update.supervisor import supervise
@@ -77,8 +78,10 @@ class SinglePort:
             self.receiver.close()
 
 
-@pytest.mark.parametrize("drop_candidate", [False, True], ids=["installed", "rollback"])
-def test_controller_observes_handoff_on_same_open_link(tmp_path, capsys, drop_candidate):
+@pytest.mark.parametrize(("drop_candidate", "button_pairing"), [(False, False), (True, False),
+                         (False, True)], ids=["installed", "rollback", "button-installed"])
+def test_controller_observes_handoff_on_same_open_link(tmp_path, capsys, monkeypatch,
+                                                     drop_candidate, button_pairing):
     source = Path(__file__).resolve().parents[2]
     checkout = tmp_path / "bootstrap"
     checkout.mkdir()
@@ -92,11 +95,16 @@ def test_controller_observes_handoff_on_same_open_link(tmp_path, capsys, drop_ca
     subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                     "-c", "commit.gpgsign=false", "commit", "-qm", "offline test release"],
                    cwd=checkout, check=True)
-    private_key = tmp_path / "offline.key"
-    assert cli.main(["release-keygen", str(private_key)]) == 0
-    public_key = capsys.readouterr().out.strip().removeprefix("publisher public key: ")
-    assert cli.main(["sign-update", "--repo", str(checkout), "--key", str(private_key),
-                     "--sequence", "1"]) == 0
+    if button_pairing:
+        monkeypatch.setattr(cli, "application_data_dir", lambda: tmp_path / "mac-data")
+        public_key = local_signer(tmp_path / "mac-data").public_bytes.hex()
+        key_args = []
+    else:
+        private_key = tmp_path / "offline.key"
+        assert cli.main(["release-keygen", str(private_key)]) == 0
+        public_key = capsys.readouterr().out.strip().removeprefix("publisher public key: ")
+        key_args = ["--key", str(private_key)]
+    assert cli.main(["sign-update", "--repo", str(checkout), "--sequence", "1", *key_args]) == 0
     manifest, = (checkout / "dist").glob("*.release.json")
     release = Release.parse(json.loads(manifest.read_bytes()))
     release.verify(public_key)
@@ -105,7 +113,8 @@ def test_controller_observes_handoff_on_same_open_link(tmp_path, capsys, drop_ca
     data = tmp_path / "receiver-data"
     home = data / "managed-updates"
     home.mkdir(parents=True)
-    (home / "publisher").write_text(public_key)
+    if not button_pairing:
+        (home / "publisher").write_text(public_key)
     peer = uuid.uuid4().hex
     (data / "installation-id").write_text(peer)
     SettingsStore(data / "settings.json").save(AppSettings(
@@ -114,7 +123,7 @@ def test_controller_observes_handoff_on_same_open_link(tmp_path, capsys, drop_ca
     (data / "downloads").mkdir()
     old_download = data / "downloads" / (release.name + ".zip")
     old_download.write_bytes(b"previous download")
-    sender, _, _ = build_core(tmp_path, "controller")
+    sender, _, _ = build_core(tmp_path, "controller", update_publisher=public_key if button_pairing else None)
     receiver_identity = IdentityStore(data / "identity.key").load_or_create()
     sender.trust_store.accept(peer, receiver_identity.fingerprint)
     TrustStore(data / "trusted-peers.json").accept(sender.local_peer_id, sender.identity.fingerprint)
@@ -133,6 +142,14 @@ from shooklink.ui import main_window
 app.application_data_dir = lambda: Path(os.environ['TEST_DATA'])
 app._build_input_backend = lambda: None
 main_window.list_ports.comports = lambda: [SimpleNamespace(device=os.environ['TEST_PORT'])]
+if os.environ.get('TEST_LOCAL_CLICK') == '1':
+    from PySide6.QtCore import QTimer
+    apply = app.MainWindow.apply_core_snapshot
+    def simulate_local_operator(window, snapshot):
+        apply(window, snapshot)
+        if window.allow_updates_button.isVisible() and window.allow_updates_button.isEnabled():
+            QTimer.singleShot(0, window.allow_updates_button.click)
+    app.MainWindow.apply_core_snapshot = simulate_local_operator
 raise SystemExit(app.main())
 """
     def launch(folder):
@@ -141,6 +158,7 @@ raise SystemExit(app.main())
         assert all(child.poll() is not None for child in children)
         env = dict(os.environ, QT_QPA_PLATFORM="offscreen", TEST_DATA=str(data), TEST_PORT=cable.port)
         env[MANAGED_ENV] = str(home)
+        env["TEST_LOCAL_CLICK"] = "1" if button_pairing and not children else "0"
         with (tmp_path / "gui.log").open("ab") as log:
             child = subprocess.Popen([sys.executable, "-E", "-c", child_main], cwd=folder,
                                      env=env, stdout=log, stderr=log)
@@ -159,6 +177,9 @@ raise SystemExit(app.main())
     try:
         server.start()
         assert wait_for(lambda: sender.trusted, timeout=20), (tmp_path / "gui.log").read_text()
+        if button_pairing:
+            assert wait_for(lambda: PublisherPin.load(home) == PublisherPin(public_key, sender.identity.fingerprint),
+                            timeout=5), (tmp_path / "gui.log").read_text()
         connection = sender.snapshot.connection_id
         assert cli.main(["--endpoint", str(endpoint), "peer-update-status"]) == 0
         assert '"managed": true' in capsys.readouterr().out

@@ -17,6 +17,8 @@ from PySide6.QtWidgets import QApplication
 
 from shooklink.core import CoreSnapshot, ShookLinkCore
 from shooklink.input.topology import Side
+from shooklink.live_update.enrollment import local_signer
+from shooklink.live_update.manager import MANAGED_ENV
 from shooklink.local_control.client import application_data_dir
 from shooklink.local_control.server import LocalControlServer
 from shooklink.protocol.crypto import IdentityStore, TrustStore
@@ -126,6 +128,7 @@ class ApplicationController(QObject):
         self._window.connect_requested.connect(self._connect_requested)
         self._window.disconnect_requested.connect(self._disconnect_requested)
         self._window.trust_requested.connect(self._trust_requested)
+        self._window.allow_updates_requested.connect(self._allow_peer_updates)
         self._window.preferences_changed.connect(self._save_preferences)
         self._core.add_state_listener(self._core_listener)
         self._window.set_serial_defaults(
@@ -196,6 +199,10 @@ class ApplicationController(QObject):
                 connection_id,
                 fingerprint,
             )
+
+    def _allow_peer_updates(self, displayed: CoreSnapshot) -> None:
+        if not self._closed:
+            self._submit("allow updates", self._core.allow_peer_updates, displayed)
 
     def _submit(self, kind: str, callback, *args) -> None:
         operation_id = self._next_operation_id
@@ -277,7 +284,7 @@ def _future_error(future: Future) -> BaseException | None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_argument_parser()
     arguments = parser.parse_args(argv)
-    if arguments.managed:
+    if arguments.managed or (sys.platform == "win32" and not os.environ.get(MANAGED_ENV)):
         from shooklink.live_update.supervisor import run_launcher
         try:
             return run_launcher(arguments.publisher, arguments.debug)
@@ -299,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     settings_store = SettingsStore(data_dir / "settings.json")
     settings = settings_store.load()
     identity = IdentityStore(data_dir / "identity.key").load_or_create()
-    from shooklink.live_update.manager import MANAGED_ENV, SWITCH_EXIT, ManagedReceiver
+    from shooklink.live_update.manager import SWITCH_EXIT, ManagedReceiver
 
     receiver = None
     if os.environ.get(MANAGED_ENV):
@@ -311,6 +318,11 @@ def main(argv: list[str] | None = None) -> int:
         if not owner.tryLock(0):
             parser.exit(1, "ShookLink: another managed GUI is still running\n")
         receiver = ManagedReceiver(managed_home)
+    try:
+        publisher = local_signer(data_dir).public_bytes.hex()
+    except (OSError, ValueError, RuntimeError) as error:
+        logger.warning("Cannot offer signed updates from this installation: %s", error)
+        publisher = None
     core = ShookLinkCore(
         identity=identity,
         trust_store=TrustStore(data_dir / "trusted-peers.json"),
@@ -321,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
         auto_edge_enabled=settings.auto_edge_enabled,
         debug=arguments.debug,
         update_receiver=receiver,
+        update_publisher=publisher,
     )
     _apply_persisted_authorizations(core, settings)
     local_control_server = LocalControlServer(core, data_dir / "control.json")
@@ -347,7 +360,8 @@ def main(argv: list[str] | None = None) -> int:
                 qt_app.exit(SWITCH_EXIT)
                 return
             phase = receiver.report()["phase"]
-            title = f"ShookLink | Managed updates | {core.updates.revision[:12]} | {phase}"
+            status = "Peer updates off" if phase == "awaiting_approval" else f"Peer updates: {phase}"
+            title = f"ShookLink | {core.updates.revision[:12]} | {status}"
             if window.windowTitle() != title:
                 window.setWindowTitle(title)
 

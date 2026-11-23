@@ -20,7 +20,8 @@ from shooklink.files.service import FileService
 from shooklink.input.backend import BaseInputBackend
 from shooklink.input.service import InputService
 from shooklink.input.topology import Side
-from shooklink.live_update.release import FEATURE as UPDATE_FEATURE
+from shooklink.live_update.enrollment import OFFER_PREFIX, PublisherPin, offered_publisher
+from shooklink.live_update.release import FEATURE as UPDATE_FEATURE, hex_id
 from shooklink.live_update.wire import UpdateService
 from shooklink.protocol.crypto import (
     HandshakeError,
@@ -97,6 +98,12 @@ class CoreSnapshot:
     error: str | None = None
     peer_version: str | None = None
     peer_revision: str | None = None
+    supervised_updates: bool = False
+    update_pin: PublisherPin | None = None
+
+    @property
+    def peer_publisher(self) -> str | None:
+        return offered_publisher(self.features) if self.state is CoreState.READY else None
 
 
 @dataclass(slots=True)
@@ -215,6 +222,7 @@ class ShookLinkCore:
         auto_edge_enabled: bool = False,
         debug: bool = False,
         update_receiver=None,
+        update_publisher: str | None = None,
     ) -> None:
         _validate_peer_id(local_peer_id)
         if not isinstance(identity, Identity):
@@ -224,6 +232,9 @@ class ShookLinkCore:
         self.identity = identity
         self.trust_store = trust_store
         self.local_peer_id = local_peer_id
+        if update_publisher is not None and not hex_id(update_publisher, 64):
+            raise ValueError("invalid local update publisher")
+        self._update_publisher = update_publisher
         self.debug = bool(debug)
         self._lock = threading.RLock()
         self._send_lock = threading.RLock()
@@ -394,6 +405,24 @@ class ShookLinkCore:
             except LinkClosedError:
                 pass
         self._publish_trust_state(connection_id)
+
+    def allow_peer_updates(self, displayed: CoreSnapshot) -> None:
+        """Local GUI action only. A trust handshake or a wire request cannot enroll."""
+        if not self.updates.idle_for_update():
+            raise CoreError("finish the active file, shell or input session before allowing updates")
+        with self._lock:
+            current = self._snapshot_locked()
+            receiver = self.updates.receiver
+            publisher = displayed.peer_publisher
+            if (
+                receiver is None or not publisher or current.state is not CoreState.READY
+                or not current.fingerprint or current.fingerprint != displayed.fingerprint
+                or current.peer_id != displayed.peer_id or current.connection_id != displayed.connection_id
+                or current.peer_publisher != publisher
+            ):
+                raise CoreError("the trusted update peer changed or is unavailable")
+            receiver.enroll(publisher, current.fingerprint)
+        self._publish_current()
 
     def send(
         self,
@@ -1080,11 +1109,15 @@ class ShookLinkCore:
 
     def _snapshot_locked(self) -> CoreSnapshot:
         connection = self._connection
+        receiver = self.updates.receiver
+        pin = receiver.pin if receiver is not None else None
         if connection is None:
             return CoreSnapshot(
                 self._last_connection_id,
                 self._last_state,
                 error=self._last_error,
+                supervised_updates=receiver is not None,
+                update_pin=pin,
             )
         if self._disconnect_requested.is_set():
             state = CoreState.DISCONNECTING
@@ -1107,6 +1140,8 @@ class ShookLinkCore:
             connection.remote_features,
             peer_version=connection.remote_version if state is CoreState.READY else None,
             peer_revision=connection.remote_revision if state is CoreState.READY else None,
+            supervised_updates=receiver is not None,
+            update_pin=pin,
         )
 
     def _publish_current(self) -> None:
@@ -1137,9 +1172,10 @@ class ShookLinkCore:
             logger.exception("input capture could not refresh after trust")
 
     def _local_features(self) -> frozenset[str]:
-        if self.input is None:
-            return LOCAL_FEATURES - {"input"}
-        return LOCAL_FEATURES
+        features = LOCAL_FEATURES if self.input is not None else LOCAL_FEATURES - {"input"}
+        if self._update_publisher is not None:
+            features = features | {OFFER_PREFIX + self._update_publisher}
+        return features
 
 
 def _stream_id(message_type: MessageType, priority: Priority) -> int:

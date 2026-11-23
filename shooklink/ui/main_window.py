@@ -175,6 +175,7 @@ class MainWindow(QMainWindow):
     connect_requested = Signal(str, int)
     disconnect_requested = Signal()
     trust_requested = Signal(int, str)
+    allow_updates_requested = Signal(object)
     emergency_exit_requested = Signal()
     preferences_changed = Signal()
     incoming_message = Signal(object)
@@ -203,6 +204,7 @@ class MainWindow(QMainWindow):
         self._connecting = False
         self._connection_id = 0
         self._peer_fingerprint: str | None = None
+        self._update_snapshot: CoreSnapshot | None = None
         self._secure_feature_available = True
         self._input_feature_available = input_service is not None
         self._active_transfer_id: str | None = None
@@ -292,8 +294,13 @@ class MainWindow(QMainWindow):
         self.trust_button = QPushButton("Trust Peer")
         self.trust_button.clicked.connect(self._request_trust)
         self.trust_button.setEnabled(False)
+        self.allow_updates_button = QPushButton("Allow Peer Updates")
+        self.allow_updates_button.clicked.connect(self._request_update_permission)
+        self.allow_updates_button.setEnabled(False)
+        self.allow_updates_button.hide()
         connection_layout.addWidget(self.peer_fingerprint, 2, 0, 1, 2)
         connection_layout.addWidget(self.trust_button, 2, 2)
+        connection_layout.addWidget(self.allow_updates_button, 2, 2)
         connection_layout.setColumnStretch(0, 3)
         connection_layout.setColumnStretch(1, 1)
         layout.addWidget(connection)
@@ -638,6 +645,34 @@ class MainWindow(QMainWindow):
         path, _selected_filter = QFileDialog.getOpenFileName(self, "Choose a file")
         if path:
             self._queue_file(path)
+
+    def _request_update_permission(self) -> None:
+        if self._update_snapshot is None or not self.allow_updates_button.isEnabled():
+            return
+        if ((self._input_service and self._input_service.state is not InputSessionState.IDLE)
+                or self._active_shell_session is not None):
+            self.show_operation_error("Stop input sharing and remote shell before allowing updates.")
+            return
+        self.allow_updates_button.setEnabled(False)
+        self.allow_updates_requested.emit(self._update_snapshot)
+
+    def _show_update_permission(self, snapshot: CoreSnapshot) -> None:
+        show = snapshot.supervised_updates and snapshot.state is CoreState.READY
+        self._update_snapshot = snapshot if show else None
+        self.trust_button.setVisible(not show)
+        self.allow_updates_button.setVisible(show)
+        pin, offer = snapshot.update_pin, snapshot.peer_publisher
+        self.allow_updates_button.setEnabled(show and pin is None and offer is not None)
+        if pin is None:
+            label = "Allow Peer Updates" if offer or not show else "Update Peer App First"
+            tip = ("Allow signed ShookLink updates from this trusted peer on this computer."
+                   if offer else "Update and restart the other computer's ShookLink to enable pairing.")
+        elif pin.peer == snapshot.fingerprint and offer == pin.publisher:
+            label, tip = "Peer Updates Allowed", "This peer can install its signed ShookLink updates."
+        else:
+            label, tip = "Publisher Already Set", "The existing update publisher has not been changed."
+        self.allow_updates_button.setText(label)
+        self.allow_updates_button.setToolTip(tip)
 
     def _queue_file(self, path: str) -> None:
         if self._file_service is None:
@@ -995,6 +1030,7 @@ class MainWindow(QMainWindow):
             and not snapshot.local_approved
             and snapshot.fingerprint is not None
         )
+        self._show_update_permission(snapshot)
         features = snapshot.features
         plain_available = (
             snapshot.state

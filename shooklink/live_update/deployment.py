@@ -23,7 +23,7 @@ def deploy(core, send_file, path: Path, release: Release, job: str, timeout: int
     wire = core.updates
     before = wire.exchange(MessageType.UPDATE_PROBE, query, timeout=min(3, timeout))
     if not before.get("managed"):
-        raise Refused("start the receiver's managed launcher with its enrolled publisher")
+        raise Refused("on Windows, open the updated .bat and click Allow Peer Updates for this peer")
     release.verify(before["publisher"])
     if before["phase"] in PENDING:
         raise Refused(f"receiver is busy with update {before['job']}")

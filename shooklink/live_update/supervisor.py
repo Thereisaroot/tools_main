@@ -9,8 +9,8 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+from .enrollment import PublisherPin
 from .manager import MANAGED_ENV, PENDING, SWITCH_EXIT, State
-from .release import hex_id, read_bounded
 
 
 def _stop(child):
@@ -111,20 +111,10 @@ def run_launcher(publisher: str | None, debug: bool) -> int:
         if not owner.tryLock(0):
             raise ValueError("a managed ShookLink GUI still owns the installation")
         owner.unlock()
-        pin = home / "publisher"
         if publisher is not None:
-            if not hex_id(publisher, 64):
-                raise ValueError("--publisher expects the separate release public key (64 hex digits)")
-            if pin.exists():
-                if read_bounded(pin, 100).decode().strip() != publisher:
-                    raise ValueError("another publisher is already enrolled locally")
-            else:
-                with pin.open("x", encoding="ascii") as handle:
-                    handle.write(publisher + "\n")
-        if not pin.exists():
-            raise ValueError("first managed launch requires --publisher PUBLIC_KEY")
-        if not hex_id(read_bounded(pin, 100).decode().strip(), 64):
-            raise ValueError("invalid publisher in the local enrollment file")
+            PublisherPin(publisher).persist(home)
+        elif PublisherPin.load(home) is None and State.load(home) != State():
+            raise ValueError("existing update journal is missing its publisher enrollment")
         env = dict(os.environ, **{MANAGED_ENV: str(home)})
         args = [sys.executable, "-E", "-m", "shooklink"]
         if debug:

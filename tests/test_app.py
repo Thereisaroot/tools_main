@@ -11,6 +11,19 @@ from shooklink.input.windows_backend import WindowsInputBackend
 from shooklink.settings import AppSettings, SettingsStore
 
 
+def test_plain_windows_startup_uses_supervisor_without_key_or_flags(monkeypatch):
+    from shooklink.live_update import supervisor
+    from shooklink.live_update.manager import MANAGED_ENV
+
+    monkeypatch.setattr(app.sys, "platform", "win32")
+    monkeypatch.delenv(MANAGED_ENV, raising=False)
+    calls = []
+    monkeypatch.setattr(supervisor, "run_launcher", lambda key, debug: calls.append((key, debug)) or 7)
+    monkeypatch.setattr(app, "QApplication", None)  # This process must not start a second GUI.
+    assert app.main([]) == 7
+    assert calls == [(None, False)]
+
+
 class ImmediateExecutor:
     def __init__(self):
         self.shutdown_calls = []
@@ -71,6 +84,7 @@ class FakeWindow(QObject):
     connect_requested = Signal(str, int)
     disconnect_requested = Signal()
     trust_requested = Signal(int, str)
+    allow_updates_requested = Signal(object)
     preferences_changed = Signal()
 
     def __init__(self, ports):

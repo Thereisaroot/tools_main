@@ -182,7 +182,7 @@ class FakeProcessFactory:
         return process
 
 
-def build_core(tmp_path, name, *, auto_edge_enabled=False):
+def build_core(tmp_path, name, *, auto_edge_enabled=False, **core_options):
     backend = FakeInputBackend()
     processes = FakeProcessFactory()
     core = ShookLinkCore(
@@ -193,6 +193,7 @@ def build_core(tmp_path, name, *, auto_edge_enabled=False):
         input_backend=backend,
         process_factory=processes,
         auto_edge_enabled=auto_edge_enabled,
+        **core_options,
     )
     return core, backend, processes
 

@@ -12,6 +12,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Protocol
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 from cryptography.exceptions import InvalidSignature
@@ -65,6 +66,10 @@ def atomic_json(path: Path, document: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+class Signer(Protocol):
+    def sign(self, data: bytes, /) -> bytes: ...
+
+
 def generate_key(path: Path) -> str:
     key = Ed25519PrivateKey.generate()
     # O_EXCL prevents replacing a publisher key which is already enrolled.
@@ -105,7 +110,7 @@ class Release:
         return f"ShookLink release v1\0{self.sequence}\n{self.revision}\n{self.sha256}".encode("ascii")
 
     @classmethod
-    def sign(cls, path: Path, sequence: int, key: Ed25519PrivateKey) -> Release:
+    def sign(cls, path: Path, sequence: int, key: Signer) -> Release:
         data = read_bounded(path, MAX_ZIP)
         with ZipFile(io.BytesIO(data)) as archive:
             revision = archive.comment.decode("ascii")

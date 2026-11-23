@@ -245,33 +245,22 @@ same saved settings and identity. There is a brief gap in communication.
 The supervisor never opens COM. Management is limited to probing the running
 app and activating a publisher-signed ShookLink release.
 
-**One-time bootstrap**
+**Allow updates once on Windows (no key entry)**
 
-1. On a trusted release-signing computer, create a dedicated Ed25519 key
-   outside the checkout and downloads folder. Keep the private file with the
-   publisher. Give the **printed 64-digit public key** to the Windows operator
-   through an independently trusted channel.
+1. Start the updated Mac app. For an older Windows installation, send the
+   ZIP as described above, extract it to a permanent folder, close the old
+   app and double-click the new `run_serial_text_chat.bat`.
+2. Connect and approve the peer as usual. At `Ready`, click **Allow Peer
+   Updates** on Windows, using its own mouse. The button changes to
+   **Peer Updates Allowed**. If it says **Update Peer App First**, update
+   and restart the Mac app. Finish any active input, shell or file session first.
+3. On subsequent Windows launches just double-click the same `.bat`.
+   Starting the launcher or trusting the serial connection alone does **not**
+   authorize updates. The button pins both the authenticated peer fingerprint
+   and its separate release signer. Another peer or signer cannot replace it.
+   The signing key stays in the Mac account's ShookLink app data, outside the ZIP.
 
-   ```bash
-   python3 -m shooklink.local_control.cli release-keygen ~/.shooklink-release.key
-   ```
-
-2. Use the ordinary `send-update` procedure above for an old receiver. Extract
-   this bootstrap once into a permanent directory, close the old GUI, and from
-   that directory run this on Windows, substituting the public key:
-
-   ```bat
-   run_serial_text_chat.bat --managed --publisher PUBLIC_KEY_HEX
-   ```
-
-   Connect and approve the peer normally. On subsequent manual launches use
-   `run_serial_text_chat.bat --managed` **from the same bootstrap directory**.
-   It remembers the publisher and last healthy slot. Keep this launcher open
-   while using ShookLink. The managed GUI title shows its build and update
-   phase. An ordinary GUI launch does not enable release activation.
-
-3. Run the sending GUI from this version or newer. Agent/CLI commands talk
-   to that GUI over its existing local control endpoint. Check the actual
+   Agent/CLI commands talk to the sending GUI over its existing endpoint. Check the actual
    peer with `python3 -m shooklink.local_control.cli peer-update-status`. Its
    reply includes `managed`, `publisher`, `highest`, `revision`, `instance`,
    and the most recent transaction. A legacy peer requires the local bootstrap.
@@ -282,7 +271,7 @@ From the release checkout on the signing computer, choose a positive sequence
 greater than the receiver's `highest`:
 
 ```bash
-python3 -m shooklink.local_control.cli sign-update --key ~/.shooklink-release.key --sequence 1
+python3 -m shooklink.local_control.cli sign-update --sequence 1
 ```
 
 Give the generated ZIP and matching `.release.json` to the controller, in the
@@ -291,6 +280,11 @@ same folder. Replace `COMMIT_PREFIX` below with the 12 hex digits in the name:
 ```bash
 python3 -m shooklink.local_control.cli live-update dist/ShookLink-COMMIT_PREFIX.release.json
 ```
+
+If you already use a separately provisioned offline publisher, keep using
+`sign-update --key PATH --sequence N` and the original local
+`--managed --publisher PUBLIC_KEY_HEX` bootstrap. The button is not a key
+rotation mechanism and does not replace that enrollment.
 
 The controller checks for an idle, trusted, enrolled peer before sending. The
 receiver accepts only a verified file transfer from that connection, checks the

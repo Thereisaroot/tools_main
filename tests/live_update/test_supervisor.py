@@ -102,8 +102,8 @@ def test_publisher_requires_local_enrollment_and_is_pinned(tmp_path, monkeypatch
 
     monkeypatch.setattr(client, "application_data_dir", lambda: tmp_path)
     monkeypatch.setattr(supervisor, "supervise", lambda *_: 0)
-    with pytest.raises(ValueError, match="first managed launch"):
-        supervisor.run_launcher(None, False)
+    assert supervisor.run_launcher(None, False) == 0
+    assert not (tmp_path / "managed-updates" / "publisher").exists()
     assert supervisor.run_launcher("a" * 64, False) == 0
     assert supervisor.run_launcher(None, False) == 0
     with pytest.raises(ValueError, match="another publisher"):

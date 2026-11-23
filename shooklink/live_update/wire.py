@@ -62,20 +62,21 @@ class UpdateService:
             with self._lock:
                 self._pending.pop(nonce, None)
 
-    def _idle(self):
+    def idle_for_update(self):
         return (not self.core.files.busy and self.core.shell.active_session_id is None
                 and (self.core.input is None or self.core.input.state.value == "idle"))
 
     def tick(self) -> bool:
         snapshot = self.core.snapshot
         return self.receiver.tick(
-            snapshot.fingerprint if snapshot.state.value == "ready" else None, self._idle()
+            snapshot.fingerprint if snapshot.state.value == "ready" else None, self.idle_for_update()
         )
 
     def _report(self):
-        details = self.receiver.report() if self.receiver else {"managed": False, "phase": "unmanaged"}
+        details = (self.receiver.report(self.core.snapshot.fingerprint) if self.receiver
+                   else {"managed": False, "phase": "unmanaged"})
         return dict(details, revision=self.revision, instance=self.instance,
-                    platform=sys.platform, idle=self._idle())
+                    platform=sys.platform, idle=self.idle_for_update())
 
     def handle_message(self, message):
         if not self.core.trusted or self.core.decrypt_secure(message) != b"":
@@ -118,7 +119,7 @@ class UpdateService:
                     raise ValueError("the target GUI instance has changed")
                 if not self.receiver:
                     raise ValueError("managed updates are not enabled locally")
-                if not self._idle():
+                if not self.idle_for_update():
                     raise ValueError("busy: finish the other file, shell or input session first")
                 release = Release.parse(fields["release"])
                 path = self.core.files.completed_path(fields["transfer_id"], release.sha256)

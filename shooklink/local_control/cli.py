@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from .client import LocalControlClient, default_endpoint_path
+from .client import LocalControlClient, application_data_dir, default_endpoint_path
 from .updates import build_update_archive
 
 
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
             help="package directory (default: dist in the checkout)",
         )
         if name == "sign-update":
-            update_parser.add_argument("--key", required=True, type=Path)
+            update_parser.add_argument("--key", type=Path, help="offline signing key (default: this app's publisher)")
             update_parser.add_argument("--sequence", required=True, type=int)
     plain_parser = subparsers.add_parser("send-plain", help="send plain text")
     plain_parser.add_argument("text")
@@ -73,9 +73,11 @@ def main(
                 return 0
             if arguments.command == "sign-update":
                 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+                from shooklink.live_update.enrollment import local_signer
                 from shooklink.live_update.release import Release, atomic_json, read_bounded
 
-                key = Ed25519PrivateKey.from_private_bytes(read_bounded(arguments.key.expanduser(), 32))
+                key = (Ed25519PrivateKey.from_private_bytes(read_bounded(arguments.key.expanduser(), 32))
+                       if arguments.key else local_signer(application_data_dir()))
                 release = Release.sign(path, arguments.sequence, key)
                 manifest = path.with_suffix(".release.json")
                 atomic_json(manifest, release.as_dict())

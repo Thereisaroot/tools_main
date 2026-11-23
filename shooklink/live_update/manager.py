@@ -7,6 +7,7 @@ import threading
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from .enrollment import PublisherPin
 from .release import Release, atomic_json, hex_id, read_bounded, stage_archive
 
 SWITCH_EXIT = 75
@@ -51,9 +52,7 @@ class State:
 class ManagedReceiver:
     def __init__(self, home: Path):
         self.home = home
-        self.publisher = read_bounded(home / "publisher", 100).decode("ascii").strip()
-        if not hex_id(self.publisher, 64):
-            raise ValueError("invalid local publisher enrollment")
+        self.pin = PublisherPin.load(home)
         self._state = State.load(home)
         self._lock = threading.RLock()
         self._observed = False
@@ -62,17 +61,28 @@ class ManagedReceiver:
     def _change(self, **changes):
         self._state = replace(self._state, **changes).save(self.home)
 
-    def report(self) -> dict:
+    def enroll(self, publisher: str, fingerprint: str) -> None:
+        if not fingerprint:
+            raise ValueError("a local grant requires a trusted peer fingerprint")
+        with self._lock:
+            self.pin = PublisherPin(publisher, fingerprint).persist(self.home)
+
+    def report(self, peer: str | None = None) -> dict:
         with self._lock:
             s = self._state
-            return dict(managed=True, publisher=self.publisher, highest=s.highest,
-                        phase=s.phase, job=s.job, target=s.target, reason=s.reason)
+            allowed = self.pin is not None and (peer is None or self.pin.allows(peer))
+            return dict(managed=allowed, publisher=self.pin.publisher if allowed else "",
+                        highest=s.highest, phase=s.phase if self.pin else "awaiting_approval",
+                        job=s.job, target=s.target, reason=s.reason)
 
     def apply(self, job: str, release: Release, path: Path, peer: str, instance: str) -> None:
         if not hex_id(job, 32):
             raise ValueError("invalid transaction")
-        release.verify(self.publisher)
         with self._lock:
+            if self.pin is None or not self.pin.allows(peer):
+                raise ValueError("updates from this peer are not allowed locally")
+            publisher = self.pin.publisher
+            release.verify(publisher)
             s = self._state
             if job == s.job and peer == s.peer and release.revision == s.target:
                 return
@@ -83,13 +93,13 @@ class ManagedReceiver:
             self._change(phase="staging", job=job, target=release.revision, peer=peer,
                          old_instance=instance, reason="")
             self._worker = threading.Thread(
-                target=self._stage, args=(path, release, job), name="shooklink-stage"
+                target=self._stage, args=(path, release, job, publisher), name="shooklink-stage"
             )
             self._worker.start()
 
-    def _stage(self, path: Path, release: Release, job: str) -> None:
+    def _stage(self, path: Path, release: Release, job: str, publisher: str) -> None:
         try:
-            stage_archive(path, release, self.publisher, self.home / "slots" / job)
+            stage_archive(path, release, publisher, self.home / "slots" / job)
             with self._lock:
                 self._change(phase="prepared", highest=release.sequence)
         except Exception as error:
@@ -99,7 +109,8 @@ class ManagedReceiver:
     def confirm(self, job: str, peer: str, instance: str, actual_revision: str) -> None:
         with self._lock:
             s = self._state
-            if (s.phase not in {"trial", "healthy", "installed"} or job != s.job
+            if (self.pin is None or not self.pin.allows(peer)
+                    or s.phase not in {"trial", "healthy", "installed"} or job != s.job
                     or peer != s.peer or actual_revision != s.target or instance == s.old_instance):
                 raise ValueError("health confirmation does not match this trial")
             self._observed = True
@@ -108,6 +119,8 @@ class ManagedReceiver:
         """Called from the GUI event loop. True requests an orderly switch exit."""
         with self._lock:
             s = self._state
+            if self.pin is None:
+                return False
             if s.phase == "prepared":
                 if not idle or ready_peer != s.peer:
                     self._change(phase="failed", reason="peer disconnected or another session is busy")
