@@ -924,7 +924,6 @@ class ShookLinkCore:
                 connection.retired_remote_hellos.append(
                     connection.remote_hello_body
                 )
-            shell_allowed = self.shell.allow_remote_shell
             self._cancel_handshake_retry_locked(connection)
             connection.secure_session = secure_session
             connection.remote_peer_id = None
@@ -946,8 +945,7 @@ class ShookLinkCore:
         self.files.disconnect()
         self.chat.disconnect()
         self.files.connection_changed(True)
-        self.shell.close()
-        self.shell.set_allow_remote_shell(shell_allowed)
+        self.shell.close(revoke_permission=False)
         if self.input is not None:
             self.input.disconnect()
         self._publish_current()
@@ -1088,7 +1086,7 @@ class ShookLinkCore:
             self._disconnect_requested.clear()
         self.chat.disconnect()
         self.files.disconnect()
-        self.shell.close()
+        self.shell.close(revoke_permission=False)
         if self.input is not None:
             try:
                 self.input.disconnect()

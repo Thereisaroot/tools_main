@@ -175,7 +175,8 @@ shell, or input traffic.
 
 ### Authorization and Lifecycle
 
-`Allow Remote Shell` is off by default and is not silently enabled on restart.
+`Allow Remote Shell` defaults on when no preference has been saved; a saved
+opt-out is respected on reconnect and restart.
 The requesting peer can open a terminal only while the executing peer has this
 toggle enabled and the peer identity is trusted. Only one shell session may be
 active per peer in the first release. The executing UI clearly displays the

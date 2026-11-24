@@ -82,13 +82,30 @@ def test_unknown_json_keys_are_ignored(tmp_path):
     assert not hasattr(settings, "future_setting")
 
 
-@pytest.mark.parametrize("contents", [None, "not json", "[]"])
-def test_missing_or_corrupt_settings_return_defaults(tmp_path, contents):
+@pytest.mark.parametrize("contents", [None, '{"last_port": "COM7"}'])
+def test_shell_is_on_when_no_shell_preference_was_saved(tmp_path, contents):
     path = tmp_path / "settings.json"
     if contents is not None:
         path.write_text(contents, encoding="utf-8")
 
-    assert SettingsStore(path).load() == AppSettings()
+    settings = SettingsStore(path).load()
+    assert settings.allow_remote_shell is True
+    assert settings.allow_input is False
+
+
+def test_saved_shell_opt_out_survives_restart(tmp_path):
+    path = tmp_path / "settings.json"
+    SettingsStore(path).save(AppSettings(allow_remote_shell=False))
+
+    assert SettingsStore(path).load().allow_remote_shell is False
+
+
+@pytest.mark.parametrize("contents", ["not json", "[]"])
+def test_corrupt_settings_do_not_grant_shell_access(tmp_path, contents):
+    path = tmp_path / "settings.json"
+    path.write_text(contents, encoding="utf-8")
+
+    assert SettingsStore(path).load() == AppSettings(allow_remote_shell=False)
 
 
 def test_app_settings_is_frozen():

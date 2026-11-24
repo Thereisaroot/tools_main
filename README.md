@@ -113,16 +113,17 @@ hardware flow control.
 
 ## Remote Shell Authorization
 
-Remote shell access requires a trusted peer and explicit permission on the
-computer that will execute the shell:
+Remote shell access is enabled by default for mutually trusted peers. Nothing
+starts automatically; a peer must request a session:
 
-1. Enable `Allow Remote Shell` on the executing computer.
+1. Connect and trust the peer on both computers. If you previously turned off
+   `Allow Remote Shell`, turn it back on on the computer that will run the shell.
 2. Select `Open Remote Shell` on the requesting computer.
 3. Use `Terminate Session`, disable `Allow Remote Shell`, disconnect, or quit to
    stop the child process.
 
-`Allow Remote Shell` is off by default. Its local checkbox state is saved and
-restored on the next launch; a peer still cannot enable it remotely. Only one
+The local checkbox is remembered across reconnects and restarts. Updating
+does not override a saved `off`, and a peer cannot enable it remotely. Only one
 shell session per peer is accepted, and all shell input and output is encrypted.
 macOS hosts the user's login shell; Windows hosts PowerShell and falls back to
 `cmd.exe` when needed.

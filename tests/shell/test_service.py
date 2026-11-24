@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 from shooklink.protocol.messages import Message, MessageType
 from shooklink.shell.service import ShellService
 from shooklink.transport.multiplexer import Priority
@@ -166,8 +168,9 @@ def test_requester_session_receives_output_and_sends_interactive_input():
     assert bus.sent[-1][0].message_type is MessageType.SHELL_RESIZE
 
 
-def test_shell_messages_rejected_by_authentication_do_not_spawn_process():
-    bus = FakeBus(authenticated=False)
+@pytest.mark.parametrize(("trusted", "authenticated"), [(True, False), (False, True)])
+def test_shell_messages_require_trust_and_authentication(trusted, authenticated):
+    bus = FakeBus(trusted=trusted, authenticated=authenticated)
     factory = FakeProcessFactory()
     service = ShellService(bus, factory)
     service.set_allow_remote_shell(True)
@@ -214,6 +217,24 @@ def test_shell_state_listeners_receive_request_active_and_exit():
         ("exited", session_id),
     ]
     assert states[-1].exit_code == 0
+
+
+def test_disconnect_during_shell_preparation_discards_request_but_keeps_preference():
+    bus = FakeBus()
+    factory = FakeProcessFactory()
+
+    def disconnect_during_prepare(on_output, on_exit, term):
+        process = factory(on_output, on_exit, term)
+        service.close(revoke_permission=False)
+        return process
+
+    service = ShellService(bus, disconnect_during_prepare)
+    service.set_allow_remote_shell(True)
+    service.handle_message(shell_message(MessageType.SHELL_OPEN, columns=80, rows=24, term="xterm"))
+
+    assert service.allow_remote_shell and service.active_session_id is None
+    assert factory.processes[-1].started == [] and factory.processes[-1].terminate_calls == 1
+    assert bus.sent == []
 
 
 def test_permission_revocation_during_process_creation_prevents_start():

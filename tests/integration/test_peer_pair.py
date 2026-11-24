@@ -382,6 +382,8 @@ def test_fragmented_peer_pair_runs_all_services_and_reconnects_cleanly(tmp_path)
         )
         assert left.shell.active_session_id is None
         assert right.shell.active_session_id is None
+        assert not left.shell.allow_remote_shell
+        assert right.shell.allow_remote_shell
         assert left.input.state is InputSessionState.IDLE
         assert right.input.state is InputSessionState.IDLE
         assert not left_input.capture_running

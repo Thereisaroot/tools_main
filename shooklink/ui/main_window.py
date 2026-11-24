@@ -411,6 +411,7 @@ class MainWindow(QMainWindow):
         shell_title = QLabel("REMOTE SHELL")
         shell_title.setObjectName("sectionLabel")
         self.allow_shell_checkbox = QCheckBox("Allow Remote Shell")
+        self.allow_shell_checkbox.setToolTip("Allow a trusted peer to run commands as your user on this computer.")
         self.open_shell_button = QPushButton("Open Remote Shell")
         self.open_shell_button.clicked.connect(self._open_remote_shell)
         self.terminate_shell_button = QPushButton("Terminate Session")

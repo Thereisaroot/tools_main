@@ -94,6 +94,7 @@ class ShellService:
         self._process_factory = process_factory or _default_process_factory
         self._lock = threading.RLock()
         self._allow_remote_shell = False
+        self._link_epoch = 0
         self._session: _ShellSession | None = None
         self._output_listeners: list[Callable[[ShellOutput], None]] = []
         self._state_listeners: list[Callable[[ShellState], None]] = []
@@ -201,6 +202,8 @@ class ShellService:
     def handle_message(self, message: Message) -> bool:
         if message.message_type not in _SHELL_TYPES:
             return False
+        with self._lock:
+            link_epoch = self._link_epoch
         if not self._bus.trusted:
             return False
         try:
@@ -211,7 +214,7 @@ class ShellService:
             return False
         authenticated = Message(message.message_type, message.metadata, body)
         handlers = {
-            MessageType.SHELL_OPEN: self._handle_open,
+            MessageType.SHELL_OPEN: lambda request: self._handle_open(request, link_epoch),
             MessageType.SHELL_ACCEPT: self._handle_accept,
             MessageType.SHELL_DENY: self._handle_deny,
             MessageType.SHELL_INPUT: self._handle_input,
@@ -280,17 +283,19 @@ class ShellService:
         )
         self._notify_state(ShellState(session_id, "outgoing", "exited", reason="closed"))
 
-    def close(self) -> None:
+    def close(self, *, revoke_permission: bool = True) -> None:
         process = None
         with self._lock:
+            self._link_epoch += 1
             if self._session is not None:
                 process = self._session.process
             self._session = None
-            self._allow_remote_shell = False
+            if revoke_permission:
+                self._allow_remote_shell = False
         if process is not None:
             process.terminate()
 
-    def _handle_open(self, message: Message) -> None:
+    def _handle_open(self, message: Message, link_epoch: int) -> None:
         session_id = _session_id(message.metadata)
         columns, rows = _terminal_size(message.metadata)
         if set(message.metadata) != {
@@ -308,6 +313,8 @@ class ShellService:
         if message.body:
             raise ShellProtocolError("shell open cannot contain a body")
         with self._lock:
+            if link_epoch != self._link_epoch:
+                return
             if not self._allow_remote_shell:
                 reason = "permission"
             elif self._session is not None:
@@ -331,7 +338,9 @@ class ShellService:
         )
         denied_reason = None
         with self._lock:
-            if not self._allow_remote_shell:
+            if link_epoch != self._link_epoch:
+                denied_reason = "disconnected"
+            elif not self._allow_remote_shell:
                 denied_reason = "permission"
             elif self._session is not None:
                 denied_reason = "busy"
@@ -344,6 +353,8 @@ class ShellService:
                 )
         if denied_reason is not None:
             process.terminate()
+            if denied_reason == "disconnected":
+                return  # No response belongs on a replacement link.
             self._send(
                 Message(
                     MessageType.SHELL_DENY,

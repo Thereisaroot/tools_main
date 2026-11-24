@@ -24,7 +24,7 @@ class AppSettings:
     peer_side: str = "right"
     auto_edge_enabled: bool = False
     download_dir: str = field(default_factory=_default_download_dir)
-    allow_remote_shell: bool = False
+    allow_remote_shell: bool = True
     allow_input: bool = False
 
 
@@ -36,18 +36,20 @@ class SettingsStore:
         defaults = AppSettings()
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except FileNotFoundError:
             return defaults
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raw = None
 
         if not isinstance(raw, dict):
-            return defaults
+            # An unreadable profile may contain a saved opt-out.
+            return AppSettings(allow_remote_shell=False)
 
         last_port = raw.get("last_port")
         baud_rate = raw.get("baud_rate")
         peer_side = raw.get("peer_side")
         auto_edge_enabled = raw.get("auto_edge_enabled")
         download_dir = raw.get("download_dir")
-        allow_remote_shell = raw.get("allow_remote_shell")
         allow_input = raw.get("allow_input")
 
         return AppSettings(
@@ -73,11 +75,7 @@ class SettingsStore:
                 if isinstance(download_dir, str) and download_dir
                 else defaults.download_dir
             ),
-            allow_remote_shell=(
-                allow_remote_shell
-                if isinstance(allow_remote_shell, bool)
-                else defaults.allow_remote_shell
-            ),
+            allow_remote_shell=raw.get("allow_remote_shell", defaults.allow_remote_shell) is True,
             allow_input=(
                 allow_input
                 if isinstance(allow_input, bool)
