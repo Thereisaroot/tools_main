@@ -250,8 +250,11 @@ class SerialLink:
 
     def _read_loop(self) -> None:
         try:
+            # socket:// reports only socket readability, not an actual byte count.
+            uart = not str(getattr(self._endpoint, "port", "")).startswith("socket://")
             while not self._stop_event.is_set():
-                data = self._endpoint.read(self._read_size)
+                available = getattr(self._endpoint, "in_waiting", self._read_size) if uart else self._read_size
+                data = self._endpoint.read(max(1, min(self._read_size, available)))
                 if not data:
                     continue
                 for frame in self._parser.feed(data):

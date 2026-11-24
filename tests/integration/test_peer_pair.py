@@ -15,6 +15,7 @@ from shooklink.input.topology import Monitor, Rect
 from shooklink.protocol.crypto import IdentityStore, TrustStore
 from shooklink.protocol.framing import SECURE_FLAG, Frame, pack_frame_header
 from shooklink.protocol.messages import Message, MessageType, encode_message
+from shooklink.shell.codec import FEATURE as SHELL_COMPRESSION
 from shooklink.transport.multiplexer import Priority
 from shooklink.transport.serial_link import LinkCloseTimeout
 
@@ -1082,6 +1083,48 @@ def test_peer_reconnects_while_other_serial_port_stays_open(tmp_path):
     finally:
         left.close()
         right.close()
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_shell_output_with_lost_accept_is_compatible_and_preserves_bytes(tmp_path, legacy):
+    viewer, *_ = build_core(tmp_path, "viewer")
+    host, _, processes = build_core(tmp_path, "host")
+    if legacy:
+        features = viewer._local_features() - {SHELL_COMPRESSION}
+        viewer._local_features = lambda: features
+    blocks, wire_outputs, accepts = [], [], []
+    viewer.shell.add_output_listener(lambda event: blocks.append(event.data))
+    send = host.send
+
+    def drop_first_accept(message, **options):
+        if message.message_type is MessageType.SHELL_ACCEPT:
+            accepts.append(message)
+            if len(accepts) == 1:
+                return
+        if message.message_type is MessageType.SHELL_OUTPUT:
+            wire_outputs.append(message)
+        send(message, **options)
+
+    host.send = drop_first_accept
+    try:
+        a, b = endpoint_pair()
+        viewer.connect_endpoint(a)
+        host.connect_endpoint(b)
+        assert wait_for(lambda: viewer.snapshot.state is host.snapshot.state is CoreState.UNTRUSTED)
+        approve_pair(viewer, host)
+        host.shell.set_allow_remote_shell(True)
+        sid = viewer.shell.open_remote(columns=90, rows=24)
+        assert wait_for(lambda: processes.processes and processes.processes[0].started)
+        log = b"\x1b[32mcompiling modules...\x1b[0m\r\n" * 2000
+        processes.processes[0].emit_output(log)
+        assert wait_for(lambda: b"".join(blocks) == log)
+        assert all(("codec" not in frame.metadata) == legacy for frame in wire_outputs)
+        viewer.shell.send_input(sid, b"x")
+        assert wait_for(lambda: processes.processes[0].writes == [b"x"])
+        assert len(processes.processes) == 1
+    finally:
+        viewer.close()
+        host.close()
 
 
 def test_ready_transition_starts_persisted_auto_edge_capture(tmp_path):

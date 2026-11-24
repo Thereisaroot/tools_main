@@ -219,6 +219,44 @@ def test_shell_state_listeners_receive_request_active_and_exit():
     assert states[-1].exit_code == 0
 
 
+def test_first_authenticated_output_recovers_a_lost_accept_without_replaying_input():
+    bus = FakeBus()
+    service = ShellService(bus, FakeProcessFactory())
+    states, output = [], []
+    service.add_state_listener(states.append)
+    service.add_output_listener(output.append)
+    sid = service.open_remote(columns=80, rows=24)
+    assert not service.handle_message(shell_message(MessageType.SHELL_OUTPUT, "0" * 32, b"stale"))
+    assert service.handle_message(shell_message(MessageType.SHELL_OUTPUT, sid, b"prompt> "))
+    assert service.handle_message(shell_message(MessageType.SHELL_ACCEPT, sid))
+    assert [s.state for s in states] == ["requesting", "active"]
+    assert [o.data for o in output] == [b"prompt> "]
+    assert not service.cancel_pending_open(sid)
+    assert not any(item[0].message_type is MessageType.SHELL_INPUT for item in bus.sent)
+
+
+def test_timed_out_request_is_closed_and_late_output_cannot_activate_it():
+    bus = FakeBus()
+    service = ShellService(bus, FakeProcessFactory())
+    sid = service.open_remote(columns=80, rows=24)
+    assert service.cancel_pending_open(sid)
+    assert service.active_session_id is None and bus.sent[-1][0].message_type is MessageType.SHELL_EXIT
+    assert not service.handle_message(shell_message(MessageType.SHELL_OUTPUT, sid, b"late"))
+
+
+def test_legacy_controller_gets_one_repeat_accept_with_first_prompt():
+    bus = FakeBus()
+    factory = FakeProcessFactory()
+    service = ShellService(bus, factory)
+    service.set_allow_remote_shell(True)
+    service.handle_message(shell_message(MessageType.SHELL_OPEN, columns=80, rows=24, term="xterm"))
+    factory.processes[0].emit_output(b"one")
+    factory.processes[0].emit_output(b"two")
+    assert [m.message_type for m, _, _ in bus.sent] == [
+        MessageType.SHELL_ACCEPT, MessageType.SHELL_ACCEPT, MessageType.SHELL_OUTPUT, MessageType.SHELL_OUTPUT,
+    ]
+
+
 def test_disconnect_during_shell_preparation_discards_request_but_keeps_preference():
     bus = FakeBus()
     factory = FakeProcessFactory()
@@ -290,6 +328,7 @@ def test_permission_revocation_during_accept_send_prevents_start():
 
 def test_shell_accept_precedes_output_emitted_synchronously_by_start():
     bus = FakeBus()
+    bus.shell_output_compression = True
 
     class EagerFactory(FakeProcessFactory):
         def __call__(self, on_output, on_exit, term="xterm"):

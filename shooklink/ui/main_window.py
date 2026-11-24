@@ -8,7 +8,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import Protocol
 
-from PySide6.QtCore import QUrl, Qt, Signal
+from PySide6.QtCore import QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import (
     QCloseEvent,
     QDesktopServices,
@@ -96,6 +96,8 @@ class ShellUiService(Protocol):
     def set_allow_remote_shell(self, allowed: bool) -> None: ...
 
     def open_remote(self, *, columns: int, rows: int) -> str: ...
+
+    def cancel_pending_open(self, session_id: str) -> bool: ...
 
     def send_input(self, session_id: str, data: bytes) -> None: ...
 
@@ -821,10 +823,11 @@ class MainWindow(QMainWindow):
             ),
             lambda sid=session_id: self._shell_service.close_session(sid),
         )
-        terminal.status_label.setText("Requesting remote shell")
+        terminal.set_requesting()
         self.terminal_window = terminal
         terminal.show()
         self.terminate_shell_button.setEnabled(True)
+        QTimer.singleShot(10_000, terminal, lambda: self._shell_service.cancel_pending_open(session_id))
 
     def _terminate_shell(self) -> None:
         if self._shell_service is None or self._active_shell_session is None:
@@ -854,7 +857,7 @@ class MainWindow(QMainWindow):
                 and self.terminal_window is not None
                 and self.terminal_window.session_id == state.session_id
             ):
-                self.terminal_window.status_label.setText("Remote shell connected")
+                self.terminal_window.set_connected()
             return
         if state.state in {"denied", "exited"}:
             self.shell_status.setText(
@@ -864,7 +867,7 @@ class MainWindow(QMainWindow):
                 self.terminal_window is not None
                 and self.terminal_window.session_id == state.session_id
             ):
-                self.terminal_window.mark_exited(state.exit_code)
+                self.terminal_window.mark_exited(state.exit_code, state.reason or "")
             if self._active_shell_session == state.session_id:
                 self._active_shell_session = None
                 self.terminate_shell_button.setEnabled(False)

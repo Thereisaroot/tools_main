@@ -42,6 +42,7 @@ from shooklink.protocol.messages import (
     decode_message,
     encode_message,
 )
+from shooklink.shell.codec import FEATURE as SHELL_COMPRESSION_FEATURE
 from shooklink.shell.service import ShellService
 from shooklink.transport.multiplexer import OutboundItem, Priority
 from shooklink.transport.serial_link import (
@@ -56,7 +57,7 @@ PROTOCOL_VERSION = 1
 AEAD_TAG_SIZE = 16
 HANDSHAKE_RETRY_SECONDS = 0.5
 LOCAL_FEATURES = frozenset(
-    {"chat", CHAT_ACK_FEATURE, "files", "shell", "input", UPDATE_FEATURE}
+    {"chat", CHAT_ACK_FEATURE, "files", "shell", SHELL_COMPRESSION_FEATURE, "input", UPDATE_FEATURE}
 )
 MAX_FEATURES = 32
 MAX_PEER_ID_BYTES = 256
@@ -279,6 +280,13 @@ class ShookLinkCore:
     def trusted(self) -> bool:
         with self._lock:
             return self._trusted_locked()
+
+    @property
+    def shell_output_compression(self) -> bool:
+        with self._lock:
+            return bool(self._connection and self._trusted_locked()
+                        and SHELL_COMPRESSION_FEATURE in self._connection.remote_features
+                        and SHELL_COMPRESSION_FEATURE in self._local_features())
 
     @property
     def chat_ack_available(self) -> bool:

@@ -111,3 +111,68 @@ def test_rendered_qt_cursor_tracks_pyte_cursor(qtbot):
     qtbot.waitUntil(lambda: window.terminal_view.toPlainText().startswith("abc"))
     assert window.screen.cursor.x == 1
     assert window.terminal_view.textCursor().positionInBlock() == 1
+
+
+def test_live_keys_are_immediate_but_local_command_mode_waits_for_enter(qtbot):
+    sent = []
+    window = TerminalWindow("f" * 32, sent.append, lambda *_: None, lambda: None)
+    qtbot.addWidget(window)
+    window.show()
+    assert not window.line_mode.isChecked()
+    qtbot.keyClicks(window.terminal_view, "ab")
+    assert sent == [b"a", b"b"]
+    window.line_mode.click()
+    qtbot.keyClicks(window.command_line, "pwd")
+    assert sent == [b"a", b"b"]
+    qtbot.keyClick(window.command_line, Qt.Key.Key_Return)
+    assert sent[-1] == b"pwd\r" and not window.command_line.text()
+
+
+def test_click_and_drag_do_not_relocate_remote_cursor_or_lose_selection(qtbot):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QTextCursor
+
+    window = TerminalWindow("a" * 32, lambda *_: None, lambda *_: None, lambda: None)
+    qtbot.addWidget(window)
+    window.show()
+    view = window.terminal_view
+    window.feed_output(b"history\r\nlive> ")
+    qtbot.waitUntil(lambda: "live> " in view.toPlainText())
+    qtbot.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=QPoint(12, 8))
+    assert (view.textCursor().blockNumber(), view.textCursor().positionInBlock()) == (1, 6)
+    cursor = QTextCursor(view.document())
+    cursor.setPosition(7, QTextCursor.MoveMode.KeepAnchor)
+    view.setTextCursor(cursor)
+    window.feed_output(b"ok")
+    qtbot.wait(30)
+    assert view.textCursor().selectedText() == "history"
+    qtbot.keyClicks(view, "x")
+    qtbot.waitUntil(lambda: "live> ok" in view.toPlainText())
+
+
+def test_burst_renders_together_and_unicode_wide_cells_map_to_qt_offsets(qtbot):
+    window = TerminalWindow("f" * 32, lambda *_: None, lambda *_: None, lambda: None)
+    qtbot.addWidget(window)
+    window.show()
+    changes = []
+    window.terminal_view.document().contentsChanged.connect(lambda: changes.append(1))
+    for _ in range(60):
+        window.feed_output(b"\x1b[32mhello\x1b[0m\r\n")
+    window.feed_output("한🙂>".encode())
+    qtbot.waitUntil(lambda: "한🙂>" in window.terminal_view.toPlainText())
+    assert len(changes) <= 3
+    assert window.terminal_view.textCursor().positionInBlock() == 4
+
+
+def test_requesting_or_exited_terminal_does_not_send_keys(qtbot):
+    sent = []
+    w = TerminalWindow("f" * 32, sent.append, lambda *_: None, lambda: None)
+    qtbot.addWidget(w)
+    w.set_requesting()
+    qtbot.keyClicks(w.terminal_view, "a")
+    w.set_connected()
+    qtbot.keyClicks(w.terminal_view, "b")
+    w.mark_exited(None, "permission")
+    qtbot.keyClicks(w.terminal_view, "c")
+    assert sent == [b"b"]
+    assert "Allow Remote Shell" in w.status_label.text()

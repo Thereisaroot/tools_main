@@ -66,6 +66,37 @@ class BrokenWriteEndpoint(MemoryEndpoint):
         raise OSError("write failed")
 
 
+def test_uart_reads_a_short_arrival_without_waiting_for_a_full_buffer():
+    class UART(MemoryEndpoint):
+        sizes = []
+        started = threading.Event()
+
+        @property
+        def in_waiting(self):
+            return len(self._buffer)
+
+        def read(self, size):
+            self.sizes.append(size)
+            self.started.set()
+            return super().read(size)
+
+    port = UART(max_read=4096)
+    link = SerialLink(port, lambda _: None, lambda _: None, read_size=64)
+    link.start()
+    try:
+        assert port.started.wait(1)
+        assert port.sizes[0] == 1
+        with port._condition:
+            port._buffer.extend(b"x" * 100)
+            port._condition.notify_all()
+        deadline = time.monotonic() + 1
+        while len(port.sizes) < 4 and time.monotonic() < deadline:
+            time.sleep(.001)
+        assert port.sizes[:4] == [1, 64, 35, 1]
+    finally:
+        link.close()
+
+
 class BlockingFlushEndpoint(MemoryEndpoint):
     def __init__(self):
         super().__init__()

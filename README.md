@@ -128,6 +128,20 @@ shell session per peer is accepted, and all shell input and output is encrypted.
 macOS hosts the user's login shell; Windows hosts PowerShell and falls back to
 `cmd.exe` when needed.
 
+The terminal starts in **live keys** mode: typing, Tab, arrows and Ctrl+C go
+directly to the remote terminal, including full-screen programs. Clicking old
+output does not move the remote cursor. Drag to select and copy; typing resumes
+the live display. For longer commands on a slow link, switch on **Edit command
+locally** to edit at the bottom and send the line once with Enter. Use live
+keys for passwords, completion and interactive programs. On a Windows host
+with a configured WSL distribution, run `wsl.exe` at the remote Windows prompt.
+
+Real UART reads return as soon as bytes arrive instead of waiting for a 4 KiB
+buffer to fill. Bursts of output repaint only the changed terminal rows.
+Two updated peers compress larger output blocks before encryption only when
+it saves bandwidth. Short prompts and keystrokes are not delayed for compression;
+older peers continue to receive the original bytes.
+
 ## Keyboard and Mouse Sharing
 
 Enable `Allow Remote Input` on the computer that may be controlled. Choose which

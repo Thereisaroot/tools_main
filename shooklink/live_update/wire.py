@@ -76,7 +76,8 @@ class UpdateService:
         details = (self.receiver.report(self.core.snapshot.fingerprint) if self.receiver
                    else {"managed": False, "phase": "unmanaged"})
         return dict(details, revision=self.revision, instance=self.instance,
-                    platform=sys.platform, idle=self.idle_for_update())
+                    platform=sys.platform, idle=self.idle_for_update(),
+                    allow_remote_shell=self.core.shell.allow_remote_shell)
 
     def handle_message(self, message):
         if not self.core.trusted or self.core.decrypt_secure(message) != b"":

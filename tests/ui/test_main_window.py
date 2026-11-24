@@ -120,6 +120,9 @@ class FakeShellService:
         self.opened.append((columns, rows))
         return "a" * 32
 
+    def cancel_pending_open(self, session_id):
+        return False
+
     def send_input(self, session_id, data):
         self.inputs.append((session_id, data))
 
