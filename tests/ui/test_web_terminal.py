@@ -155,4 +155,9 @@ def test_integrated_popup_uses_xterm_find_and_keeps_command_editor_optional(qtbo
     w._copy()
     qtbot.waitUntil(lambda: QApplication.clipboard().text() == "step 135")
     assert not sent
+    w._hide_find()
+    QTest.keyClick(w._web.focusProxy(), Qt.Key.Key_Minus, Qt.KeyboardModifier.ControlModifier)
+    qtbot.waitUntil(lambda: w._zoom_steps == -1)
+    QTest.keyClick(w._web.focusProxy(), Qt.Key.Key_0, Qt.KeyboardModifier.ControlModifier)
+    qtbot.waitUntil(lambda: w._zoom_steps == 0)
     w.close()

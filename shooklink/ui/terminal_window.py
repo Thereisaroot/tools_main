@@ -355,6 +355,7 @@ class TerminalWindow(QMainWindow):
                 web.find_shortcut.connect(self._open_find)
                 web.copy_shortcut.connect(self._copy)
                 web.paste_shortcut.connect(self._paste)
+                web.zoom_shortcut.connect(lambda step: self._zoom(step if step else -self._zoom_steps))
 
     def _zoom(self, change):
         self._zoom_steps = max(-5, min(12, self._zoom_steps + change))
@@ -479,7 +480,21 @@ class TerminalWindow(QMainWindow):
     def _resize(self, columns: int, rows: int) -> None:
         if self._web:
             return
-        self.screen.resize(lines=rows, columns=columns)
+        screen = self.screen
+        # Qt can finalize the viewport after the first prompt. pyte crops from
+        # the top on shrink; discard unused rows below the cursor first.
+        old_height = screen.lines
+        for y in range(old_height - 1, max(rows, screen.cursor.y + 1) - 1, -1):
+            line = screen.buffer.get(y)
+            if line is not None and (line.default != screen.default_char
+                                     or any(cell != screen.default_char for cell in line.values())):
+                break
+            screen.buffer.pop(y, None)
+            screen.lines = y
+        if screen.lines != old_height:
+            screen.set_margins()
+            screen.dirty.update(range(screen.lines))
+        screen.resize(lines=rows, columns=columns)
         self._resize_remote(columns, rows)
         self._render()
 

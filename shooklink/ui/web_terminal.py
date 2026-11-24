@@ -13,7 +13,7 @@ from PySide6.QtWebEngineCore import (
     QWebEnginePage, QWebEngineProfile, QWebEngineSettings, QWebEngineUrlRequestInterceptor,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMenu
 from shiboken6 import delete as delete_qobject
 
 from shooklink.live_update.release import TERMINAL_ASSETS
@@ -124,6 +124,7 @@ class WebTerminal(QWebEngineView):
     find_shortcut = Signal()
     copy_shortcut = Signal()
     paste_shortcut = Signal()
+    zoom_shortcut = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -143,7 +144,6 @@ class WebTerminal(QWebEngineView):
                        attr.PluginsEnabled, attr.FullScreenSupportEnabled):
             page.settings().setAttribute(option, False)
         self.setAcceptDrops(False)
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         page.permissionRequested.connect(lambda permission: permission.deny())
         self._channel = QWebChannel(page)
         self._channel.registerObject("terminalIO", self._bridge)
@@ -179,6 +179,12 @@ class WebTerminal(QWebEngineView):
                     and mods in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.ShiftModifier)):
                 reverse = event.key() == Qt.Key.Key_Backtab or bool(mods & Qt.KeyboardModifier.ShiftModifier)
                 action = lambda: self.input_bytes.emit(b"\x1b[Z" if reverse else b"\t")
+            elif event.matches(QKeySequence.StandardKey.ZoomIn):
+                action = lambda: self.zoom_shortcut.emit(1)
+            elif event.matches(QKeySequence.StandardKey.ZoomOut):
+                action = lambda: self.zoom_shortcut.emit(-1)
+            elif event.key() == Qt.Key.Key_0 and mods == Qt.KeyboardModifier.ControlModifier:
+                action = lambda: self.zoom_shortcut.emit(0)
             elif mods == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
                 action = {Qt.Key.Key_F: self.find_shortcut.emit, Qt.Key.Key_C: self.copy_shortcut.emit,
                           Qt.Key.Key_V: self.paste_shortcut.emit}.get(event.key())
@@ -243,6 +249,16 @@ class WebTerminal(QWebEngineView):
                 QApplication.clipboard().setText(text)
         if self.is_ready:
             self.page().runJavaScript("window.shookTerm.selection()", 0, copy)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        for label, callback in (("Copy", self.copy_shortcut.emit), ("Paste", self.paste_shortcut.emit),
+                                ("Find", self.find_shortcut.emit),
+                                ("Larger text", lambda: self.zoom_shortcut.emit(1)),
+                                ("Smaller text", lambda: self.zoom_shortcut.emit(-1)),
+                                ("Reset text size", lambda: self.zoom_shortcut.emit(0))):
+            menu.addAction(label).triggered.connect(lambda _=False, fn=callback: fn())
+        menu.exec(event.globalPos())
 
     def shutdown(self):
         if self._owned_page is None:

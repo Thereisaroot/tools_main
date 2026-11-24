@@ -23,7 +23,13 @@ def test_terminal_renders_vt_output_and_bounds_history(qtbot):
 
     window.feed_output(b"\x1b[2J\x1b[HPTY_OK")
 
-    qtbot.waitUntil(lambda: "PTY_OK" in window.terminal_view.toPlainText())
+    def rendered():
+        view = window.terminal_view
+        assert "PTY_OK" in view.toPlainText(), (
+            window.screen.display[0][:20], window.screen.lines, view.document().blockCount(),
+            view.textCursor().hasSelection(), view.selecting, window._frame_timer.isActive(),
+        )
+    qtbot.waitUntil(rendered)
     assert window.screen.history.size == 10_000
     window.close()
     assert closed == [True]
@@ -124,6 +130,16 @@ def test_rendered_qt_cursor_tracks_pyte_cursor(qtbot):
     qtbot.waitUntil(lambda: window.terminal_view.toPlainText().startswith("abc"))
     assert window.screen.cursor.x == 1
     assert window.terminal_view.textCursor().positionInBlock() == 1
+
+
+def test_native_resize_keeps_prompt_when_only_unused_bottom_rows_are_removed(qtbot):
+    w = TerminalWindow("a" * 32, lambda _: None, lambda *_: None, lambda: None)
+    qtbot.addWidget(w)
+    w._resize(90, 32)
+    w.feed_output(b"WSL prompt> ")
+    w._resize(88, 30)
+    assert w.screen.display[0].startswith("WSL prompt> ")
+    assert w.terminal_view.toPlainText().startswith("WSL prompt> ")
 
 
 def test_live_keys_are_immediate_but_local_command_mode_waits_for_enter(qtbot):
