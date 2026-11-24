@@ -12,7 +12,7 @@ import uuid
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import QApplication
 
 from shooklink.core import CoreSnapshot, ShookLinkCore
@@ -296,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if arguments.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if QApplication.instance() is None:
+        QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     qt_app = QApplication.instance() or QApplication(["shooklink"])
     qt_app.setApplicationName("ShookLink")
     qt_app.setOrganizationName("ShookLink")

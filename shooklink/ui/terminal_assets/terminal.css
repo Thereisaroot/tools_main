@@ -1,0 +1,4 @@
+:root { color-scheme: dark; background: #0d1715; }
+html, body { height: 100%; margin: 0; overflow: hidden; }
+#terminal { position: absolute; inset: 7px 5px 5px 8px; }
+.xterm { height: 100%; }

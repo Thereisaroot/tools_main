@@ -22,5 +22,11 @@ dependencies = [
 shooklink = "shooklink.app:main"
 shooklinkctl = "shooklink.local_control.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["shooklink*"]
+
+[tool.setuptools.package-data]
+"shooklink.ui" = ["terminal_assets/*.html", "terminal_assets/*.css", "terminal_assets/*.js", "terminal_assets/LICENSE-*.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

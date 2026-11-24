@@ -2,7 +2,7 @@ import hashlib
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -1534,16 +1534,18 @@ def test_prepared_transfer_keeps_capacity_reserved_until_registration(
         tmp_path / "downloads",
         max_outgoing_transfers=1,
     )
-    result = service.send_file(first)
-    assert entered_transition.wait(1)
-
-    try:
-        with pytest.raises(FileTransferError, match="capacity"):
-            service.send_file(second)
-    finally:
-        release_transition.set()
-        result.result(timeout=2)
-        service.close()
+    # add_done_callback may run inline if this tiny file was prepared immediately.
+    # Keep the thread which releases the test barrier independent of either path.
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        request = caller.submit(service.send_file, first)
+        try:
+            assert entered_transition.wait(2)
+            with pytest.raises(FileTransferError, match="capacity"):
+                service.send_file(second)
+        finally:
+            release_transition.set()
+            request.result(timeout=2).result(timeout=2)
+            service.close()
 
 
 def test_exact_terminal_registry_refuses_new_ids_when_its_bound_is_reached(tmp_path):

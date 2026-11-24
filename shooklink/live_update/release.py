@@ -188,4 +188,6 @@ def stage_archive(path: Path, release: Release, public_key: str, destination: Pa
                     output.chmod(0o755)
         if not _REQUIRED.issubset(seen):
             raise ValueError("archive is missing the managed ShookLink runtime")
+        if seen & TERMINAL_ASSETS and not TERMINAL_ASSETS.issubset(seen):
+            raise ValueError("archive is missing offline terminal resources")
         root.rename(destination)

@@ -685,7 +685,8 @@ def test_terminal_file_progress_history_is_bounded(qtbot, tmp_path):
     assert len(window._file_transfers) <= 128
 
 
-def test_remote_shell_controls_open_terminal_and_forward_output(qtbot):
+def test_remote_shell_controls_open_terminal_and_forward_output(qtbot, monkeypatch):
+    monkeypatch.setenv("SHOOKLINK_TERMINAL_RENDERER", "native")
     shell = FakeShellService()
     window = MainWindow(ChatService(FakeBus()), None, shell)
     qtbot.addWidget(window)
@@ -706,6 +707,7 @@ def test_remote_shell_controls_open_terminal_and_forward_output(qtbot):
 
     qtbot.mouseClick(window.terminate_shell_button, Qt.MouseButton.LeftButton)
     assert shell.closed[-1] == session_id
+    window.terminal_window.close()
 
 
 def test_input_share_controls_state_and_leave_chat_file_actions_enabled(qtbot, tmp_path):

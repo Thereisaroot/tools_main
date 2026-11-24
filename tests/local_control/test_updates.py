@@ -72,6 +72,28 @@ def test_pack_update_uses_committed_runtime_only_and_needs_no_gui(checkout, tmp_
         }
 
 
+def test_offline_terminal_packaging_includes_exact_resources_and_not_extra_scripts(checkout, tmp_path):
+    from shooklink.live_update.release import TERMINAL_ASSETS, TERMINAL_ASSET_DIR
+    from shooklink.local_control.updates import build_update_archive
+
+    directory = checkout / TERMINAL_ASSET_DIR
+    directory.mkdir(parents=True)
+    (directory / "index.html").write_text("first")
+    subprocess.run(["git", "add", "."], cwd=checkout, check=True)
+    commit(checkout, "incomplete renderer")
+    with pytest.raises(ValueError, match="incomplete offline"):
+        build_update_archive(checkout, tmp_path / "packages")
+    for name in TERMINAL_ASSETS:
+        (checkout / name).write_bytes(b"test resource")
+    (directory / "not-shipped.js").write_text("extra")
+    subprocess.run(["git", "add", "."], cwd=checkout, check=True)
+    commit(checkout, "complete renderer")
+    path = build_update_archive(checkout, tmp_path / "packages")
+    with ZipFile(path) as archive:
+        resources = {n.split("/", 1)[1] for n in archive.namelist() if TERMINAL_ASSET_DIR in n and not n.endswith("/")}
+        assert resources == TERMINAL_ASSETS
+
+
 def test_send_update_reaches_a_peer_via_its_existing_file_service(checkout, tmp_path):
     endpoint = tmp_path / "control.json"
     sender, _, _ = build_core(tmp_path, "sender")

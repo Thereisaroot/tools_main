@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
 from collections.abc import Callable
 from itertools import groupby
@@ -16,8 +18,10 @@ from PySide6.QtGui import (
     QKeyEvent,
     QKeySequence,
     QResizeEvent,
+    QShortcut,
     QTextCharFormat,
     QTextCursor,
+    QTextDocument,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,11 +32,13 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QPlainTextEdit,
+    QPushButton,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+logger = logging.getLogger(__name__)
 _KEY_SEQUENCES = {
     Qt.Key.Key_Up: b"\x1b[A",
     Qt.Key.Key_Down: b"\x1b[B",
@@ -200,6 +206,9 @@ class TerminalView(QPlainTextEdit):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
+        self.sync_size()
+
+    def sync_size(self) -> None:
         metrics = self.fontMetrics()
         cell_width = max(1, metrics.horizontalAdvance("M"))
         cell_height = max(1, metrics.lineSpacing())
@@ -232,6 +241,8 @@ class TerminalWindow(QMainWindow):
         send_input: Callable[[bytes], None],
         resize_remote: Callable[[int, int], None],
         close_remote: Callable[[], None],
+        *,
+        rich: bool = False,
     ) -> None:
         super().__init__()
         self.session_id = session_id
@@ -240,6 +251,8 @@ class TerminalWindow(QMainWindow):
         self._close_remote = close_remote
         self._remote_exited = False
         self._connected = True
+        self._web = None
+        self._zoom_steps = 0
         self.screen = pyte.HistoryScreen(80, 24, history=10_000)
         self._stream = pyte.ByteStream(self.screen)
         self._rows = {}
@@ -260,6 +273,22 @@ class TerminalWindow(QMainWindow):
         self.terminal_view = TerminalView()
         layout.addWidget(self.status_label)
         layout.addWidget(self.terminal_view, 1)
+        self.find_bar = QWidget()
+        find_layout = QHBoxLayout(self.find_bar)
+        find_layout.setContentsMargins(8, 2, 8, 2)
+        self.find_field = QLineEdit()
+        self.find_field.setPlaceholderText("Find in terminal output")
+        find_layout.addWidget(self.find_field, 1)
+        self.find_result = QLabel()
+        find_layout.addWidget(self.find_result)
+        for label, callback in (("Previous", lambda: self._find(True)), ("Next", self._find),
+                                ("Close", self._hide_find)):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _=False, fn=callback: fn())
+            find_layout.addWidget(button)
+        self.find_field.returnPressed.connect(self._find)
+        self.find_bar.hide()
+        layout.addWidget(self.find_bar)
         controls = QHBoxLayout()
         self.line_mode = QCheckBox("Edit command locally")
         self.line_mode.setToolTip("Off: send keys immediately, including Tab and Ctrl+C.")
@@ -268,6 +297,14 @@ class TerminalWindow(QMainWindow):
         self.command_line.hide()
         controls.addWidget(self.line_mode)
         controls.addWidget(self.command_line, 1)
+        self.renderer_label = QLabel("Native terminal")
+        controls.addWidget(self.renderer_label)
+        controls.addStretch(1)
+        for label, callback in (("Find", self._open_find), ("Copy", self._copy), ("Paste", self._paste)):
+            button = QPushButton(label)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.clicked.connect(lambda _=False, fn=callback: fn())
+            controls.addWidget(button)
         layout.addLayout(controls)
         self.line_mode.toggled.connect(self._set_line_mode)
         self.command_line.returnPressed.connect(self._submit_line)
@@ -290,11 +327,120 @@ class TerminalWindow(QMainWindow):
         self.terminal_view.selection_finished.connect(self._render)
         self.terminal_view.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled)
         self.terminal_view.setFocus()
+        QShortcut(QKeySequence("Ctrl+Shift+F"), self).activated.connect(self._open_find)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.ZoomIn), self).activated.connect(lambda: self._zoom(1))
+        QShortcut(QKeySequence(QKeySequence.StandardKey.ZoomOut), self).activated.connect(lambda: self._zoom(-1))
+        QShortcut(QKeySequence("Ctrl+0"), self).activated.connect(lambda: self._zoom(-self._zoom_steps))
+        if sys.platform == "darwin":
+            QShortcut(QKeySequence(QKeySequence.StandardKey.Find), self).activated.connect(self._open_find)
+        QShortcut(QKeySequence("Esc"), self.find_field,
+                  context=Qt.ShortcutContext.WidgetShortcut).activated.connect(self._hide_find)
+        if rich and os.environ.get("SHOOKLINK_TERMINAL_RENDERER", "").lower() != "native":
+            try:
+                from shooklink.ui.web_terminal import WebTerminal
+                web = WebTerminal(self)
+            except (ImportError, OSError, RuntimeError) as error:
+                self.renderer_label.setToolTip(str(error))
+                logger.info("Using native terminal: %s", error)
+            else:
+                self._web = web
+                self.terminal_view.hide()
+                layout.insertWidget(1, web, 1)
+                self.renderer_label.setText("Starting xterm.js")
+                web.input_bytes.connect(self._send_live)
+                web.terminal_resized.connect(self._resize_remote)
+                web.ready.connect(self._web_ready)
+                web.failed.connect(self._web_failed)
+                web.search_result.connect(self._show_match)
+                web.find_shortcut.connect(self._open_find)
+                web.copy_shortcut.connect(self._copy)
+                web.paste_shortcut.connect(self._paste)
+
+    def _zoom(self, change):
+        self._zoom_steps = max(-5, min(12, self._zoom_steps + change))
+        if self._web:
+            self._web.set_font_size(15 + self._zoom_steps)
+        else:
+            font = self.terminal_view.font()
+            font.setPointSize(12 + self._zoom_steps)
+            self.terminal_view.setFont(font)
+            self.terminal_view.sync_size()
+
+    def _web_ready(self):
+        self.renderer_label.setText("xterm.js")
+        self._web.set_font_size(15 + self._zoom_steps)
+        if not self.line_mode.isChecked() and not self.find_bar.isVisible():
+            self._web.focus_terminal()
+
+    def _web_failed(self, reason: str, pending: bytes):
+        web, self._web = self._web, None
+        if web is None:
+            return
+        logger.warning("Falling back to native terminal: %s", reason)
+        web.hide()
+        web.shutdown()
+        web.deleteLater()
+        self.renderer_label.setText("Native fallback")
+        self.renderer_label.setToolTip(reason)
+        self.terminal_view.show()
+        self._set_line_mode(self.line_mode.isChecked())
+        if pending:
+            self._consume_output(pending)
+
+    def _focus_terminal(self):
+        if self.line_mode.isChecked():
+            self.command_line.setFocus()
+        elif self._web:
+            self._web.focus_terminal()
+        else:
+            self.terminal_view.setFocus()
+
+    def _open_find(self):
+        self.find_bar.show()
+        self.find_field.setFocus()
+        self.find_field.selectAll()
+
+    def _hide_find(self):
+        self.find_bar.hide()
+        self.find_result.clear()
+        if self._web:
+            self._web.find_text("")
+        self._focus_terminal()
+
+    def _show_match(self, matched):
+        self.find_result.setText("" if matched or not self.find_field.text() else "No match")
+
+    def _find(self, previous=False):
+        query = self.find_field.text()
+        if self._web:
+            self._web.find_text(query, previous)
+        elif query:
+            flags = QTextDocument.FindFlag.FindBackward if previous else QTextDocument.FindFlag(0)
+            if not self.terminal_view.find(query, flags):
+                self.terminal_view.moveCursor(QTextCursor.MoveOperation.End if previous else QTextCursor.MoveOperation.Start)
+                self._show_match(self.terminal_view.find(query, flags))
+            else:
+                self._show_match(True)
+
+    def _copy(self):
+        if self._web:
+            self._web.copy_selection()
+        else:
+            self.terminal_view.copy()
+
+    def _paste(self):
+        if self.line_mode.isChecked():
+            self.command_line.paste()
+        elif self._web:
+            self._web.paste_text(QApplication.clipboard().text())
+        else:
+            self.terminal_view.paste_to_remote()
+        self._focus_terminal()
 
     def _set_line_mode(self, enabled: bool) -> None:
         self.command_line.setVisible(enabled)
         self.terminal_view.setFocusPolicy(Qt.FocusPolicy.NoFocus if enabled else Qt.FocusPolicy.StrongFocus)
-        (self.command_line if enabled else self.terminal_view).setFocus()
+        self._focus_terminal()
 
     def _send_live(self, data: bytes) -> None:
         if self._connected and not self._remote_exited and not self.line_mode.isChecked():
@@ -323,11 +469,16 @@ class TerminalWindow(QMainWindow):
         self.exit_received.emit(exit_code, reason)
 
     def _consume_output(self, data: bytes) -> None:
+        if self._web:
+            self._web.feed_output(data)
+            return
         self._stream.feed(data)
         if not self._frame_timer.isActive():
             self._frame_timer.start()
 
     def _resize(self, columns: int, rows: int) -> None:
+        if self._web:
+            return
         self.screen.resize(lines=rows, columns=columns)
         self._resize_remote(columns, rows)
         self._render()
@@ -396,7 +547,11 @@ class TerminalWindow(QMainWindow):
         }.get(reason, f"Remote shell exited{suffix}"))
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._web:
+            web, self._web = self._web, None
+            web.shutdown()
         if not self._remote_exited:
+            self._remote_exited = True
             self._close_remote()
         super().closeEvent(event)
 

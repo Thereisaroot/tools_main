@@ -822,6 +822,7 @@ class MainWindow(QMainWindow):
                 sid, columns, rows
             ),
             lambda sid=session_id: self._shell_service.close_session(sid),
+            rich=True,
         )
         terminal.set_requesting()
         self.terminal_window = terminal

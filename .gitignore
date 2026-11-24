@@ -19,6 +19,7 @@ dist/
 pip-wheel-metadata/
 
 # Tool caches
+/tools/terminal-vendor/node_modules/
 .pytest_cache/
 .mypy_cache/
 received_files/

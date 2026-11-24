@@ -136,6 +136,20 @@ locally** to edit at the bottom and send the line once with Enter. Use live
 keys for passwords, completion and interactive programs. On a Windows host
 with a configured WSL distribution, run `wsl.exe` at the remote Windows prompt.
 
+The default display uses the [xterm.js](https://xtermjs.org/) engine. It has
+scrollback, alternate screens for vim/top/tmux, ANSI colors, and bracketed
+paste when the remote program enables it. **Find** searches terminal history;
+use Enter/Next or Previous to cycle through matches. Use **Copy** or **Paste**,
+Cmd+C/V on macOS, or Ctrl+Shift+C/V on Windows. Ctrl+Shift+F opens Find.
+Use the platform zoom shortcuts or Ctrl+0 (Cmd+0 on macOS) to reset. For
+completion, type a partial command/path and press Tab. Tab, Shift+Tab and
+command history are handled by the remote shell, not a Mac-side file lookup.
+
+The viewer loads its bundled scripts and styles locally, with no CDN, network
+listener or Node.js dependency on either user machine. If WebEngine or its
+assets cannot load, a visible native fallback keeps the existing session.
+Set `SHOOKLINK_TERMINAL_RENDERER=native` to choose it before launch.
+
 Real UART reads return as soon as bytes arrive instead of waiting for a 4 KiB
 buffer to fill. Bursts of output repaint only the changed terminal rows.
 Two updated peers compress larger output blocks before encryption only when
@@ -232,7 +246,8 @@ python3 -m shooklink.local_control.cli send-update
 
 This packages the current **committed HEAD** as `dist/ShookLink-<commit>.zip` and
 sends it through the running GUI. The ZIP contains the tracked ShookLink Python
-modules, launchers, requirements, project metadata and README. Use `pack-update`
+modules, allowlisted offline terminal assets and licenses, launchers, requirements,
+project metadata and README. Use `pack-update`
 instead of `send-update` to prepare the ZIP offline for `Choose File` or drag and
 drop. Both commands accept `--repo PATH` and `--output-dir PATH`.
 
