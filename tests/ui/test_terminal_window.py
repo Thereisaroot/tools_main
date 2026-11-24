@@ -62,6 +62,19 @@ def test_terminal_forwards_ctrl_c_arrows_text_and_paste(qtbot):
     assert sent[-1] == "한글 paste".encode()
 
 
+def test_live_tab_and_reverse_tab_reach_shell_without_traversing_controls(qtbot):
+    sent = []
+    w = TerminalWindow("c" * 32, sent.append, lambda *_: None, lambda: None)
+    qtbot.addWidget(w)
+    w.show()
+    w.activateWindow()
+    w.terminal_view.setFocus()
+    qtbot.keyClick(w.terminal_view, Qt.Key.Key_Tab)
+    qtbot.keyClick(w.terminal_view, Qt.Key.Key_Tab, Qt.KeyboardModifier.ShiftModifier)
+    assert sent == [b"\t", b"\x1b[Z"]
+    assert w.focusWidget() is w.terminal_view
+
+
 def test_remote_exit_does_not_send_a_second_close(qtbot):
     closed = []
     window = TerminalWindow(

@@ -7,7 +7,7 @@ from collections.abc import Callable
 from itertools import groupby
 
 import pyte
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -102,6 +102,19 @@ class TerminalView(QPlainTextEdit):
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.setFont(font)
         self._last_size: tuple[int, int] | None = None
+
+    def event(self, event) -> bool:
+        if event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress) and (
+            event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab)
+            and event.modifiers() in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.ShiftModifier)
+            and self.focusPolicy() != Qt.FocusPolicy.NoFocus
+        ):
+            if event.type() == QEvent.Type.KeyPress:
+                reverse = event.key() == Qt.Key.Key_Backtab or bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                self._send_keys(b"\x1b[Z" if reverse else b"\t")
+            event.accept()
+            return True
+        return super().event(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         modifiers = event.modifiers()

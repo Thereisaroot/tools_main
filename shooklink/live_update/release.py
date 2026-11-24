@@ -23,6 +23,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 FEATURE = "live_update_v1"
 MAX_ZIP = 16 * 1024 * 1024
 MAX_EXPANDED = 32 * 1024 * 1024
+TERMINAL_ASSET_DIR = "shooklink/ui/terminal_assets"
+TERMINAL_ASSETS = frozenset(f"{TERMINAL_ASSET_DIR}/{name}" for name in (
+    "index.html", "terminal.js", "terminal.css", "xterm.js", "xterm.css",
+    "addon-fit.js", "addon-search.js", "LICENSE-xterm.txt", "LICENSE-fit.txt", "LICENSE-search.txt",
+))
 _ROOT_FILES = {"README.md", "requirements.txt", "pyproject.toml",
                "run_serial_text_chat.bat", "run_serial_text_chat.sh"}
 _REQUIRED = {"shooklink/__init__.py", "shooklink/__main__.py", "shooklink/app.py",
@@ -129,7 +134,7 @@ class Release:
 
 
 def _runtime_member(name: str, directory: bool) -> bool:
-    if not directory and name in _ROOT_FILES:
+    if not directory and (name in _ROOT_FILES or name in TERMINAL_ASSETS):
         return True
     parts = name.split("/")
     if parts[0] != "shooklink" or (not directory and len(parts) == 1):

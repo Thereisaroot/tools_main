@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from zipfile import ZipFile
 
+from shooklink.live_update.release import TERMINAL_ASSET_DIR, TERMINAL_ASSETS
 _RUNTIME_FILES = (
     "requirements.txt",
     "pyproject.toml",
@@ -37,6 +38,11 @@ def build_update_archive(checkout: Path, output_dir: Path | None = None) -> Path
     toplevel = _git(checkout.expanduser(), "rev-parse", "--show-toplevel")
     root = Path(os.fsdecode(toplevel.rstrip(b"\r\n")))
     revision = _git(root, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+    tracked = set(_git(root, "ls-tree", "-r", "--name-only", revision, "--", TERMINAL_ASSET_DIR)
+                  .decode().splitlines())
+    assets = TERMINAL_ASSETS & tracked
+    if assets and assets != TERMINAL_ASSETS:
+        raise ValueError("incomplete offline terminal assets in release")
     release = f"ShookLink-{revision[:12]}"
     directory = (output_dir or root / "dist").expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -56,6 +62,7 @@ def build_update_archive(checkout: Path, output_dir: Path | None = None) -> Path
             "--",
             ":(top,glob)shooklink/**/*.py",
             *_RUNTIME_FILES,
+            *sorted(assets),
         )
         with ZipFile(staged) as archive:
             names = set(archive.namelist())

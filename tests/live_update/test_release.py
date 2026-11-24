@@ -10,6 +10,15 @@ from shooklink.live_update.manager import ManagedReceiver, State
 REVISION = "a" * 40
 
 
+def test_offline_terminal_assets_are_narrowly_allowlisted():
+    from shooklink.live_update.release import _runtime_member
+
+    for name in ("index.html", "terminal.js", "xterm.js", "addon-fit.js", "xterm.css", "LICENSE-xterm.txt"):
+        assert _runtime_member("shooklink/ui/terminal_assets/" + name, False)
+    for name in ("other.js", "../xterm.js", "index.html.exe", "XTERM.JS"):
+        assert not _runtime_member("shooklink/ui/terminal_assets/" + name, False)
+
+
 def test_signed_release_binds_bytes_revision_and_sequence(tmp_path):
     from hashlib import sha256
 
