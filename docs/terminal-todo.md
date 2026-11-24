@@ -12,8 +12,18 @@ and [flow-control](https://xtermjs.org/docs/guides/flowcontrol/) guidance.
 - [x] Embed an offline xterm with bounded output, VT alternate screen, scrollback, selection and the engine's IME input.
 - [x] Add find, next/previous match, fit-on-resize and deliberate copy/paste. No external URLs or remote clipboard commands.
 - [x] Keep a working native fallback if the browser engine or resources are unavailable.
-- [ ] Test actual key delivery, shell completion, alternate-screen restoration, UTF-8 and packaging on Mac and Windows.
+- [x] Test actual key delivery, Bash completion in a PTY, alternate-screen restoration, UTF-8 and packaging.
+  [The macOS/Windows test matrix](https://github.com/Thereisaroot/tools_main/actions/runs/45375170683)
+  passed on Python 3.11 and 3.13 for runtime build `d43d2692283d`.
 - [ ] Verify live deployment on an idle peer without taking over the user's WSL session.
+
+## 사용 및 적용
+
+- 파일명이나 명령의 앞부분을 입력하고 Tab을 누르면 원격 셸이 완성 후보를 선택한다. 실시간 입력이 기본이다.
+- 출력 검색은 **Find** 또는 Ctrl+Shift+F로 시작한다. macOS에서는 Cmd+F도 지원한다.
+- 여러 줄을 붙여넣을 때 원격 프로그램이 bracketed paste 모드를 요청하면 터미널은 붙여넣은 범위를 구분하여 전송한다.
+- 창 하단의 `xterm.js` 표시는 새 엔진을, `Native fallback` 표시는 대체 화면을 뜻한다. 설치 후 실행 버전은 상대가 보고한 커밋으로 확인한다.
+- 셸 사용 중에는 설치를 요청하지 않는다. 기존 WSL(Windows Subsystem for Linux) 세션을 종료한 뒤 업데이트와 재연결을 검증한다.
 
 ## Maintainer notes
 
