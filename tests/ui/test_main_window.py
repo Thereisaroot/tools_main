@@ -408,6 +408,69 @@ def test_ready_shows_the_connected_peers_version_and_optional_build(qtbot):
         assert window.connection_status.text() == expected
 
 
+def test_failed_connect_shows_copyable_detail_in_serial_panel_and_clears_on_retry(qtbot):
+    window = MainWindow(ChatService(FakeBus()))
+    qtbot.addWidget(window)
+    window.show()
+    window.port_combo.setCurrentText("COM7")
+    window.baud_combo.setCurrentText("750000")
+    window.set_connection_pending("COM7", 750000)
+    reason = "could not open port 'COM7': Access is denied."
+    window.show_connection_error(reason)
+
+    detail = window.connection_error_label
+    assert detail.parentWidget() is window.connect_button.parentWidget()
+    assert detail.isVisible() and detail.wordWrap()
+    assert detail.textFormat() == Qt.TextFormat.PlainText
+    assert "COM7" in detail.text() and "750000" in detail.text() and reason in detail.text()
+    assert window.copy_connection_error_button.isVisible()
+    window.show_operation_error("unrelated message")
+    qtbot.mouseClick(window.copy_connection_error_button, Qt.MouseButton.LeftButton)
+    assert QApplication.clipboard().text() == detail.text()
+    window.set_connection_pending("COM7", 750000)
+    assert detail.isHidden() and window.copy_connection_error_button.isHidden()
+
+    window.apply_core_snapshot(CoreSnapshot(2, CoreState.ERROR, error="serial device stopped responding"))
+    assert detail.isVisible() and "serial device stopped responding" in detail.text()
+    window.apply_core_snapshot(CoreSnapshot(3, CoreState.READY))
+    assert detail.isHidden()
+
+
+def test_bad_baud_shows_validation_error_next_to_connect(qtbot):
+    window = MainWindow(ChatService(FakeBus()))
+    qtbot.addWidget(window)
+    window.show()
+    window.port_combo.setCurrentText("COM7")
+    window.baud_combo.setCurrentText("not-a-rate")
+    qtbot.mouseClick(window.connect_button, Qt.MouseButton.LeftButton)
+    assert window.connection_error_label.isVisible()
+    assert "Baud" in window.connection_error_label.text()
+
+
+def test_missing_port_reports_real_driver_error_without_another_device(qtbot, tmp_path):
+    from shooklink.app import ApplicationController
+    from shooklink.settings import AppSettings, SettingsStore
+    from tests.integration.test_peer_pair import build_core
+
+    core, *_ = build_core(tmp_path, "connect-error")
+    window = MainWindow(core.chat)
+    qtbot.addWidget(window)
+    controller = ApplicationController(core, window, SettingsStore(tmp_path / "settings.json"), AppSettings())
+    try:
+        window.show()
+        missing = str(tmp_path / "absent-serial-device")
+        window.port_combo.setCurrentText(missing)
+        window.baud_combo.setCurrentText("750000")
+        qtbot.mouseClick(window.connect_button, Qt.MouseButton.LeftButton)
+        qtbot.waitUntil(window.connection_error_label.isVisible)
+        assert window.connection_status.text() == "Error"
+        detail = window.connection_error_label.text()
+        assert missing in detail and "750000" in detail and "could not open port" in detail.lower()
+        assert window.connect_button.isEnabled() and window.port_combo.isEnabled()
+    finally:
+        controller.close()
+
+
 def test_connection_state_exposes_trust_approval_and_disconnect(qtbot):
     bus = FakeBus(trusted=False)
     window = MainWindow(ChatService(bus))

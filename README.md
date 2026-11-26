@@ -90,6 +90,11 @@ authenticated and encrypted after trust.
 Typical serial port names are `/dev/cu.usbserial-*` on macOS and `COM3` on
 Windows.
 
+If **Connect** immediately shows **Error**, read the serial driver's message
+below the port and baud fields, or use **Copy Error**. In older builds it is
+at the bottom of the main window, to the left of **Send Plain**. **Handshaking**
+is different: the local port is open but the peer handshake is not complete.
+
 ## Baud Rates
 
 The connection screen provides these common rates:

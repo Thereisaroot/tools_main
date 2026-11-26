@@ -175,7 +175,7 @@ class ApplicationController(QObject):
     def _connect_requested(self, port: str, baud_rate: int) -> None:
         if self._closed:
             return
-        self._window.set_connection_pending(port)
+        self._window.set_connection_pending(port, baud_rate)
         self._settings = AppSettings(
             last_port=port,
             baud_rate=baud_rate,
@@ -230,10 +230,16 @@ class ApplicationController(QObject):
         self._active_operations.remove(operation_id)
         if self._closed or error is None:
             return
-        logger.debug("%s operation failed", kind, exc_info=error)
         if kind == "connect":
-            self._window.show_connection_error(str(error))
+            detail = str(error).strip() or type(error).__name__
+            logger.warning(
+                "Connect failed on %s at %s baud: %s",
+                self._settings.last_port, self._settings.baud_rate, detail,
+                exc_info=error if logger.isEnabledFor(logging.DEBUG) else None,
+            )
+            self._window.show_connection_error(detail)
             return
+        logger.debug("%s operation failed", kind, exc_info=error)
         self._window.apply_core_snapshot(self._core.snapshot)
         self._window.show_operation_error(str(error))
 

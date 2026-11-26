@@ -106,8 +106,8 @@ class FakeWindow(QObject):
     def apply_core_snapshot(self, snapshot):
         self.snapshots.append(snapshot)
 
-    def set_connection_pending(self, port):
-        self.pending.append(port)
+    def set_connection_pending(self, port, baud_rate):
+        self.pending.append((port, baud_rate))
 
     def show_connection_error(self, message):
         self.errors.append(message)
@@ -168,7 +168,7 @@ def test_controller_autoconnects_only_when_saved_port_is_present(qtbot, tmp_path
     controller.start()
     qtbot.waitUntil(lambda: core.connect_calls == [("COM9", 460800)])
     assert window.defaults == ("COM9", 460800)
-    assert window.pending == ["COM9"]
+    assert window.pending == [("COM9", 460800)]
 
     controller.close()
     assert core.close_calls == 1
@@ -284,3 +284,20 @@ def test_trust_failure_preserves_the_active_connection_snapshot(qtbot, tmp_path)
     assert window.errors == []
     assert window.snapshots[-1] is active_snapshot
     controller.close()
+
+
+def test_failed_port_open_logs_target_and_explains_an_empty_exception(qtbot, tmp_path, caplog):
+    core = FakeCore()
+    def fail(_port, _baud):
+        raise OSError()
+    core.connect_port = fail
+    window = FakeWindow(("COM7",))
+    controller = app.ApplicationController(core, window, SettingsStore(tmp_path / "settings.json"),
+                                           AppSettings(), executor=ImmediateExecutor())
+    try:
+        window.connect_requested.emit("COM7", 750000)
+        qtbot.waitUntil(lambda: bool(window.errors))
+        assert "OSError" in window.errors[-1]
+        assert "COM7" in caplog.text and "750000" in caplog.text and "OSError" in caplog.text
+    finally:
+        controller.close()

@@ -204,6 +204,7 @@ class MainWindow(QMainWindow):
         self._shortcuts: list[QShortcut] = []
         self._connected = False
         self._connecting = False
+        self._connection_target = ""
         self._connection_id = 0
         self._peer_fingerprint: str | None = None
         self._update_snapshot: CoreSnapshot | None = None
@@ -291,6 +292,19 @@ class MainWindow(QMainWindow):
         connection_layout.addWidget(self.port_combo, 1, 0)
         connection_layout.addWidget(self.baud_combo, 1, 1)
         connection_layout.addWidget(self.connect_button, 1, 2)
+        self.connection_error_label = QLabel()
+        self.connection_error_label.setObjectName("connectionError")
+        self.connection_error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.connection_error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.connection_error_label.setWordWrap(True)
+        self.connection_error_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.copy_connection_error_button = QPushButton("Copy Error")
+        self.copy_connection_error_button.clicked.connect(
+            lambda: QApplication.clipboard().setText(self.connection_error_label.text())
+        )
+        connection_layout.addWidget(self.connection_error_label, 2, 0, 1, 2)
+        connection_layout.addWidget(self.copy_connection_error_button, 2, 2)
+        self._set_connection_detail("")
         self.peer_fingerprint = QLabel("No authenticated peer")
         self.peer_fingerprint.setObjectName("peerFingerprint")
         self.trust_button = QPushButton("Trust Peer")
@@ -300,9 +314,9 @@ class MainWindow(QMainWindow):
         self.allow_updates_button.clicked.connect(self._request_update_permission)
         self.allow_updates_button.setEnabled(False)
         self.allow_updates_button.hide()
-        connection_layout.addWidget(self.peer_fingerprint, 2, 0, 1, 2)
-        connection_layout.addWidget(self.trust_button, 2, 2)
-        connection_layout.addWidget(self.allow_updates_button, 2, 2)
+        connection_layout.addWidget(self.peer_fingerprint, 3, 0, 1, 2)
+        connection_layout.addWidget(self.trust_button, 3, 2)
+        connection_layout.addWidget(self.allow_updates_button, 3, 2)
         connection_layout.setColumnStretch(0, 3)
         connection_layout.setColumnStretch(1, 1)
         layout.addWidget(connection)
@@ -543,6 +557,7 @@ class MainWindow(QMainWindow):
                 background: #d9dfd4; color: #27443e; border-radius: 10px;
                 padding: 5px 11px; font-weight: 700;
             }
+            QLabel#connectionError { color: #812f21; padding: 4px 0; }
             QFrame#panel {
                 background: #e7e3d9; border: 1px solid #c8c1b2; border-radius: 8px;
             }
@@ -627,12 +642,11 @@ class MainWindow(QMainWindow):
         try:
             baud = int(self.baud_combo.currentText().strip())
         except ValueError:
-            self.action_status.setText("Baud must be an integer")
+            self._set_connection_detail("Baud must be an integer")
             return
         if not port:
-            self.action_status.setText("Select a serial port")
+            self._set_connection_detail("Select a serial port")
             return
-        self.action_status.clear()
         self.connect_requested.emit(port, baud)
 
     def _request_trust(self) -> None:
@@ -974,8 +988,18 @@ class MainWindow(QMainWindow):
             allow_input,
         )
 
-    def set_connection_pending(self, port: str) -> None:
+    def _set_connection_detail(self, text: str) -> None:
+        self.connection_error_label.setText(text)
+        self.connection_error_label.setVisible(bool(text))
+        self.copy_connection_error_button.setVisible(bool(text))
+
+    def _connection_failure_text(self, message: str) -> str:
+        return f"{self._connection_target}\n{message}" if self._connection_target else message
+
+    def set_connection_pending(self, port: str, baud_rate: int) -> None:
         self._connecting = True
+        self._connection_target = f"{port} at {baud_rate} baud"
+        self._set_connection_detail("")
         self.connection_status.setText(f"Connecting {port}")
         self.connect_button.setText("Disconnect")
         self.port_combo.setEnabled(False)
@@ -984,7 +1008,7 @@ class MainWindow(QMainWindow):
     def show_connection_error(self, message: str) -> None:
         self.set_connected(False)
         self.connection_status.setText("Error")
-        self.action_status.setText(message)
+        self._set_connection_detail(self._connection_failure_text(message or "No error details were reported."))
 
     def show_operation_error(self, message: str) -> None:
         self.action_status.setText(message)
@@ -1020,8 +1044,10 @@ class MainWindow(QMainWindow):
                 if snapshot.peer_revision:
                     status += f" ({snapshot.peer_revision[:12]})"
         self.connection_status.setText(status)
-        if snapshot.error:
-            self.action_status.setText(snapshot.error)
+        if snapshot.state is CoreState.ERROR:
+            self._set_connection_detail(self._connection_failure_text(snapshot.error or "Serial connection lost."))
+        else:
+            self._set_connection_detail("")
 
         if snapshot.fingerprint is None:
             self.peer_fingerprint.setText("No authenticated peer")
