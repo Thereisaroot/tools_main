@@ -113,6 +113,8 @@ def test_all_required_message_types_are_stable_and_unique():
         "SHELL_OUTPUT": 34,
         "SHELL_RESIZE": 35,
         "SHELL_EXIT": 36,
+        "SHELL_KEYS": 37,
+        "SHELL_KEYS_ACK": 38,
         "INPUT_REQUEST": 40,
         "INPUT_ACCEPT": 41,
         "INPUT_BUSY": 42,

@@ -44,6 +44,8 @@ class MessageType(IntEnum):
     SHELL_OUTPUT = 34
     SHELL_RESIZE = 35
     SHELL_EXIT = 36
+    SHELL_KEYS = 37
+    SHELL_KEYS_ACK = 38
 
     INPUT_REQUEST = 40
     INPUT_ACCEPT = 41

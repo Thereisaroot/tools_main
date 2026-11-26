@@ -43,6 +43,7 @@ from shooklink.protocol.messages import (
     encode_message,
 )
 from shooklink.shell.codec import FEATURE as SHELL_COMPRESSION_FEATURE
+from shooklink.shell.key_stream import FEATURE as SHELL_KEYS_FEATURE
 from shooklink.shell.service import ShellService
 from shooklink.transport.multiplexer import OutboundItem, Priority
 from shooklink.transport.serial_link import (
@@ -57,7 +58,7 @@ PROTOCOL_VERSION = 1
 AEAD_TAG_SIZE = 16
 HANDSHAKE_RETRY_SECONDS = 0.5
 LOCAL_FEATURES = frozenset(
-    {"chat", CHAT_ACK_FEATURE, "files", "shell", SHELL_COMPRESSION_FEATURE, "input", UPDATE_FEATURE}
+    {"chat", CHAT_ACK_FEATURE, "files", "shell", SHELL_COMPRESSION_FEATURE, SHELL_KEYS_FEATURE, "input", UPDATE_FEATURE}
 )
 MAX_FEATURES = 32
 MAX_PEER_ID_BYTES = 256
@@ -151,6 +152,8 @@ _FEATURE_BY_TYPE = {
     MessageType.SHELL_ACCEPT: "shell",
     MessageType.SHELL_DENY: "shell",
     MessageType.SHELL_INPUT: "shell",
+    MessageType.SHELL_KEYS: "shell",
+    MessageType.SHELL_KEYS_ACK: "shell",
     MessageType.SHELL_OUTPUT: "shell",
     MessageType.SHELL_RESIZE: "shell",
     MessageType.SHELL_EXIT: "shell",
@@ -191,6 +194,8 @@ _ALLOWED_PRIORITIES = {
     MessageType.SHELL_ACCEPT: frozenset({Priority.INTERACTIVE}),
     MessageType.SHELL_DENY: frozenset({Priority.INTERACTIVE}),
     MessageType.SHELL_INPUT: frozenset({Priority.INTERACTIVE}),
+    MessageType.SHELL_KEYS: frozenset({Priority.INTERACTIVE}),
+    MessageType.SHELL_KEYS_ACK: frozenset({Priority.INTERACTIVE}),
     MessageType.SHELL_OUTPUT: frozenset({Priority.NORMAL}),
     MessageType.SHELL_RESIZE: frozenset({Priority.INTERACTIVE}),
     MessageType.SHELL_EXIT: frozenset({Priority.INTERACTIVE}),
@@ -280,6 +285,18 @@ class ShookLinkCore:
     def trusted(self) -> bool:
         with self._lock:
             return self._trusted_locked()
+
+    @property
+    def reliable_shell_input(self) -> bool:
+        with self._lock:
+            return bool(self._connection and self._trusted_locked()
+                        and SHELL_KEYS_FEATURE in self._connection.remote_features
+                        and SHELL_KEYS_FEATURE in self._local_features())
+
+    @property
+    def shell_baud(self) -> int:
+        with self._lock:
+            return self._connection.link.baud_rate if self._connection else 115200
 
     @property
     def shell_output_compression(self) -> bool:

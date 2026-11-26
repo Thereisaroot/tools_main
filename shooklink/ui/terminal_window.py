@@ -559,6 +559,7 @@ class TerminalWindow(QMainWindow):
             "timeout": "No shell reply. Check the peer connection and Allow Remote Shell, then try again.",
             "busy": "Denied: another remote shell is active.",
             "start_failed": "The remote terminal process could not start.",
+            "input_unconfirmed": "Input delivery uncertain. Shell closed; check the last command before retrying.",
         }.get(reason, f"Remote shell exited{suffix}"))
 
     def closeEvent(self, event: QCloseEvent) -> None:

@@ -108,6 +108,10 @@ class SerialLink:
         return cls(endpoint, on_frame, on_disconnect)
 
     @property
+    def baud_rate(self) -> int:
+        return getattr(self._endpoint, "baudrate", 115200)
+
+    @property
     def parser(self) -> FrameParser:
         return self._parser
 

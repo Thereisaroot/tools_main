@@ -12,6 +12,7 @@ from typing import Any, Protocol
 
 from shooklink.protocol.messages import Message, MessageType
 from shooklink.shell.codec import MAX_SHELL_IO_BYTES, decode_output, output_message
+from shooklink.shell.key_stream import KeyReader, KeyWriter
 from shooklink.shell.process import TerminalProcess
 from shooklink.transport.multiplexer import Priority
 
@@ -22,6 +23,8 @@ _SHELL_TYPES = frozenset(
         MessageType.SHELL_ACCEPT,
         MessageType.SHELL_DENY,
         MessageType.SHELL_INPUT,
+        MessageType.SHELL_KEYS,
+        MessageType.SHELL_KEYS_ACK,
         MessageType.SHELL_OUTPUT,
         MessageType.SHELL_RESIZE,
         MessageType.SHELL_EXIT,
@@ -83,6 +86,9 @@ class _ShellSession:
     process: TerminalProcess | None = None
     pending_size: tuple[int, int] | None = None
     confirm_on_output: bool = True
+    writer: KeyWriter | None = None
+    reader: KeyReader | None = None
+    link_id: int | None = None
 
 
 class ShellService:
@@ -109,6 +115,11 @@ class ShellService:
     def active_session_id(self) -> str | None:
         with self._lock:
             return None if self._session is None else self._session.session_id
+
+    def _clear_session_locked(self) -> None:
+        if self._session is not None and self._session.writer is not None:
+            self._session.writer.close()
+        self._session = None
 
     def add_output_listener(self, listener: Callable[[ShellOutput], None]) -> None:
         with self._lock:
@@ -148,7 +159,7 @@ class ShellService:
             ):
                 process = self._session.process
                 session_id = self._session.session_id
-                self._session = None
+                self._clear_session_locked()
         if process is not None:
             process.terminate()
             self._send(
@@ -174,10 +185,19 @@ class ShellService:
         if not self._bus.trusted:
             raise ShellUnavailable("trust the connected peer before opening a shell")
         session_id = uuid.uuid4().hex
+        reliable = getattr(self._bus, "reliable_shell_input", False)
+        link_id = getattr(self._bus, "chat_connection_id", None)
+        baud = getattr(self._bus, "shell_baud", 115200)
         with self._lock:
             if self._session is not None:
                 raise ShellUnavailable("a shell session is already active")
             self._session = _ShellSession(session_id, "outgoing", "requesting")
+            if reliable:
+                self._session.link_id = link_id
+                self._session.writer = KeyWriter(
+                    lambda offset, data: self._send_key_block(session_id, link_id, offset, data),
+                    lambda: self._input_failed(session_id), baud,
+                )
         try:
             self._send(
                 Message(
@@ -195,7 +215,7 @@ class ShellService:
         except BaseException:
             with self._lock:
                 if self._session is not None and self._session.session_id == session_id:
-                    self._session = None
+                    self._clear_session_locked()
             raise
         self._notify_state(ShellState(session_id, "outgoing", "requesting"))
         return session_id
@@ -219,6 +239,8 @@ class ShellService:
             MessageType.SHELL_ACCEPT: self._handle_accept,
             MessageType.SHELL_DENY: self._handle_deny,
             MessageType.SHELL_INPUT: self._handle_input,
+            MessageType.SHELL_KEYS: self._handle_keys,
+            MessageType.SHELL_KEYS_ACK: self._handle_keys_ack,
             MessageType.SHELL_OUTPUT: self._handle_output,
             MessageType.SHELL_RESIZE: self._handle_resize,
             MessageType.SHELL_EXIT: self._handle_exit,
@@ -232,7 +254,13 @@ class ShellService:
     def send_input(self, session_id: str, data: bytes) -> None:
         if not isinstance(data, bytes):
             raise TypeError("shell input must be bytes")
-        self._require_outgoing_session(session_id)
+        session = self._require_outgoing_session(session_id)
+        if session.writer is not None:
+            try:
+                session.writer.write(data)
+            except (BufferError, RuntimeError):
+                self._input_failed(session_id)
+            return
         for offset in range(0, len(data), MAX_SHELL_IO_BYTES):
             self._send(
                 Message(
@@ -272,7 +300,7 @@ class ShellService:
             if self._session is None or self._session.session_id != session_id:
                 return
             process = self._session.process
-            self._session = None
+            self._clear_session_locked()
         if process is not None:
             process.terminate()
         self._send(
@@ -289,7 +317,7 @@ class ShellService:
             if (self._session is None or self._session.session_id != session_id
                     or self._session.direction != "outgoing" or self._session.state != "requesting"):
                 return False
-            self._session = None
+            self._clear_session_locked()
         try:
             self._send(Message(MessageType.SHELL_EXIT, {"session_id": session_id, "reason": "timeout"}),
                        Priority.INTERACTIVE)
@@ -304,7 +332,7 @@ class ShellService:
             self._link_epoch += 1
             if self._session is not None:
                 process = self._session.process
-            self._session = None
+            self._clear_session_locked()
             if revoke_permission:
                 self._allow_remote_shell = False
         if process is not None:
@@ -352,6 +380,8 @@ class ShellService:
             term,
         )
         denied_reason = None
+        reliable = getattr(self._bus, "reliable_shell_input", False)
+        link_id = getattr(self._bus, "chat_connection_id", None)
         with self._lock:
             if link_epoch != self._link_epoch:
                 denied_reason = "disconnected"
@@ -365,6 +395,8 @@ class ShellService:
                     "incoming",
                     "starting",
                     process,
+                    reader=KeyReader() if reliable else None,
+                    link_id=link_id,
                 )
         if denied_reason is not None:
             process.terminate()
@@ -468,7 +500,7 @@ class ShellService:
                 and self._session.session_id == session_id
                 and self._session.direction == "outgoing"
             ):
-                self._session = None
+                self._clear_session_locked()
                 denied = True
         if denied:
             self._notify_state(
@@ -479,8 +511,62 @@ class ShellService:
         session_id = _session_id(message.metadata)
         if len(message.body) > MAX_SHELL_IO_BYTES:
             raise ShellProtocolError("shell input exceeds the frame budget")
-        process = self._require_incoming_process(session_id)
+        with self._lock:
+            process = self._require_incoming_process(session_id)
+            if self._session.reader is not None:
+                raise ShellProtocolError("unsequenced keyboard input in reliable session")
         process.write(message.body)
+
+    def _key_send(self, message, link_id):
+        options = {} if link_id is None else {"expected_connection_id": link_id}
+        self._bus.send(message, secure=True, priority=Priority.INTERACTIVE, **options)
+
+    def _send_key_block(self, session_id, link_id, offset, data):
+        self._require_outgoing_session(session_id)
+        self._key_send(Message(MessageType.SHELL_KEYS, {"session_id": session_id, "offset": offset}, data), link_id)
+
+    def _handle_keys(self, message: Message):
+        sid = _session_id(message.metadata)
+        if set(message.metadata) != {"session_id", "offset"}:
+            raise ShellProtocolError("invalid shell key fields")
+        with self._lock:
+            process = self._require_incoming_process(sid)
+            session = self._session
+            if not self._allow_remote_shell or session.reader is None:
+                raise ShellProtocolError("shell input not negotiated")
+        try:
+            end = session.reader.receive(message.metadata["offset"], message.body, process.write)
+        except OSError:
+            self._input_failed(sid)
+            return
+        self._key_send(Message(MessageType.SHELL_KEYS_ACK, {"session_id": sid, "end": end}), session.link_id)
+
+    def _handle_keys_ack(self, message: Message):
+        sid = _session_id(message.metadata)
+        if message.body or set(message.metadata) != {"session_id", "end"}:
+            raise ShellProtocolError("invalid shell input acknowledgement")
+        with self._lock:
+            session = self._session
+            if (session is None or session.session_id != sid or session.writer is None
+                    or session.direction != "outgoing" or session.state != "active"):
+                raise ShellProtocolError("stale shell input acknowledgement")
+            session.writer.acknowledge(message.metadata["end"])
+
+    def _input_failed(self, sid):
+        with self._lock:
+            session = self._session
+            if session is None or session.session_id != sid:
+                return
+            self._clear_session_locked()
+        try:
+            if session.process is not None:
+                session.process.terminate()
+            self._key_send(Message(MessageType.SHELL_EXIT, {"session_id": sid, "reason": "input_unconfirmed"}),
+                           session.link_id)
+        except (RuntimeError, OSError):
+            pass
+        finally:
+            self._notify_state(ShellState(sid, session.direction, "exited", reason="input_unconfirmed"))
 
     def _handle_output(self, message: Message) -> None:
         session_id = _session_id(message.metadata)
@@ -510,14 +596,15 @@ class ShellService:
                 return
             process = self._session.process
             direction = self._session.direction
-            self._session = None
+            self._clear_session_locked()
         if process is not None:
             process.terminate()
         exit_code = message.metadata.get("exit_code")
         if type(exit_code) is not int:
             exit_code = None
         self._notify_state(
-            ShellState(session_id, direction, "exited", exit_code=exit_code)
+            ShellState(session_id, direction, "exited", exit_code=exit_code,
+                       reason="input_unconfirmed" if message.metadata.get("reason") == "input_unconfirmed" else None)
         )
 
     def _process_output(self, session_id: str, data: bytes) -> None:

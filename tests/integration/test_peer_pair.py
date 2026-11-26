@@ -16,6 +16,7 @@ from shooklink.protocol.crypto import IdentityStore, TrustStore
 from shooklink.protocol.framing import SECURE_FLAG, Frame, pack_frame_header
 from shooklink.protocol.messages import Message, MessageType, encode_message
 from shooklink.shell.codec import FEATURE as SHELL_COMPRESSION
+from shooklink.shell.key_stream import FEATURE as SHELL_KEYS
 from shooklink.transport.multiplexer import Priority
 from shooklink.transport.serial_link import LinkCloseTimeout
 
@@ -1122,6 +1123,56 @@ def test_shell_output_with_lost_accept_is_compatible_and_preserves_bytes(tmp_pat
         viewer.shell.send_input(sid, b"x")
         assert wait_for(lambda: processes.processes[0].writes == [b"x"])
         assert len(processes.processes) == 1
+    finally:
+        viewer.close()
+        host.close()
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_negotiated_shell_keys_with_loss_duplication_and_large_paste(tmp_path, legacy):
+    viewer, *_ = build_core(tmp_path, "key-viewer")
+    host, _, procs = build_core(tmp_path, "key-host")
+    if legacy:
+        features = host._local_features() - {SHELL_KEYS}
+        host._local_features = lambda: features
+    sent_keys, sent_acks = [], []
+    viewer_send, host_send = viewer.send, host.send
+
+    def forward_key(msg, **options):
+        if msg.message_type in (MessageType.SHELL_INPUT, MessageType.SHELL_KEYS):
+            sent_keys.append(msg.message_type)
+            if not legacy:
+                if len(sent_keys) == 1:
+                    return
+                if len(sent_keys) == 2:
+                    viewer_send(msg, **options)
+        viewer_send(msg, **options)
+
+    def forward_ack(msg, **options):
+        if msg.message_type is MessageType.SHELL_KEYS_ACK:
+            sent_acks.append(msg.metadata["end"])
+            if len(sent_acks) < 3:
+                return
+        host_send(msg, **options)
+
+    viewer.send, host.send = forward_key, forward_ack
+    try:
+        a, b = endpoint_pair()
+        viewer.connect_endpoint(a)
+        host.connect_endpoint(b)
+        assert wait_for(lambda: viewer.snapshot.state is host.snapshot.state is CoreState.UNTRUSTED)
+        approve_pair(viewer, host)
+        host.shell.set_allow_remote_shell(True)
+        ready = threading.Event()
+        viewer.shell.add_state_listener(lambda s: ready.set() if s.state == "active" else None)
+        sid = viewer.shell.open_remote(columns=90, rows=24)
+        assert ready.wait(2)
+        chunks = [b"a", b"\t", b"\r", ("한글" * 1500).encode(), b"\x03"]
+        for item in chunks:
+            viewer.shell.send_input(sid, item)
+        assert wait_for(lambda: procs.processes and b"".join(procs.processes[0].writes) == b"".join(chunks), timeout=8)
+        assert all(t is (MessageType.SHELL_INPUT if legacy else MessageType.SHELL_KEYS) for t in sent_keys)
+        assert bool(sent_acks) != legacy
     finally:
         viewer.close()
         host.close()
